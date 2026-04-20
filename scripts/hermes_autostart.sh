@@ -26,19 +26,19 @@ start_gateway_background() {
   local logfile="$LOG_DIR/gateway.log"
   if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
     "$PROJECT_DIR/venv/bin/python" -m hermes_cli.main gateway run --replace >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    GATEWAY_PID=$!
     return 0
   fi
 
   if command -v hermes >/dev/null 2>&1; then
     hermes gateway run --replace >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    GATEWAY_PID=$!
     return 0
   fi
 
   if command -v python3 >/dev/null 2>&1; then
     python3 -m hermes_cli.main gateway run --replace >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    GATEWAY_PID=$!
     return 0
   fi
 
@@ -49,19 +49,19 @@ start_dashboard_background() {
   local logfile="$LOG_DIR/dashboard.log"
   if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
     "$PROJECT_DIR/venv/bin/python" -m hermes_cli.main dashboard --no-open >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    DASHBOARD_PID=$!
     return 0
   fi
 
   if command -v hermes >/dev/null 2>&1; then
     hermes dashboard --no-open >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    DASHBOARD_PID=$!
     return 0
   fi
 
   if command -v python3 >/dev/null 2>&1; then
     python3 -m hermes_cli.main dashboard --no-open >>"$logfile" 2>&1 &
-    printf '%s' "$!"
+    DASHBOARD_PID=$!
     return 0
   fi
 
@@ -70,7 +70,6 @@ start_dashboard_background() {
 
 watch_gateway() {
   local delay="$RESTART_DELAY"
-  local pid
 
   if is_gateway_running; then
     log "Gateway is already running; leaving it alone."
@@ -78,14 +77,14 @@ watch_gateway() {
   fi
 
   while true; do
-    if ! pid="$(start_gateway_background)"; then
+    if ! start_gateway_background; then
       log "No gateway launch command was found."
       return 1
     fi
 
-    log "Gateway PID: ${pid}"
+    log "Gateway PID: ${GATEWAY_PID}"
 
-    if wait "$pid"; then
+    if wait "$GATEWAY_PID"; then
       log "Gateway exited cleanly."
     else
       log "Gateway exited with status $?"
@@ -114,7 +113,6 @@ watch_gateway() {
 
 watch_dashboard() {
   local delay="${HERMES_AUTOSTART_DASHBOARD_RESTART_DELAY:-10}"
-  local pid
 
   if [[ "$DASHBOARD_ENABLED" != "1" ]]; then
     log "Web UI mode disabled; dashboard watcher will not start."
@@ -122,14 +120,14 @@ watch_dashboard() {
   fi
 
   while true; do
-    if ! pid="$(start_dashboard_background)"; then
+    if ! start_dashboard_background; then
       log "Dashboard launch command not found; skipping web UI mode."
       return 0
     fi
 
-    log "Dashboard PID: ${pid}"
+    log "Dashboard PID: ${DASHBOARD_PID}"
 
-    if wait "$pid"; then
+    if wait "$DASHBOARD_PID"; then
       log "Dashboard exited cleanly."
       return 0
     fi
