@@ -453,12 +453,41 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     if audio_path.suffix.lower() in LOCAL_NATIVE_AUDIO_FORMATS:
         return file_path, None
 
+    converted_path = os.path.join(work_dir, f"{audio_path.stem}.wav")
+    return _convert_audio_to_wav(
+        file_path,
+        converted_path,
+        missing_ffmpeg_error="Local STT fallback requires ffmpeg for non-WAV inputs, but ffmpeg was not found",
+        failure_prefix="Failed to convert audio for local STT",
+    )
+
+
+def _convert_audio_to_wav(
+    file_path: str,
+    converted_path: str,
+    *,
+    missing_ffmpeg_error: str,
+    failure_prefix: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Convert arbitrary audio to 16 kHz mono PCM WAV using ffmpeg."""
     ffmpeg = _find_ffmpeg_binary()
     if not ffmpeg:
-        return None, "Local STT fallback requires ffmpeg for non-WAV inputs, but ffmpeg was not found"
+        return None, missing_ffmpeg_error
 
-    converted_path = os.path.join(work_dir, f"{audio_path.stem}.wav")
-    command = [ffmpeg, "-y", "-i", file_path, converted_path]
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        file_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        converted_path,
+    ]
 
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
@@ -466,7 +495,41 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     except subprocess.CalledProcessError as e:
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("ffmpeg conversion failed for %s: %s", file_path, details)
-        return None, f"Failed to convert audio for local STT: {details}"
+        return None, f"{failure_prefix}: {details}"
+
+
+def _openai_should_convert_to_wav(base_url: str, openai_cfg: dict, file_path: str) -> bool:
+    """Return whether OpenAI-compatible STT should normalize input to WAV.
+
+    The real OpenAI endpoint accepts OGG/Opus and other compressed formats, so
+    avoid expanding files there. Some OpenAI-compatible local servers only
+    accept WAV despite exposing /v1/audio/transcriptions; for custom base_url
+    values we convert non-WAV inputs by default. Users can force either behavior
+    with stt.openai.convert_to_wav.
+    """
+    if Path(file_path).suffix.lower() == ".wav":
+        return False
+
+    configured = openai_cfg.get("convert_to_wav")
+    if configured is not None:
+        return is_truthy_value(configured, default=False)
+
+    return base_url.rstrip("/") != OPENAI_BASE_URL.rstrip("/")
+
+
+def _prepare_openai_audio(file_path: str, work_dir: str, base_url: str, openai_cfg: dict) -> tuple[Optional[str], Optional[str]]:
+    """Normalize audio for OpenAI-compatible STT endpoints when needed."""
+    if not _openai_should_convert_to_wav(base_url, openai_cfg, file_path):
+        return file_path, None
+
+    audio_path = Path(file_path)
+    converted_path = os.path.join(work_dir, f"{audio_path.stem}.wav")
+    return _convert_audio_to_wav(
+        file_path,
+        converted_path,
+        missing_ffmpeg_error="OpenAI-compatible STT endpoint requires WAV conversion for this input, but ffmpeg was not found",
+        failure_prefix="Failed to convert audio for OpenAI-compatible STT",
+    )
 
 
 def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]:
@@ -593,6 +656,8 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 
 def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using OpenAI Whisper API (paid)."""
+    stt_config = _load_stt_config()
+
     try:
         api_key, base_url = _resolve_openai_audio_client_config()
     except ValueError as exc:
@@ -605,8 +670,12 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     if not _HAS_OPENAI:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
 
-    # Auto-correct model if caller passed a Groq-only model
-    if model_name in GROQ_MODELS:
+    official_openai_base_url = base_url.rstrip("/") == OPENAI_BASE_URL.rstrip("/")
+
+    # Auto-correct Groq model names only for the official OpenAI endpoint. OpenAI-compatible
+    # local STT servers may intentionally expose Groq/Whisper-style model names (for example
+    # whisper-large-v3-turbo) and may reject the whisper-1/text response-format fallback.
+    if official_openai_base_url and model_name in GROQ_MODELS:
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
 
@@ -614,12 +683,21 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
-            with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text" if model_name == "whisper-1" else "json",
-                )
+            with tempfile.TemporaryDirectory(prefix="hermes-openai-stt-") as work_dir:
+                prepared_input, prep_error = _prepare_openai_audio(file_path, work_dir, base_url, stt_config.get("openai", {}))
+                if prep_error:
+                    return {"success": False, "transcript": "", "error": prep_error}
+
+                with open(prepared_input, "rb") as audio_file:
+                    transcription = client.audio.transcriptions.create(
+                        model=model_name,
+                        file=audio_file,
+                        response_format=(
+                            "text"
+                            if model_name == "whisper-1" and official_openai_base_url
+                            else "json"
+                        ),
+                    )
 
             transcript_text = _extract_transcript_text(transcription)
             logger.info("Transcribed %s via OpenAI API (%s, %d chars)",
