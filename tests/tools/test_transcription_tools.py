@@ -337,6 +337,48 @@ class TestTranscribeOpenAIExtended:
         assert result["transcript"] == "hello"
         mock_client.close.assert_called_once()
 
+    def test_custom_openai_compatible_endpoint_keeps_groq_model_and_json_response(self, sample_wav):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = {"text": "hello"}
+        stt_config = {
+            "openai": {
+                "api_key": "local-test-key",
+                "base_url": "http://127.0.0.1:9000/v1",
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+            result = _transcribe_openai(sample_wav, "whisper-large-v3-turbo")
+
+        assert result["success"] is True
+        create_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert create_kwargs["model"] == "whisper-large-v3-turbo"
+        assert create_kwargs["response_format"] == "json"
+
+    def test_custom_openai_compatible_endpoint_uses_json_even_for_whisper_1(self, sample_wav):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = {"text": "hello"}
+        stt_config = {
+            "openai": {
+                "api_key": "local-test-key",
+                "base_url": "http://127.0.0.1:9000/v1",
+            }
+        }
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+            result = _transcribe_openai(sample_wav, "whisper-1")
+
+        assert result["success"] is True
+        create_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert create_kwargs["model"] == "whisper-1"
+        assert create_kwargs["response_format"] == "json"
+
     def test_permission_error(self, monkeypatch, sample_wav):
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
 
