@@ -282,7 +282,7 @@ async def test_send_typing_preserves_general_topic_thread_id():
 
 @pytest.mark.asyncio
 async def test_send_typing_does_not_fall_back_to_root_for_dm_topic():
-    """Typing failures in DM topics should not show an indicator in All Messages."""
+    """Typing in DM topics is suppressed because Bot API has no direct topic arg."""
     adapter = _make_adapter()
     call_log = []
 
@@ -292,11 +292,9 @@ async def test_send_typing_does_not_fall_back_to_root_for_dm_topic():
 
     adapter._bot = SimpleNamespace(send_chat_action=mock_send_chat_action)
 
-    await adapter.send_typing("12345", metadata={"thread_id": "22182"})
+    await adapter.send_typing("12345", metadata={"thread_id": "22182", "direct_messages_topic_id": "22182"})
 
-    assert call_log == [
-        {"chat_id": 12345, "action": "typing", "message_thread_id": 22182},
-    ]
+    assert call_log == []
 
 
 @pytest.mark.asyncio
@@ -379,8 +377,7 @@ async def test_send_retries_without_thread_on_thread_not_found():
 
     async def mock_send_message(**kwargs):
         call_log.append(dict(kwargs))
-        tid = kwargs.get("message_thread_id")
-        if tid is not None:
+        if kwargs.get("direct_messages_topic_id") is not None or kwargs.get("message_thread_id") is not None:
             raise FakeBadRequest("Message thread not found")
         return SimpleNamespace(message_id=42)
 
@@ -389,7 +386,7 @@ async def test_send_retries_without_thread_on_thread_not_found():
     result = await adapter.send(
         chat_id="123",
         content="test message",
-        metadata={"thread_id": "99999"},
+        metadata={"thread_id": "99999", "direct_messages_topic_id": "99999"},
     )
 
     assert result.success is True
@@ -1235,26 +1232,23 @@ async def test_thread_fallback_only_fires_once():
 
     async def mock_send_message(**kwargs):
         call_log.append(dict(kwargs))
-        tid = kwargs.get("message_thread_id")
-        if tid is not None:
+        if kwargs.get("direct_messages_topic_id") is not None or kwargs.get("message_thread_id") is not None:
             raise FakeBadRequest("Message thread not found")
         return SimpleNamespace(message_id=42)
 
     adapter._bot = SimpleNamespace(send_message=mock_send_message)
 
-    # Send a long message that gets split into chunks
     long_msg = "A" * 5000  # Exceeds Telegram's 4096 limit
     result = await adapter.send(
         chat_id="123",
         content=long_msg,
-        metadata={"thread_id": "99999"},
+        metadata={"thread_id": "99999", "direct_messages_topic_id": "99999"},
     )
 
-    assert result.success is True
-    # First chunk: attempt with thread → fail → retry without → succeed
-    # Second chunk: should use thread_id=None directly (effective_thread_id
-    # was cleared per-chunk but the metadata doesn't change between chunks)
-    # The key point: the message was delivered despite the invalid thread
+    assert result.success is False
+    assert len(call_log) == 1
+    assert call_log[0]["direct_messages_topic_id"] == 99999
+    assert "message_thread_id" not in call_log[0]
 
 
 @pytest.mark.asyncio

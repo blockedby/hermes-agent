@@ -2127,6 +2127,18 @@ class GatewayRunner:
             and str(getattr(source, "thread_id", "") or "").startswith("business:")
         )
 
+    def _is_message_dispatch_authorized(self, source: SessionSource) -> bool:
+        """Return True when an inbound event may enter the agent pipeline.
+
+        Telegram Business customers are not Hermes users and should not need
+        pairing/allowlist authorization. Telegram controls Business capability;
+        the Telegram adapter later routes generated replies to owner approval
+        drafts instead of sending directly to customers.
+        """
+        if self._is_telegram_business_source(source):
+            return True
+        return self._is_user_authorized(source)
+
     async def _notify_telegram_business_owner(self, adapter: Any, source: SessionSource, text: str) -> bool:
         """Best-effort owner notice for Business safety suppressions.
 
@@ -2961,7 +2973,7 @@ class GatewayRunner:
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        if not self._is_message_dispatch_authorized(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -3052,9 +3064,12 @@ class GatewayRunner:
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
-        # never actually delivered.
+        # never actually delivered.  Telegram Business customer sessions also skip
+        # helper acks: assistant output from Business sessions becomes owner approval
+        # drafts, so generic "interrupting/queued" status text is noisy and can mix
+        # with real customer drafts.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        if not busy_ack_enabled or self._is_telegram_business_source(event.source):
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
@@ -6258,6 +6273,15 @@ class GatewayRunner:
 
         if not user_id:
             return False
+
+        # Telegram Business customer messages are not ordinary bot DMs: the
+        # customer did not authorize Hermes directly, the Business owner did via
+        # Telegram's Business connection.  The Telegram adapter separately
+        # fail-closes on connection/reply rights and routes generated replies to
+        # owner approval drafts, so the generic DM user allowlist must not drop
+        # these inbound customer events before that safety path runs.
+        if self._is_telegram_business_source(source):
+            return True
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
@@ -16203,6 +16227,8 @@ class GatewayRunner:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
+            if _business_source:
+                return
             if not _status_adapter or not _run_still_current():
                 return
             prepared_message = _prepare_gateway_status_message(
@@ -17198,8 +17224,8 @@ class GatewayRunner:
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
-                return  # Notifications disabled (gateway_notify_interval: 0)
+            if _NOTIFY_INTERVAL is None or _business_source:
+                return  # Notifications disabled (gateway_notify_interval: 0) or unsafe/noisy for Business drafts
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
