@@ -112,6 +112,25 @@ hermes gateway
 
 The bot should come online within seconds. Send it a message on Telegram to verify.
 
+## Telegram Business assistant mode
+
+Hermes can receive Telegram Business `business_message` updates as a text-only assistant MVP. Customer chats are isolated from normal Telegram DM sessions by the Business connection ID. Hermes does **not** send drafted replies directly to the customer; instead it posts each draft to the owner/home chat with **Send** and **Cancel** buttons.
+
+Configure the approval destination with the regular Telegram home channel or an explicit owner chat:
+
+```yaml
+platforms:
+  telegram:
+    home_channel:
+      platform: telegram
+      chat_id: 123456789
+      name: Owner
+    extra:
+      business_owner_chat_id: 123456789
+```
+
+`business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables.
+
 ## Sending Generated Files from Docker-backed Terminals
 
 If your terminal backend is `docker`, keep in mind that Telegram attachments are
