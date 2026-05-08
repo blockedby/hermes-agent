@@ -754,7 +754,7 @@ class TestSendDocument:
         connected_adapter._bot.send_document = AsyncMock(return_value=mock_msg)
 
         await connected_adapter.send_document(
-            chat_id="12345",
+            chat_id="-100123",
             file_path=str(test_file),
             metadata={"thread_id": "789"},
         )
@@ -882,7 +882,7 @@ class TestSendVideo:
         connected_adapter._bot.send_video = AsyncMock(return_value=mock_msg)
 
         await connected_adapter.send_video(
-            chat_id="12345",
+            chat_id="-100123",
             video_path=str(test_file),
             metadata={"thread_id": "789"},
         )

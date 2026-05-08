@@ -393,11 +393,47 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
 
+    @classmethod
+    def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not metadata:
+            return None
+        topic_id = metadata.get("direct_messages_topic_id") or metadata.get("direct_message_topic_id")
+        return str(topic_id) if topic_id is not None else None
+
+    @staticmethod
+    def _direct_messages_topic_id_from_message(message: Message) -> Optional[str]:
+        topic = getattr(message, "direct_messages_topic", None)
+        topic_id = getattr(topic, "topic_id", None)
+        if topic_id is None or isinstance(topic_id, bool):
+            return None
+        text = str(topic_id).strip()
+        if not text or not re.fullmatch(r"\d+", text):
+            return None
+        return text
+
+    @staticmethod
+    def _chat_id_looks_like_private_dm(chat_id: Any) -> bool:
+        try:
+            return int(chat_id) > 0
+        except (TypeError, ValueError):
+            return False
+
     _BUSINESS_THREAD_PREFIX = "business:"
 
+    _BUSINESS_TOPIC_MARKER = ":topic:"
+
     @classmethod
-    def _business_thread_id(cls, business_connection_id: str) -> str:
-        return f"{cls._BUSINESS_THREAD_PREFIX}{business_connection_id}"
+    def _business_thread_id(
+        cls,
+        business_connection_id: str,
+        direct_messages_topic_id: Optional[str] = None,
+    ) -> str:
+        connection_id = str(business_connection_id or "").strip()
+        if direct_messages_topic_id:
+            topic_id = str(direct_messages_topic_id).strip()
+            if topic_id:
+                return f"{cls._BUSINESS_THREAD_PREFIX}{connection_id}{cls._BUSINESS_TOPIC_MARKER}{topic_id}"
+        return f"{cls._BUSINESS_THREAD_PREFIX}{connection_id}"
 
     @classmethod
     def _business_connection_id_from_thread(cls, thread_id: Optional[str]) -> Optional[str]:
@@ -407,6 +443,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not value.startswith(cls._BUSINESS_THREAD_PREFIX):
             return None
         connection_id = value[len(cls._BUSINESS_THREAD_PREFIX):].strip()
+        if cls._BUSINESS_TOPIC_MARKER in connection_id:
+            connection_id = connection_id.split(cls._BUSINESS_TOPIC_MARKER, 1)[0]
         return connection_id or None
 
     @classmethod
@@ -472,9 +510,17 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata = super()._message_event_metadata(event) or {}
         source = getattr(event, "source", None)
         thread_id = getattr(source, "thread_id", None)
-        if not self._business_connection_id_from_thread(thread_id):
+
+        direct_topic_id = self._direct_messages_topic_id_from_message(getattr(event, "raw_message", None))
+        if direct_topic_id:
+            metadata["direct_messages_topic_id"] = direct_topic_id
+            metadata.setdefault("thread_id", direct_topic_id)
+
+        business_connection_id = self._business_connection_id_from_thread(thread_id)
+        if not business_connection_id:
             return metadata or None
 
+        metadata["business_connection_id"] = business_connection_id
         metadata["inbound_text"] = getattr(event, "text", "") or ""
         if getattr(event, "message_id", None):
             metadata["inbound_message_id"] = str(event.message_id)
@@ -558,12 +604,37 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(self._telegram_message_chat_id(message) in ignored)
 
     def _is_business_self_message(self, message: Message, business_connection_id: str) -> bool:
-        """Return True when a Business update was sent by the connected owner."""
+        """Return True when a Business update was sent by Hermes or the owner.
+
+        Telegram can echo bot-generated status/progress messages back as
+        ``business_message`` updates.  If those are treated as customer input,
+        Hermes drafts approvals to itself (customer == bot id) and can recurse.
+        """
         if not self._business_ignore_self_messages_enabled():
             return False
         sender_id = self._telegram_message_user_id(message)
         if not sender_id:
             return False
+
+        bot = getattr(self, "_bot", None)
+        if bot is not None:
+            try:
+                bot_id = str(getattr(bot, "id", "") or "").strip()
+            except Exception:
+                bot_id = ""
+            if bot_id and sender_id == bot_id:
+                return True
+
+            raw_user = getattr(message, "from_user", None)
+            sender_username = str(getattr(raw_user, "username", "") or "").strip().lstrip("@").lower()
+            if sender_username:
+                try:
+                    bot_username = str(getattr(bot, "username", "") or "").strip().lstrip("@").lower()
+                except Exception:
+                    bot_username = ""
+                if bot_username and sender_username == bot_username:
+                    return True
+
         owner_id = getattr(self, "_business_owner_user_ids", {}).get(str(business_connection_id))
         if owner_id and sender_id == owner_id:
             return True
@@ -625,6 +696,27 @@ class TelegramAdapter(BasePlatformAdapter):
         return int(thread_id)
 
     @classmethod
+    def _topic_kwargs_for_send(
+        cls,
+        chat_id: Any,
+        thread_id: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """Return the correct Telegram topic kwargs for sendMessage.
+
+        Forum topics use ``message_thread_id``. Telegram Direct Messages Topics
+        use ``direct_messages_topic_id``; retrying those as ``message_thread_id``
+        makes Telegram reject the request and the old fallback leaked messages
+        into the unthreaded/general chat.
+        """
+        direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
+        if direct_topic_id:
+            return {"direct_messages_topic_id": int(direct_topic_id)}
+
+        message_thread_id = cls._message_thread_id_for_send(thread_id)
+        return {"message_thread_id": message_thread_id}
+
+    @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
         # Asymmetric with _message_thread_id_for_send on purpose. Telegram's
         # sendMessage and sendChatAction treat thread id "1" (the forum General
@@ -639,7 +731,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
-        return "thread not found" in str(error).lower()
+        text = str(error).lower()
+        return "thread not found" in text or "topic not found" in text
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -1142,8 +1235,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     try:
                         await self._bot.send_message(
                             chat_id=int(chat_id),
-                            message_thread_id=thread_id,
-                            text=f"\U0001f4cc {topic_name}",
+                            **self._topic_kwargs_for_send(chat_id, str(thread_id)),
+                            text=f"📌 {topic_name}",
                         )
                     except Exception as seed_err:
                         logger.debug(
@@ -1503,7 +1596,7 @@ class TelegramAdapter(BasePlatformAdapter):
         }
         owner_thread_id = self._business_owner_thread_id()
         if owner_thread_id:
-            kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
         try:
             msg = await self._bot.send_message(**kwargs)
             return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
@@ -1618,11 +1711,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             }
             if owner_thread_id:
-                kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+                kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
             try:
                 msg = await self._bot.send_message(**kwargs)
                 return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
             except Exception as exc:
+                if self._is_thread_not_found_error(exc) and ("message_thread_id" in kwargs or "direct_messages_topic_id" in kwargs):
+                    logger.error(
+                        "[%s] Business owner topic %s not found; not retrying notice unthreaded",
+                        self.name,
+                        owner_thread_id,
+                    )
                 logger.error("[%s] Failed to send Telegram Business owner notice: %s", self.name, exc, exc_info=True)
                 return SendResult(success=True, raw_response={"business_notice_error": str(exc)})
 
@@ -1635,11 +1734,15 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         approval_id = uuid.uuid4().hex[:16]
-        self._business_approval_state[approval_id] = {
+        approval_entry = {
             "chat_id": str(chat_id),
             "business_connection_id": str(business_connection_id),
             "draft": content,
         }
+        direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
+        if direct_topic_id:
+            approval_entry["direct_messages_topic_id"] = str(direct_topic_id)
+        self._business_approval_state[approval_id] = approval_entry
 
         prompt = self._business_approval_prompt_text(
             chat_id=chat_id,
@@ -1667,7 +1770,7 @@ class TelegramAdapter(BasePlatformAdapter):
         }
         owner_thread_id = self._business_owner_thread_id()
         if owner_thread_id:
-            kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
         try:
             msg = await self._bot.send_message(**kwargs)
             return SendResult(
@@ -1676,6 +1779,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 raw_response={"business_approval_id": approval_id},
             )
         except Exception as exc:
+            if self._is_thread_not_found_error(exc) and ("message_thread_id" in kwargs or "direct_messages_topic_id" in kwargs):
+                logger.error(
+                    "[%s] Business owner topic %s not found; not retrying approval prompt unthreaded",
+                    self.name,
+                    owner_thread_id,
+                )
             self._business_approval_state.pop(approval_id, None)
             logger.error("[%s] Failed to send Telegram Business approval prompt: %s", self.name, exc, exc_info=True)
             # Treat as delivered from the base pipeline's perspective so it
@@ -1742,7 +1851,7 @@ class TelegramAdapter(BasePlatformAdapter):
             for i, chunk in enumerate(chunks):
                 should_thread = self._should_thread_reply(reply_to, i)
                 reply_to_id = int(reply_to) if should_thread else None
-                effective_thread_id = self._message_thread_id_for_send(thread_id)
+                topic_kwargs = self._topic_kwargs_for_send(chat_id, thread_id, metadata)
 
                 msg = None
                 for _send_attempt in range(3):
@@ -1754,7 +1863,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
-                                message_thread_id=effective_thread_id,
+                                **topic_kwargs,
                                 **self._link_preview_kwargs(),
                             )
                         except Exception as md_error:
@@ -1767,7 +1876,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
-                                    message_thread_id=effective_thread_id,
+                                    **topic_kwargs,
                                     **self._link_preview_kwargs(),
                                 )
                             else:
@@ -1779,16 +1888,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         # (not transient network issues). Detect and handle
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
-                            if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                # Thread doesn't exist — retry without
-                                # message_thread_id so the message still
-                                # reaches the chat.
-                                logger.warning(
-                                    "[%s] Thread %s not found, retrying without message_thread_id",
-                                    self.name, effective_thread_id,
+                            if self._is_thread_not_found_error(send_err) and topic_kwargs:
+                                # Fail closed for topic-scoped sends. Retrying
+                                # without topic kwargs leaks replies/status into
+                                # the unthreaded/general Telegram chat.
+                                logger.error(
+                                    "[%s] Telegram topic send failed for chat %s topic=%s; not retrying unthreaded: %s",
+                                    self.name,
+                                    chat_id,
+                                    topic_kwargs,
+                                    send_err,
                                 )
-                                effective_thread_id = None
-                                continue
+                                raise
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
                                 # Original message was deleted before we
@@ -2004,17 +2115,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 }
                 owner_thread_id = self._business_owner_thread_id()
                 if owner_thread_id:
-                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+                    kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
                 msg = await self._bot.send_message(**kwargs)
                 return SendResult(success=True, message_id=str(msg.message_id))
 
-            message_thread_id = self._message_thread_id_for_send(thread_id)
+            topic_kwargs = self._topic_kwargs_for_send(chat_id, thread_id, metadata)
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
-                message_thread_id=message_thread_id,
+                **topic_kwargs,
                 **self._link_preview_kwargs(),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -2089,7 +2200,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 }
                 owner_thread_id = self._business_owner_thread_id()
                 if owner_thread_id:
-                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+                    kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
             else:
                 kwargs = {
                     "chat_id": int(chat_id),
@@ -2098,9 +2209,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "reply_markup": keyboard,
                     **self._link_preview_kwargs(),
                 }
-                message_thread_id = self._message_thread_id_for_send(thread_id)
-                if message_thread_id is not None:
-                    kwargs["message_thread_id"] = message_thread_id
+                kwargs.update(self._topic_kwargs_for_send(chat_id, thread_id, metadata))
 
             msg = await self._bot.send_message(**kwargs)
 
@@ -2162,7 +2271,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 }
                 owner_thread_id = self._business_owner_thread_id()
                 if owner_thread_id:
-                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+                    kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
             else:
                 kwargs = {
                     "chat_id": int(chat_id),
@@ -2171,9 +2280,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "reply_markup": keyboard,
                     **self._link_preview_kwargs(),
                 }
-                message_thread_id = self._message_thread_id_for_send(thread_id)
-                if message_thread_id is not None:
-                    kwargs["message_thread_id"] = message_thread_id
+                kwargs.update(self._topic_kwargs_for_send(chat_id, thread_id, metadata))
 
             msg = await self._bot.send_message(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
@@ -2242,12 +2349,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     "Switch models from the owner chat instead."
                 )
 
+            topic_kwargs = self._topic_kwargs_for_send(chat_id, thread_id, metadata)
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
-                message_thread_id=int(thread_id) if thread_id else None,
+                **topic_kwargs,
                 **self._link_preview_kwargs(),
             )
 
@@ -2523,7 +2631,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if (
                 not owner_chat_id
                 or str(query_chat_id) != str(owner_chat_id)
-                or (owner_thread_id and str(query_thread_id or "") != str(owner_thread_id))
                 or not self._is_callback_user_authorized(
                     caller_id,
                     chat_id=query_chat_id,
@@ -2571,12 +2678,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
                 sent_ids: list[str] = []
                 for chunk in chunks:
-                    msg = await self._bot.send_message(
-                        chat_id=self._telegram_chat_id(entry["chat_id"]),
-                        business_connection_id=entry["business_connection_id"],
-                        text=chunk,
+                    kwargs = {
+                        "chat_id": self._telegram_chat_id(entry["chat_id"]),
+                        "business_connection_id": entry["business_connection_id"],
+                        "text": chunk,
                         **self._link_preview_kwargs(),
-                    )
+                    }
+                    direct_topic_id = entry.get("direct_messages_topic_id")
+                    if direct_topic_id:
+                        kwargs["direct_messages_topic_id"] = int(direct_topic_id)
+                    msg = await self._bot.send_message(**kwargs)
                     sent_ids.append(str(getattr(msg, "message_id", "") or ""))
                 await query.answer(text="Sent")
                 try:
@@ -2804,22 +2915,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 # .ogg / .opus files -> send as voice (round playable bubble)
                 if ext in (".ogg", ".opus"):
                     _voice_thread = self._metadata_thread_id(metadata)
+                    _voice_topic_kwargs = self._topic_kwargs_for_send(chat_id, _voice_thread, metadata)
                     msg = await self._bot.send_voice(
                         chat_id=int(chat_id),
                         voice=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=self._message_thread_id_for_send(_voice_thread),
+                        **_voice_topic_kwargs,
                     )
                 elif ext in (".mp3", ".m4a"):
                     # Telegram's Bot API sendAudio only accepts MP3 / M4A.
                     _audio_thread = self._metadata_thread_id(metadata)
+                    _audio_topic_kwargs = self._topic_kwargs_for_send(chat_id, _audio_thread, metadata)
                     msg = await self._bot.send_audio(
                         chat_id=int(chat_id),
                         audio=audio_file,
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=self._message_thread_id_for_send(_audio_thread),
+                        **_audio_topic_kwargs,
                     )
                 else:
                     # Formats Telegram can't play natively (.wav, .flac, ...)
@@ -2833,13 +2946,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram voice/audio topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
                 self.name,
                 e,
                 exc_info=True,
             )
-            return await super().send_voice(chat_id, audio_path, caption, reply_to)
+            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
 
     async def send_multiple_images(
         self,
@@ -2900,7 +3022,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
-        _thread_id = self._message_thread_id_for_send(_thread)
+        _topic_kwargs = self._topic_kwargs_for_send(chat_id, _thread, metadata)
 
         # Chunk into groups of 10 (Telegram's album limit)
         CHUNK = 10
@@ -2939,9 +3061,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._bot.send_media_group(
                     chat_id=int(chat_id),
                     media=media,
-                    message_thread_id=_thread_id,
+                    **_topic_kwargs,
                 )
             except Exception as e:
+                if self._is_thread_not_found_error(e) and _topic_kwargs:
+                    logger.error(
+                        "[%s] Telegram media group topic send failed; not falling back unthreaded: %s",
+                        self.name,
+                        e,
+                    )
+                    continue
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e,
@@ -2981,16 +3110,26 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
 
             _thread = self._metadata_thread_id(metadata)
+            _topic_kwargs = self._topic_kwargs_for_send(chat_id, _thread, metadata)
             with open(image_path, "rb") as image_file:
                 msg = await self._bot.send_photo(
                     chat_id=int(chat_id),
                     photo=image_file,
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=self._message_thread_id_for_send(_thread),
+                    **_topic_kwargs,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram image topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
             # files that Telegram just refuses as photos (screenshots, extreme
@@ -3038,7 +3177,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     doc_err,
                     exc_info=True,
                 )
-                return await super().send_image_file(chat_id, image_path, caption, reply_to)
+                return await super().send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
 
     async def send_document(
         self,
@@ -3065,6 +3204,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             display_name = file_name or os.path.basename(file_path)
             _thread = self._metadata_thread_id(metadata)
+            _topic_kwargs = self._topic_kwargs_for_send(chat_id, _thread, metadata)
 
             with open(file_path, "rb") as f:
                 msg = await self._bot.send_document(
@@ -3073,12 +3213,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     filename=display_name,
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=self._message_thread_id_for_send(_thread),
+                    **_topic_kwargs,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram document topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             print(f"[{self.name}] Failed to send document: {e}")
-            return await super().send_document(chat_id, file_path, caption, file_name, reply_to)
+            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_video(
         self,
@@ -3103,18 +3252,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
 
             _thread = self._metadata_thread_id(metadata)
+            _topic_kwargs = self._topic_kwargs_for_send(chat_id, _thread, metadata)
             with open(video_path, "rb") as f:
                 msg = await self._bot.send_video(
                     chat_id=int(chat_id),
                     video=f,
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=self._message_thread_id_for_send(_thread),
+                    **_topic_kwargs,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram video topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             print(f"[{self.name}] Failed to send video: {e}")
-            return await super().send_video(chat_id, video_path, caption, reply_to)
+            return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
 
     async def send_image(
         self,
@@ -3145,15 +3304,25 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
             _photo_thread = self._metadata_thread_id(metadata)
+            _photo_topic_kwargs = self._topic_kwargs_for_send(chat_id, _photo_thread, metadata)
             msg = await self._bot.send_photo(
                 chat_id=int(chat_id),
                 photo=image_url,
                 caption=caption[:1024] if caption else None,  # Telegram caption limit
                 reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=self._message_thread_id_for_send(_photo_thread),
+                **_photo_topic_kwargs,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram image URL topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s",
                 self.name,
@@ -3173,10 +3342,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     photo=image_data,
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=self._message_thread_id_for_send(_photo_thread),
+                    **_photo_topic_kwargs,
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
+                if self._is_thread_not_found_error(e2) and self._topic_kwargs_for_send(
+                    chat_id, self._metadata_thread_id(metadata), metadata
+                ):
+                    logger.error(
+                        "[%s] Telegram image upload topic send failed; not falling back unthreaded: %s",
+                        self.name,
+                        e2,
+                    )
+                    return SendResult(success=False, error=str(e2))
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
                     self.name,
@@ -3184,7 +3362,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Final fallback: send URL as text
-                return await super().send_image(chat_id, image_url, caption, reply_to)
+                return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
     async def send_animation(
         self,
@@ -3205,15 +3383,25 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             _anim_thread = self._metadata_thread_id(metadata)
+            _anim_topic_kwargs = self._topic_kwargs_for_send(chat_id, _anim_thread, metadata)
             msg = await self._bot.send_animation(
                 chat_id=int(chat_id),
                 animation=animation_url,
                 caption=caption[:1024] if caption else None,
                 reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=self._message_thread_id_for_send(_anim_thread),
+                **_anim_topic_kwargs,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_thread_not_found_error(e) and self._topic_kwargs_for_send(
+                chat_id, self._metadata_thread_id(metadata), metadata
+            ):
+                logger.error(
+                    "[%s] Telegram animation topic send failed; not falling back unthreaded: %s",
+                    self.name,
+                    e,
+                )
+                return SendResult(success=False, error=str(e))
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
                 self.name,
@@ -3221,7 +3409,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             # Fallback: try as a regular photo
-            return await self.send_image(chat_id, animation_url, caption, reply_to)
+            return await self.send_image(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
@@ -3233,6 +3421,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Typing indicators are direct customer-facing Business API
                     # actions. Suppress them so the only customer-visible
                     # Business action is the owner-approved final Send.
+                    return
+                typing_topic_kwargs = self._topic_kwargs_for_send(chat_id, _typing_thread, metadata)
+                if "direct_messages_topic_id" in typing_topic_kwargs:
+                    # Bot API 9.x/PTB 22.7 supports direct_messages_topic_id on
+                    # send* methods, but not sendChatAction.  Do not send a
+                    # typing indicator with message_thread_id into the wrong DM.
                     return
                 message_thread_id = self._message_thread_id_for_typing(_typing_thread)
                 # No retry-without-thread fallback here: _message_thread_id_for_typing
@@ -4395,11 +4589,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # connection id into thread_id so build_session_key and response routing
         # both preserve the isolation without changing ordinary DM/group/topic
         # behavior.
-        thread_id_raw = message.message_thread_id
+        direct_topic_id = self._direct_messages_topic_id_from_message(message)
+        thread_id_raw = direct_topic_id if direct_topic_id is not None else message.message_thread_id
         thread_id_str = str(thread_id_raw) if thread_id_raw is not None else None
         if business_connection_id:
             chat_type = "dm"
-            thread_id_str = self._business_thread_id(business_connection_id)
+            thread_id_str = self._business_thread_id(business_connection_id, direct_topic_id)
         elif chat_type == "group" and thread_id_str is None and getattr(chat, "is_forum", False):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = "Telegram Business" if business_connection_id else None

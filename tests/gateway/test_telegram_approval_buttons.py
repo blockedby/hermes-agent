@@ -131,7 +131,7 @@ class TestTelegramExecApproval:
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
         await adapter.send_exec_approval(
-            chat_id="12345",
+            chat_id="-100123",
             command="ls",
             session_key="s",
             metadata={"thread_id": "999"},

@@ -9,20 +9,22 @@ from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms import telegram as telegram_mod
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 
 
-def _make_adapter(*, owner_chat_id: str = "999") -> TelegramAdapter:
+def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = None) -> TelegramAdapter:
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(
         enabled=True,
         token="test-token",
-        home_channel=HomeChannel(Platform.TELEGRAM, owner_chat_id, "Owner"),
+        home_channel=HomeChannel(Platform.TELEGRAM, owner_chat_id, "Owner", thread_id=owner_thread_id),
         extra={},
     )
-    adapter._bot = SimpleNamespace(username="hermesbot", send_message=AsyncMock(), send_chat_action=AsyncMock())
+    adapter._bot = SimpleNamespace(id=1215244879, username="hermesbot", send_message=AsyncMock(), send_chat_action=AsyncMock())
     adapter._bot.send_message.return_value = SimpleNamespace(message_id=101)
     adapter._approval_state = {}
     adapter._slash_confirm_state = {}
@@ -36,6 +38,8 @@ def _make_adapter(*, owner_chat_id: str = "999") -> TelegramAdapter:
     adapter._text_batch_delay_seconds = 0
     adapter._message_handler = AsyncMock()
     adapter._model_picker_state = {}
+    adapter._dm_topics = {}
+    adapter._dm_topics_config = []
     adapter._disable_link_previews = False
     return adapter
 
@@ -159,6 +163,34 @@ async def test_business_update_ignores_configured_business_chat_id():
     adapter._enqueue_text_event.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_business_update_ignores_bot_echo_message_by_default():
+    adapter = _make_adapter(owner_chat_id="227049836")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=92,
+        business_connection=SimpleNamespace(
+            id="bc-9",
+            is_enabled=True,
+            rights=SimpleNamespace(can_reply=True),
+            user=SimpleNamespace(id=227049836),
+        ),
+        business_message=_business_message(
+            text="⏳ Retrying in 5.9s (attempt 2/3)...",
+            connection_id="bc-9",
+            chat_id=1215244879,
+            from_user_id=1215244879,
+        ),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+
+
 def test_build_message_event_marks_business_session_thread():
     adapter = _make_adapter()
 
@@ -183,6 +215,116 @@ def test_business_session_key_is_isolated_from_normal_dm():
     assert business_event.source.to_dict()["chat_topic"] == "Telegram Business"
     assert build_session_key(normal_event.source) == "agent:main:telegram:dm:12345"
     assert build_session_key(business_event.source) == "agent:main:telegram:dm:12345:business:bc-42"
+
+
+def test_business_direct_messages_topic_session_key_isolated_per_topic():
+    adapter = _make_adapter()
+    first = _business_message(connection_id="bc-42", text="first topic")
+    first.direct_messages_topic = SimpleNamespace(topic_id=338575)
+    second = _business_message(connection_id="bc-42", text="second topic")
+    second.direct_messages_topic = SimpleNamespace(topic_id=338576)
+
+    first_event = adapter._build_message_event(first, MessageType.TEXT, update_id=8)
+    second_event = adapter._build_message_event(second, MessageType.TEXT, update_id=9)
+
+    assert first_event.source.thread_id == "business:bc-42:topic:338575"
+    assert second_event.source.thread_id == "business:bc-42:topic:338576"
+    assert build_session_key(first_event.source) == "agent:main:telegram:dm:12345:business:bc-42:topic:338575"
+    assert build_session_key(second_event.source) == "agent:main:telegram:dm:12345:business:bc-42:topic:338576"
+    assert build_session_key(first_event.source) != build_session_key(second_event.source)
+
+    metadata = adapter._message_event_metadata(first_event)
+    assert metadata["business_connection_id"] == "bc-42"
+    assert metadata["direct_messages_topic_id"] == "338575"
+
+
+def test_direct_messages_topic_builds_thread_and_metadata():
+    adapter = _make_adapter()
+    msg = _telegram_message(text="topic hello")
+    msg.message_thread_id = None
+    msg.direct_messages_topic = SimpleNamespace(topic_id=338575)
+
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=8)
+    metadata = adapter._message_event_metadata(event)
+
+    assert event.source.chat_type == "dm"
+    assert event.source.thread_id == "338575"
+    assert metadata["thread_id"] == "338575"
+    assert metadata["direct_messages_topic_id"] == "338575"
+
+
+def test_direct_messages_topic_session_key_isolated_per_topic():
+    adapter = _make_adapter()
+    first = _telegram_message(text="first topic")
+    first.direct_messages_topic = SimpleNamespace(topic_id=338575)
+    second = _telegram_message(text="second topic")
+    second.direct_messages_topic = SimpleNamespace(topic_id=338576)
+
+    first_event = adapter._build_message_event(first, MessageType.TEXT, update_id=9)
+    second_event = adapter._build_message_event(second, MessageType.TEXT, update_id=10)
+
+    assert build_session_key(first_event.source) == "agent:main:telegram:dm:12345:338575"
+    assert build_session_key(second_event.source) == "agent:main:telegram:dm:12345:338576"
+    assert build_session_key(first_event.source) != build_session_key(second_event.source)
+
+
+def test_business_customer_bypasses_generic_dm_allowlist(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "227049836")
+
+    business_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="1215244879",
+        chat_type="dm",
+        user_id="1215244879",
+        user_name="Customer",
+        thread_id="business:bc-42",
+    )
+    normal_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="1215244879",
+        chat_type="dm",
+        user_id="1215244879",
+        user_name="Customer",
+    )
+
+    assert runner._is_user_authorized(business_source) is True
+    assert runner._is_user_authorized(normal_source) is False
+
+
+@pytest.mark.asyncio
+async def test_business_busy_ack_is_suppressed_but_interrupt_still_happens():
+    runner = object.__new__(GatewayRunner)
+    runner._busy_input_mode = "interrupt"
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner.adapters = {}
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="1215244879",
+        chat_type="dm",
+        user_id="1215244879",
+        user_name="Customer",
+        thread_id="business:bc-42",
+    )
+    event = MessageEvent(text="new customer text", source=source, message_id="m1")
+    session_key = build_session_key(source)
+    agent = MagicMock()
+    adapter = SimpleNamespace(_pending_messages={}, _send_with_retry=AsyncMock())
+    runner._running_agents[session_key] = agent
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    result = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert result is True
+    agent.interrupt.assert_called_once_with("new customer text")
+    adapter._send_with_retry.assert_not_awaited()
+    assert session_key not in runner._busy_ack_ts
 
 
 @pytest.mark.asyncio
@@ -227,6 +369,37 @@ async def test_business_send_creates_owner_draft_not_customer_send():
         "business_connection_id": "bc-1",
         "draft": "Draft to approve",
     }
+
+
+@pytest.mark.asyncio
+async def test_business_owner_draft_does_not_retry_missing_thread_unthreaded():
+    adapter = _make_adapter(owner_chat_id="-100999", owner_thread_id="338512")
+    _allow_business_reply(adapter)
+    adapter._bot.send_message.side_effect = BadRequest("Message thread not found")
+
+    result = await adapter.send("12345", "Draft to approve", metadata={"thread_id": "business:bc-1"})
+
+    assert result.success is True
+    assert adapter._bot.send_message.call_count == 1
+    first_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert first_kwargs["message_thread_id"] == 338512
+    assert "direct_messages_topic_id" not in first_kwargs
+    assert adapter._business_approval_state == {}
+
+
+@pytest.mark.asyncio
+async def test_business_owner_notice_does_not_retry_missing_thread_unthreaded():
+    adapter = _make_adapter(owner_chat_id="-100999", owner_thread_id="338512")
+    adapter._business_can_reply["bc-1"] = False
+    adapter._bot.send_message.side_effect = BadRequest("Message thread not found")
+
+    result = await adapter.send("12345", "Draft to approve", metadata={"thread_id": "business:bc-1"})
+
+    assert result.success is True
+    assert adapter._bot.send_message.call_count == 1
+    first_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert first_kwargs["message_thread_id"] == 338512
+    assert "direct_messages_topic_id" not in first_kwargs
 
 
 @pytest.mark.asyncio
@@ -342,6 +515,37 @@ async def test_business_approval_send_uses_business_connection_id():
 
 
 @pytest.mark.asyncio
+async def test_business_approval_allows_owner_prompt_after_thread_fallback():
+    adapter = _make_adapter(owner_chat_id="999", owner_thread_id="338512")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = {
+        "chat_id": "12345",
+        "business_connection_id": "bc-1",
+        "draft": "Approved text",
+    }
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=None,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_called_once()
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 12345
+    assert call_kwargs["business_connection_id"] == "bc-1"
+    query.answer.assert_awaited_with(text="Sent")
+
+
+@pytest.mark.asyncio
 async def test_business_approval_denies_without_explicit_authorization():
     adapter = _make_adapter(owner_chat_id="999")
     _allow_business_reply(adapter)
@@ -420,6 +624,63 @@ async def test_normal_telegram_send_does_not_include_business_connection_id():
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["text"]
     assert "business_connection_id" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_private_bot_dm_topic_send_uses_message_thread_id():
+    adapter = _make_adapter()
+
+    result = await adapter.send("227049836", "Topic reply", metadata={"thread_id": "338575"})
+
+    assert result.success is True
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 227049836
+    assert call_kwargs["message_thread_id"] == 338575
+    assert "direct_messages_topic_id" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_direct_messages_topic_send_uses_explicit_direct_messages_topic_id():
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "227049836",
+        "Topic reply",
+        metadata={"thread_id": "338575", "direct_messages_topic_id": "338575"},
+    )
+
+    assert result.success is True
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 227049836
+    assert call_kwargs["direct_messages_topic_id"] == 338575
+    assert "message_thread_id" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_thread_not_found_does_not_retry_unthreaded():
+    adapter = _make_adapter()
+    adapter._bot.send_message.side_effect = BadRequest("Message thread not found")
+
+    result = await adapter.send("227049836", "Topic reply", metadata={"thread_id": "338575"})
+
+    assert result.success is False
+    assert adapter._bot.send_message.call_count == 1
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["message_thread_id"] == 338575
+    assert "direct_messages_topic_id" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_forum_topic_send_still_uses_message_thread_id():
+    adapter = _make_adapter()
+
+    result = await adapter.send("-100123", "Forum reply", metadata={"thread_id": "42"})
+
+    assert result.success is True
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == -100123
+    assert call_kwargs["message_thread_id"] == 42
+    assert "direct_messages_topic_id" not in call_kwargs
 
 
 @pytest.mark.asyncio
@@ -507,22 +768,11 @@ async def test_business_slash_confirm_routes_to_owner_not_customer():
     assert adapter._slash_confirm_state == {"c1": "agent:main:telegram:dm:12345:business:bc-1"}
 
 
-@pytest.mark.asyncio
-async def test_unauthorized_business_pairing_notice_routes_to_owner_not_customer():
+def test_business_customer_source_bypasses_gateway_user_pairing_auth():
     from gateway.run import GatewayRunner
 
-    adapter = _make_adapter(owner_chat_id="999")
-    adapter._notify_business_owner = AsyncMock(return_value=SendResult(success=True))
-    adapter.send = AsyncMock(side_effect=AssertionError("must not send directly to business customer"))
-
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {Platform.TELEGRAM: adapter}
     runner._is_user_authorized = MagicMock(return_value=False)
-    runner._get_unauthorized_dm_behavior = MagicMock(return_value="pair")
-    runner.pairing_store = SimpleNamespace(
-        _is_rate_limited=MagicMock(return_value=False),
-        generate_code=MagicMock(return_value="abc123"),
-    )
 
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -533,13 +783,24 @@ async def test_unauthorized_business_pairing_notice_routes_to_owner_not_customer
         thread_id="business:bc-1",
         chat_topic="Telegram Business",
     )
-    event = MessageEvent(text="hello", source=source)
 
-    result = await runner._handle_message(event)
+    assert runner._is_message_dispatch_authorized(source) is True
+    runner._is_user_authorized.assert_not_called()
 
-    assert result is None
-    adapter.send.assert_not_called()
-    adapter._notify_business_owner.assert_awaited_once()
-    notice = adapter._notify_business_owner.call_args.args[0]
-    assert "pairing approve telegram abc123" in notice
-    assert "Customer chat: 12345" in notice
+
+def test_normal_telegram_dm_still_uses_gateway_user_pairing_auth():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized = MagicMock(return_value=False)
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="67890",
+        user_name="Customer User",
+    )
+
+    assert runner._is_message_dispatch_authorized(source) is False
+    runner._is_user_authorized.assert_called_once_with(source)

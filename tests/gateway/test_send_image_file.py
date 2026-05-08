@@ -15,6 +15,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
+from telegram.error import BadRequest
 
 
 def _run(coro):
@@ -147,13 +148,34 @@ class TestTelegramSendImageFile:
         call_kwargs = adapter._bot.send_photo.call_args.kwargs
         assert len(call_kwargs["caption"]) == 1024
 
-    def test_thread_id_forwarded(self, adapter, tmp_path):
-        """metadata thread_id is forwarded as message_thread_id (required for Telegram forum groups)."""
+    def test_thread_id_forwarded_for_forum_groups(self, adapter, tmp_path):
+        """Forum metadata thread_id is forwarded as message_thread_id for negative supergroup ids."""
         img = tmp_path / "shot.png"
         img.write_bytes(b"\x89PNG" + b"\x00" * 50)
 
         mock_msg = MagicMock()
         mock_msg.message_id = 43
+        adapter._bot.send_photo = AsyncMock(return_value=mock_msg)
+
+        _run(
+            adapter.send_image_file(
+                chat_id="-100123",
+                image_path=str(img),
+                metadata={"thread_id": "789"},
+            )
+        )
+
+        call_kwargs = adapter._bot.send_photo.call_args.kwargs
+        assert call_kwargs["message_thread_id"] == 789
+        assert "direct_messages_topic_id" not in call_kwargs
+
+    def test_direct_messages_topic_forwarded_for_private_dm(self, adapter, tmp_path):
+        """DM topic metadata uses direct_messages_topic_id, not message_thread_id."""
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 50)
+
+        mock_msg = MagicMock()
+        mock_msg.message_id = 44
         adapter._bot.send_photo = AsyncMock(return_value=mock_msg)
 
         _run(
@@ -165,7 +187,27 @@ class TestTelegramSendImageFile:
         )
 
         call_kwargs = adapter._bot.send_photo.call_args.kwargs
-        assert call_kwargs["message_thread_id"] == 789
+        assert call_kwargs["direct_messages_topic_id"] == 789
+        assert "message_thread_id" not in call_kwargs
+
+    def test_direct_messages_topic_missing_does_not_fallback_unthreaded(self, adapter, tmp_path):
+        """A deleted/missing DM topic must fail closed instead of sending in the unthreaded DM."""
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 50)
+        adapter._bot.send_photo = AsyncMock(side_effect=BadRequest("Message thread not found"))
+        adapter._bot.send_document = AsyncMock()
+
+        result = _run(
+            adapter.send_image_file(
+                chat_id="12345",
+                image_path=str(img),
+                metadata={"thread_id": "789"},
+            )
+        )
+
+        assert not result.success
+        adapter._bot.send_photo.assert_awaited_once()
+        adapter._bot.send_document.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
