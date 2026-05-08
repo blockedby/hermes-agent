@@ -670,14 +670,71 @@ class TelegramAdapter(BasePlatformAdapter):
         connection_id = str(getattr(connection, "id", "") or "").strip()
         if not connection_id:
             return None
+        if not hasattr(self, "_business_owner_user_ids"):
+            self._business_owner_user_ids = {}
         self._business_can_reply[connection_id] = self._coerce_business_can_reply(connection)
+        user = getattr(connection, "user", None)
+        user_id = str(getattr(user, "id", "") or "").strip()
+        if user_id:
+            self._business_owner_user_ids[connection_id] = user_id
         logger.info(
-            "[%s] Telegram Business connection %s updated: can_reply=%s",
+            "[%s] Telegram Business connection %s updated: can_reply=%s owner_user_id=%s",
             self.name,
             connection_id,
             self._business_can_reply[connection_id],
+            user_id or "unknown",
         )
         return connection_id
+
+    def _business_ignore_self_messages_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self,
+                "_business_ignore_self_messages",
+                self._coerce_bool_extra(
+                    "business_ignore_self_messages",
+                    os.getenv("TELEGRAM_BUSINESS_IGNORE_SELF_MESSAGES", "true").strip().lower()
+                    not in ("false", "0", "no", "off"),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _telegram_message_user_id(message: Message) -> Optional[str]:
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "").strip()
+        return user_id or None
+
+    @staticmethod
+    def _telegram_message_chat_id(message: Message) -> Optional[str]:
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", "") or "").strip()
+        return chat_id or None
+
+    def _is_ignored_business_chat(self, message: Message) -> bool:
+        ignored = getattr(self, "_business_ignored_chat_ids", None)
+        if ignored is None:
+            ignored = self._coerce_str_set_extra(
+                "business_ignored_chat_ids",
+                env_var="TELEGRAM_BUSINESS_IGNORED_CHAT_IDS",
+            )
+        return bool(self._telegram_message_chat_id(message) in ignored)
+
+    def _is_business_self_message(self, message: Message, business_connection_id: str) -> bool:
+        """Return True when a Business update was sent by the connected owner."""
+        if not self._business_ignore_self_messages_enabled():
+            return False
+        sender_id = self._telegram_message_user_id(message)
+        if not sender_id:
+            return False
+        owner_id = getattr(self, "_business_owner_user_ids", {}).get(str(business_connection_id))
+        if owner_id and sender_id == owner_id:
+            return True
+        # Practical fallback for personal bots where the owner/home chat is a
+        # private chat whose id equals the Telegram user id.  This also covers
+        # startup windows before Telegram has replayed BusinessConnection.
+        owner_chat_id = self._business_owner_chat_id()
+        return bool(owner_chat_id and sender_id == str(owner_chat_id))
 
     def _business_reply_allowed(self, business_connection_id: str) -> bool:
         """Return True only for a known enabled Business connection with can_reply."""
@@ -980,6 +1037,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
             return default
         return bool(value)
+
+    def _coerce_str_set_extra(self, key: str, *, env_var: Optional[str] = None) -> set[str]:
+        values: Any = None
+        if env_var:
+            env_value = os.getenv(env_var, "").strip()
+            if env_value:
+                values = env_value
+        if values is None and getattr(self.config, "extra", None):
+            values = self.config.extra.get(key)
+        if values is None:
+            return set()
+        if isinstance(values, str):
+            raw_items = values.split(",")
+        elif isinstance(values, (list, tuple, set)):
+            raw_items = values
+        else:
+            raw_items = [values]
+        return {str(item).strip() for item in raw_items if str(item).strip()}
 
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):

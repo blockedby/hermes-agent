@@ -28,6 +28,9 @@ def _make_adapter(*, owner_chat_id: str = "999") -> TelegramAdapter:
     adapter._slash_confirm_state = {}
     adapter._business_approval_state = {}
     adapter._business_can_reply = {}
+    adapter._business_owner_user_ids = {}
+    adapter._business_ignore_self_messages = True
+    adapter._business_ignored_chat_ids = set()
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0
@@ -50,8 +53,16 @@ def _telegram_message(*, text: str = "hello"):
     )
 
 
-def _business_message(*, text: str = "hello", connection_id: str = "bc-1"):
+def _business_message(
+    *,
+    text: str = "hello",
+    connection_id: str = "bc-1",
+    chat_id: int = 12345,
+    from_user_id: int = 67890,
+):
     msg = _telegram_message(text=text)
+    msg.chat.id = chat_id
+    msg.from_user.id = from_user_id
     msg.business_connection_id = connection_id
     return msg
 
@@ -63,7 +74,12 @@ def _allow_business_reply(adapter: TelegramAdapter, connection_id: str = "bc-1")
 def test_record_business_connection_can_reply_rights():
     adapter = _make_adapter()
 
-    enabled = SimpleNamespace(id="bc-enabled", is_enabled=True, rights=SimpleNamespace(can_reply=True))
+    enabled = SimpleNamespace(
+        id="bc-enabled",
+        is_enabled=True,
+        rights=SimpleNamespace(can_reply=True),
+        user=SimpleNamespace(id=227049836),
+    )
     disabled = SimpleNamespace(id="bc-disabled", is_enabled=False, rights=SimpleNamespace(can_reply=True))
     no_reply = SimpleNamespace(id="bc-no-reply", is_enabled=True, rights=SimpleNamespace(can_reply=False))
 
@@ -74,6 +90,73 @@ def test_record_business_connection_can_reply_rights():
     assert adapter._business_can_reply["bc-enabled"] is True
     assert adapter._business_can_reply["bc-disabled"] is False
     assert adapter._business_can_reply["bc-no-reply"] is False
+    assert adapter._business_owner_user_ids["bc-enabled"] == "227049836"
+
+
+@pytest.mark.asyncio
+async def test_business_update_ignores_owner_self_message_by_default():
+    adapter = _make_adapter(owner_chat_id="227049836")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=89,
+        business_connection=SimpleNamespace(
+            id="bc-9",
+            is_enabled=True,
+            rights=SimpleNamespace(can_reply=True),
+            user=SimpleNamespace(id=227049836),
+        ),
+        business_message=_business_message(text="my own outgoing note", connection_id="bc-9", from_user_id=227049836),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_update_can_process_owner_self_message_when_flag_disabled():
+    adapter = _make_adapter(owner_chat_id="227049836")
+    adapter._business_ignore_self_messages = False
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=90,
+        business_connection=SimpleNamespace(
+            id="bc-9",
+            is_enabled=True,
+            rights=SimpleNamespace(can_reply=True),
+            user=SimpleNamespace(id=227049836),
+        ),
+        business_message=_business_message(text="process me", connection_id="bc-9", from_user_id=227049836),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_business_update_ignores_configured_business_chat_id():
+    adapter = _make_adapter()
+    adapter._business_ignored_chat_ids = {"227049836"}
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=91,
+        business_connection=None,
+        business_message=_business_message(text="ignored chat", connection_id="bc-9", chat_id=227049836),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
 
 
 def test_build_message_event_marks_business_session_thread():
