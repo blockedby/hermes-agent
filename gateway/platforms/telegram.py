@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+import uuid
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
+        ApplicationHandlerStop,
         ContextTypes,
         filters,
     )
@@ -47,6 +50,8 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
+    ApplicationHandlerStop = RuntimeError
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -57,6 +62,10 @@ except ImportError:
     class _MockContextTypes:
         DEFAULT_TYPE = Any
     ContextTypes = _MockContextTypes
+
+if not isinstance(ApplicationHandlerStop, type) or not issubclass(ApplicationHandlerStop, BaseException):
+    class ApplicationHandlerStop(Exception):
+        """Fallback for test telegram mocks lacking PTB's stop sentinel."""
 
 import sys
 from pathlib import Path as _Path
@@ -305,6 +314,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Business-chat draft approvals. Telegram Business messages must never
+        # receive agent replies directly; each draft is routed to the owner's
+        # configured home chat and delivered only after an explicit Send click.
+        self._business_approval_state: Dict[str, Dict[str, str]] = {}
+        # Business connection capabilities, keyed by BusinessConnection.id.
+        # ``None`` means unknown (e.g. bot saw a message before the connection
+        # update); ``False`` is a hard no-send gate.
+        self._business_can_reply: Dict[str, Optional[bool]] = {}
 
     def _is_callback_user_authorized(
         self,
@@ -314,6 +331,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        default_allow: bool = True,
     ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -350,7 +368,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
-            return True
+            return bool(default_allow)
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -361,9 +379,177 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
 
+    _BUSINESS_THREAD_PREFIX = "business:"
+
+    @classmethod
+    def _business_thread_id(cls, business_connection_id: str) -> str:
+        return f"{cls._BUSINESS_THREAD_PREFIX}{business_connection_id}"
+
+    @classmethod
+    def _business_connection_id_from_thread(cls, thread_id: Optional[str]) -> Optional[str]:
+        if not thread_id:
+            return None
+        value = str(thread_id)
+        if not value.startswith(cls._BUSINESS_THREAD_PREFIX):
+            return None
+        connection_id = value[len(cls._BUSINESS_THREAD_PREFIX):].strip()
+        return connection_id or None
+
+    @classmethod
+    def _business_connection_id_from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not metadata:
+            return None
+        explicit = metadata.get("business_connection_id")
+        if explicit:
+            return str(explicit)
+        return cls._business_connection_id_from_thread(cls._metadata_thread_id(metadata))
+
+    @staticmethod
+    def _business_connection_id_from_message(message: Message) -> Optional[str]:
+        raw = getattr(message, "business_connection_id", None)
+        # Test doubles often synthesize arbitrary MagicMock attributes for any
+        # name; real PTB uses a string/None here.  Ignore non-string values so
+        # normal mocked Telegram messages don't accidentally become Business
+        # sessions.
+        if not isinstance(raw, str):
+            return None
+        connection_id = raw.strip()
+        return connection_id or None
+
+    @staticmethod
+    def _telegram_chat_id(value: str) -> Any:
+        text = str(value)
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return text
+
+    def _message_from_update(self, update: "Update") -> Optional[Message]:
+        """Return the Telegram message carried by a normal update.
+
+        Business updates are handled exclusively by ``_handle_business_update``.
+        Falling back to ``Update.effective_message`` here would make PTB expose
+        ``business_message`` to the ordinary text/media handlers after the
+        catch-all TypeHandler, risking duplicate processing or direct sends.
+        """
+        return getattr(update, "message", None)
+
+    def _business_owner_chat_id(self) -> Optional[str]:
+        raw = (
+            self.config.extra.get("business_owner_chat_id")
+            or self.config.extra.get("owner_chat_id")
+            or os.getenv("TELEGRAM_BUSINESS_OWNER_CHAT_ID", "").strip()
+        )
+        if raw:
+            return str(raw)
+        home = getattr(self.config, "home_channel", None)
+        if home and getattr(home, "chat_id", None):
+            return str(home.chat_id)
+        return None
+
+    def _business_owner_thread_id(self) -> Optional[str]:
+        home = getattr(self.config, "home_channel", None)
+        if home and getattr(home, "thread_id", None):
+            return str(home.thread_id)
+        return None
+
+    def _message_event_metadata(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Include Business customer context so owner approval cards are useful."""
+        metadata = super()._message_event_metadata(event) or {}
+        source = getattr(event, "source", None)
+        thread_id = getattr(source, "thread_id", None)
+        if not self._business_connection_id_from_thread(thread_id):
+            return metadata or None
+
+        metadata["inbound_text"] = getattr(event, "text", "") or ""
+        if getattr(event, "message_id", None):
+            metadata["inbound_message_id"] = str(event.message_id)
+        if getattr(source, "chat_id", None):
+            metadata["source_chat_id"] = str(source.chat_id)
+        if getattr(source, "user_id", None):
+            metadata["source_user_id"] = str(source.user_id)
+        if getattr(source, "user_name", None):
+            metadata["source_user_name"] = str(source.user_name)
+
+        raw_message = getattr(event, "raw_message", None)
+        raw_user = getattr(raw_message, "from_user", None)
+        username = getattr(raw_user, "username", None)
+        if username:
+            metadata["telegram_username"] = str(username).lstrip("@")
+        return metadata or None
+
+    @staticmethod
+    def _coerce_business_can_reply(connection: Any) -> Optional[bool]:
+        """Extract BusinessConnection reply permission from PTB objects."""
+        if not getattr(connection, "is_enabled", True):
+            return False
+        rights = getattr(connection, "rights", None)
+        can_reply = getattr(rights, "can_reply", None) if rights is not None else None
+        if can_reply is None:
+            return None
+        return bool(can_reply)
+
+    def _record_business_connection(self, connection: Any) -> Optional[str]:
+        connection_id = str(getattr(connection, "id", "") or "").strip()
+        if not connection_id:
+            return None
+        self._business_can_reply[connection_id] = self._coerce_business_can_reply(connection)
+        logger.info(
+            "[%s] Telegram Business connection %s updated: can_reply=%s",
+            self.name,
+            connection_id,
+            self._business_can_reply[connection_id],
+        )
+        return connection_id
+
+    def _business_reply_allowed(self, business_connection_id: str) -> bool:
+        """Return True only for a known enabled Business connection with can_reply."""
+        return self._business_can_reply.get(str(business_connection_id)) is True
+
+    async def _refresh_business_connection(self, business_connection_id: str) -> Optional[bool]:
+        """Fetch and cache current Telegram Business reply capability.
+
+        Telegram may deliver ``business_message`` updates after a gateway restart
+        without replaying the earlier ``business_connection`` rights update.  The
+        official Bot API exposes ``getBusinessConnection`` for exactly this kind
+        of state lookup; use it before failing closed on unknown rights.
+        """
+        connection_id = str(business_connection_id or "").strip()
+        if not connection_id or not self._bot:
+            return None
+        get_business_connection = getattr(self._bot, "get_business_connection", None)
+        if not callable(get_business_connection):
+            return None
+        try:
+            connection = await get_business_connection(connection_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to refresh Telegram Business connection %s: %s",
+                self.name,
+                connection_id,
+                exc,
+                exc_info=True,
+            )
+            return self._business_can_reply.get(connection_id)
+        self._record_business_connection(connection)
+        return self._business_can_reply.get(connection_id)
+
+    async def _ensure_business_reply_allowed(self, business_connection_id: str) -> bool:
+        """Return current reply permission, refreshing unknown state from Telegram."""
+        connection_id = str(business_connection_id or "").strip()
+        if self._business_reply_allowed(connection_id):
+            return True
+        if self._business_can_reply.get(connection_id) is None:
+            await self._refresh_business_connection(connection_id)
+        return self._business_reply_allowed(connection_id)
+
     @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
-        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
+        if (
+            not thread_id
+            or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID
+            or cls._business_connection_id_from_thread(thread_id)
+        ):
             return None
         return int(thread_id)
 
@@ -376,7 +562,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # bubble in the General topic (omitting it hides the bubble entirely
         # from the client's view of that topic). Preserve the real id here —
         # sends still map "1" → None via _message_thread_id_for_send.
-        if not thread_id:
+        if not thread_id or cls._business_connection_id_from_thread(thread_id):
             return None
         return int(thread_id)
 
@@ -983,7 +1169,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
-            # Register handlers
+            # Register handlers. Business updates are not exposed via a
+            # dedicated PTB filter in 22.7, so inspect every Update in an
+            # earlier group and return immediately for normal updates.
+            self._app.add_handler(TypeHandler(Update, self._handle_business_update), group=-1)
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -1205,6 +1394,205 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    async def _notify_business_owner(
+        self,
+        text: str,
+    ) -> SendResult:
+        """Best-effort notice to the Telegram Business owner/home chat."""
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id:
+            logger.warning(
+                "[%s] Suppressing Telegram Business owner notice because no owner/home chat is configured",
+                self.name,
+            )
+            return SendResult(success=True, raw_response={"business_notice": "missing_owner_chat"})
+
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": text,
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+        try:
+            msg = await self._bot.send_message(**kwargs)
+            return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+        except Exception as exc:
+            logger.error("[%s] Failed to send Telegram Business owner notice: %s", self.name, exc, exc_info=True)
+            return SendResult(success=True, raw_response={"business_notice_error": str(exc)})
+
+    async def _suppress_business_non_text_send(
+        self,
+        *,
+        chat_id: str,
+        business_connection_id: str,
+        kind: str,
+    ) -> SendResult:
+        """Suppress non-text Business replies for the MVP instead of direct-sending media."""
+        return await self._notify_business_owner(
+            "💼 Telegram Business non-text reply suppressed\n\n"
+            f"Customer chat: {chat_id}\n"
+            f"Business connection: {business_connection_id}\n\n"
+            f"Hermes attempted to send {kind}, but Telegram Business support is currently text-only."
+        )
+
+    @staticmethod
+    def _truncate_business_card_field(value: str, limit: int) -> str:
+        value = (value or "").strip()
+        if utf16_len(value) <= limit:
+            return value
+        return _prefix_within_utf16_limit(value, max(0, limit - 1)).rstrip() + "…"
+
+    @staticmethod
+    def _business_customer_link(metadata: Optional[Dict[str, Any]], chat_id: str) -> tuple[str, Optional[str]]:
+        metadata = metadata or {}
+        username = str(metadata.get("telegram_username") or "").strip().lstrip("@")
+        if username:
+            label = f"@{username}"
+            url = f"https://t.me/{username}"
+            return f'<a href="{_html.escape(url, quote=True)}">{_html.escape(label)}</a>', url
+
+        user_id = str(
+            metadata.get("source_user_id")
+            or metadata.get("source_chat_id")
+            or chat_id
+            or ""
+        ).strip()
+        display = str(metadata.get("source_user_name") or user_id or "customer").strip()
+        if user_id:
+            url = f"tg://user?id={user_id}"
+            return f'<a href="{_html.escape(url, quote=True)}">{_html.escape(display)}</a>', url
+        return _html.escape(display), None
+
+    def _business_approval_prompt_text(
+        self,
+        *,
+        chat_id: str,
+        business_connection_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        customer_link, _ = self._business_customer_link(metadata, chat_id)
+        question = self._truncate_business_card_field(
+            str((metadata or {}).get("inbound_text") or ""),
+            900,
+        )
+        draft = self._truncate_business_card_field(content, 2400)
+        parts = [
+            "💼 Telegram Business draft awaiting approval",
+            "",
+            f"Customer: {customer_link}",
+            f"Chat ID: <code>{_html.escape(str(chat_id))}</code>",
+            f"Business connection: <code>{_html.escape(str(business_connection_id))}</code>",
+        ]
+        if question:
+            parts.extend([
+                "",
+                "Question:",
+                f"<blockquote>{_html.escape(question)}</blockquote>",
+            ])
+        parts.extend([
+            "",
+            "Draft:",
+            f"<blockquote>{_html.escape(draft)}</blockquote>",
+        ])
+        return "\n".join(parts)
+
+    async def _route_business_draft_for_owner_approval(
+        self,
+        *,
+        chat_id: str,
+        business_connection_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a business-chat draft to the owner instead of the customer."""
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id:
+            logger.warning(
+                "[%s] Suppressing Telegram Business reply for chat %s because no owner/home chat is configured",
+                self.name,
+                chat_id,
+            )
+            return SendResult(
+                success=True,
+                raw_response={"business_approval": "missing_owner_chat"},
+            )
+
+        owner_thread_id = self._business_owner_thread_id()
+
+        async def _send_owner_notice(text: str) -> SendResult:
+            kwargs: Dict[str, Any] = {
+                "chat_id": self._telegram_chat_id(owner_chat_id),
+                "text": text,
+                **self._link_preview_kwargs(),
+            }
+            if owner_thread_id:
+                kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+            try:
+                msg = await self._bot.send_message(**kwargs)
+                return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+            except Exception as exc:
+                logger.error("[%s] Failed to send Telegram Business owner notice: %s", self.name, exc, exc_info=True)
+                return SendResult(success=True, raw_response={"business_notice_error": str(exc)})
+
+        if not await self._ensure_business_reply_allowed(business_connection_id):
+            return await _send_owner_notice(
+                "💼 Telegram Business reply suppressed\n\n"
+                f"Customer chat: {chat_id}\n"
+                f"Business connection: {business_connection_id}\n\n"
+                "Telegram reports that this bot cannot currently reply for that Business connection."
+            )
+
+        approval_id = uuid.uuid4().hex[:16]
+        self._business_approval_state[approval_id] = {
+            "chat_id": str(chat_id),
+            "business_connection_id": str(business_connection_id),
+            "draft": content,
+        }
+
+        prompt = self._business_approval_prompt_text(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            content=content,
+            metadata=metadata,
+        )
+        _, customer_url = self._business_customer_link(metadata, chat_id)
+        keyboard_rows = []
+        if customer_url:
+            keyboard_rows.append([
+                InlineKeyboardButton("👤 Open chat", url=customer_url),
+            ])
+        keyboard_rows.append([
+            InlineKeyboardButton("✅ Send", callback_data=f"ba:s:{approval_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"ba:c:{approval_id}"),
+        ])
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": prompt,
+            "reply_markup": keyboard,
+            "parse_mode": "HTML",
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+        try:
+            msg = await self._bot.send_message(**kwargs)
+            return SendResult(
+                success=True,
+                message_id=str(getattr(msg, "message_id", "") or ""),
+                raw_response={"business_approval_id": approval_id},
+            )
+        except Exception as exc:
+            self._business_approval_state.pop(approval_id, None)
+            logger.error("[%s] Failed to send Telegram Business approval prompt: %s", self.name, exc, exc_info=True)
+            # Treat as delivered from the base pipeline's perspective so it
+            # never falls back to sending the business draft directly.
+            return SendResult(success=True, raw_response={"business_approval_error": str(exc)})
+
     async def send(
         self,
         chat_id: str,
@@ -1219,6 +1607,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._route_business_draft_for_owner_approval(
+                chat_id=str(chat_id),
+                business_connection_id=business_connection_id,
+                content=content,
+                metadata=metadata,
+            )
         
         try:
             # Format and split message if needed
@@ -1494,6 +1891,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             ])
             thread_id = self._metadata_thread_id(metadata)
+            business_connection_id = self._business_connection_id_from_metadata(metadata)
+            if business_connection_id:
+                owner_chat_id = self._business_owner_chat_id()
+                if not owner_chat_id:
+                    logger.warning(
+                        "[%s] Suppressing Telegram Business update prompt for chat %s because no owner/home chat is configured",
+                        self.name,
+                        chat_id,
+                    )
+                    return SendResult(success=True, raw_response={"business_update_prompt": "missing_owner_chat"})
+                kwargs: Dict[str, Any] = {
+                    "chat_id": self._telegram_chat_id(owner_chat_id),
+                    "text": (
+                        "💼 Telegram Business update prompt routed to owner\n\n"
+                        f"Customer chat: {chat_id}\n"
+                        f"Business connection: {business_connection_id}\n\n"
+                        f"{text}"
+                    ),
+                    "parse_mode": ParseMode.MARKDOWN,
+                    "reply_markup": keyboard,
+                    **self._link_preview_kwargs(),
+                }
+                owner_thread_id = self._business_owner_thread_id()
+                if owner_thread_id:
+                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+                msg = await self._bot.send_message(**kwargs)
+                return SendResult(success=True, message_id=str(msg.message_id))
+
             message_thread_id = self._message_thread_id_for_send(thread_id)
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
@@ -1531,6 +1956,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
+            business_connection_id = self._business_connection_id_from_metadata(metadata)
 
             # We'll use the message_id as part of callback_data to look up session_key
             # Send a placeholder first, then update — or use a counter.
@@ -1551,20 +1977,47 @@ class TelegramAdapter(BasePlatformAdapter):
                 ],
             ])
 
-            kwargs: Dict[str, Any] = {
-                "chat_id": int(chat_id),
-                "text": text,
-                "parse_mode": ParseMode.HTML,
-                "reply_markup": keyboard,
-                **self._link_preview_kwargs(),
-            }
-            message_thread_id = self._message_thread_id_for_send(thread_id)
-            if message_thread_id is not None:
-                kwargs["message_thread_id"] = message_thread_id
+            if business_connection_id:
+                owner_chat_id = self._business_owner_chat_id()
+                if not owner_chat_id:
+                    logger.warning(
+                        "[%s] Suppressing Telegram Business exec approval for chat %s because no owner/home chat is configured",
+                        self.name,
+                        chat_id,
+                    )
+                    return SendResult(success=True, raw_response={"business_exec_approval": "missing_owner_chat"})
+                kwargs: Dict[str, Any] = {
+                    "chat_id": self._telegram_chat_id(owner_chat_id),
+                    "text": (
+                        "💼 <b>Telegram Business command approval</b>\n\n"
+                        f"Customer chat: {_html.escape(str(chat_id))}\n"
+                        f"Business connection: {_html.escape(str(business_connection_id))}\n\n"
+                        f"{text}"
+                    ),
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": keyboard,
+                    **self._link_preview_kwargs(),
+                }
+                owner_thread_id = self._business_owner_thread_id()
+                if owner_thread_id:
+                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+            else:
+                kwargs = {
+                    "chat_id": int(chat_id),
+                    "text": text,
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": keyboard,
+                    **self._link_preview_kwargs(),
+                }
+                message_thread_id = self._message_thread_id_for_send(thread_id)
+                if message_thread_id is not None:
+                    kwargs["message_thread_id"] = message_thread_id
 
             msg = await self._bot.send_message(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
+            if not hasattr(self, "_approval_state"):
+                self._approval_state = {}
             self._approval_state[approval_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -1596,16 +2049,42 @@ class TelegramAdapter(BasePlatformAdapter):
             ])
 
             thread_id = self._metadata_thread_id(metadata)
-            kwargs: Dict[str, Any] = {
-                "chat_id": int(chat_id),
-                "text": preview,
-                "parse_mode": ParseMode.MARKDOWN,
-                "reply_markup": keyboard,
-                **self._link_preview_kwargs(),
-            }
-            message_thread_id = self._message_thread_id_for_send(thread_id)
-            if message_thread_id is not None:
-                kwargs["message_thread_id"] = message_thread_id
+            business_connection_id = self._business_connection_id_from_metadata(metadata)
+            if business_connection_id:
+                owner_chat_id = self._business_owner_chat_id()
+                if not owner_chat_id:
+                    logger.warning(
+                        "[%s] Suppressing Telegram Business slash confirmation for chat %s because no owner/home chat is configured",
+                        self.name,
+                        chat_id,
+                    )
+                    return SendResult(success=True, raw_response={"business_slash_confirm": "missing_owner_chat"})
+                kwargs: Dict[str, Any] = {
+                    "chat_id": self._telegram_chat_id(owner_chat_id),
+                    "text": (
+                        "💼 Telegram Business confirmation routed to owner\n\n"
+                        f"Customer chat: {chat_id}\n"
+                        f"Business connection: {business_connection_id}\n\n"
+                        f"{preview}"
+                    ),
+                    "parse_mode": ParseMode.MARKDOWN,
+                    "reply_markup": keyboard,
+                    **self._link_preview_kwargs(),
+                }
+                owner_thread_id = self._business_owner_thread_id()
+                if owner_thread_id:
+                    kwargs["message_thread_id"] = self._message_thread_id_for_send(owner_thread_id)
+            else:
+                kwargs = {
+                    "chat_id": int(chat_id),
+                    "text": preview,
+                    "parse_mode": ParseMode.MARKDOWN,
+                    "reply_markup": keyboard,
+                    **self._link_preview_kwargs(),
+                }
+                message_thread_id = self._message_thread_id_for_send(thread_id)
+                if message_thread_id is not None:
+                    kwargs["message_thread_id"] = message_thread_id
 
             msg = await self._bot.send_message(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
@@ -1664,6 +2143,16 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             thread_id = metadata.get("thread_id") if metadata else None
+            business_connection_id = self._business_connection_id_from_metadata(metadata)
+            if business_connection_id:
+                return await self._notify_business_owner(
+                    "💼 Telegram Business model picker suppressed\n\n"
+                    f"Customer chat: {chat_id}\n"
+                    f"Business connection: {business_connection_id}\n\n"
+                    "Hermes did not open the model picker in the customer chat. "
+                    "Switch models from the owner chat instead."
+                )
+
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=text,
@@ -1932,6 +2421,90 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Telegram Business draft approval callbacks (ba:s|c:id) ---
+        if data.startswith("ba:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"s", "c"}:
+                await query.answer(text="Invalid business approval data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            owner_chat_id = self._business_owner_chat_id()
+            owner_thread_id = self._business_owner_thread_id()
+            if (
+                not owner_chat_id
+                or str(query_chat_id) != str(owner_chat_id)
+                or (owner_thread_id and str(query_thread_id or "") != str(owner_thread_id))
+                or not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                    default_allow=False,
+                )
+            ):
+                await query.answer(text="⛔ You are not authorized to approve business drafts.")
+                return
+
+            action = parts[1]
+            approval_id = parts[2]
+            entry = self._business_approval_state.pop(approval_id, None)
+            if not entry:
+                await query.answer(text="This business draft has already been resolved.")
+                return
+
+            user_display = getattr(query.from_user, "first_name", "User")
+            if action == "c":
+                await query.answer(text="Cancelled")
+                try:
+                    await query.edit_message_text(
+                        text=f"❌ Business draft cancelled by {user_display}",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+
+            try:
+                if not await self._ensure_business_reply_allowed(entry["business_connection_id"]):
+                    await query.answer(text="Cannot reply: Business permission is disabled.")
+                    try:
+                        await query.edit_message_text(
+                            text="❌ Business draft not sent: Telegram reports reply permission is disabled.",
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                draft = entry["draft"]
+                chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+                sent_ids: list[str] = []
+                for chunk in chunks:
+                    msg = await self._bot.send_message(
+                        chat_id=self._telegram_chat_id(entry["chat_id"]),
+                        business_connection_id=entry["business_connection_id"],
+                        text=chunk,
+                        **self._link_preview_kwargs(),
+                    )
+                    sent_ids.append(str(getattr(msg, "message_id", "") or ""))
+                await query.answer(text="Sent")
+                try:
+                    suffix = f" ({len(sent_ids)} message(s))" if len(sent_ids) != 1 else ""
+                    await query.edit_message_text(
+                        text=f"✅ Business draft sent by {user_display}{suffix}",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.error("[%s] Telegram Business draft send failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Send failed.")
+                # Restore so the owner can retry after a transient Bot API error.
+                self._business_approval_state[approval_id] = entry
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -2127,6 +2700,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="audio/voice"
+            )
         
         try:
             if not os.path.exists(audio_path):
@@ -2195,6 +2773,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return
         if not images:
+            return
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="images"
+            )
             return
 
         try:
@@ -2297,6 +2881,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Telegram photo."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="an image file"
+            )
 
         try:
             if not os.path.exists(image_path):
@@ -2375,6 +2964,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="a document"
+            )
 
         try:
             if not os.path.exists(file_path):
@@ -2409,6 +3003,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a video natively as a Telegram video message."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="a video"
+            )
 
         try:
             if not os.path.exists(video_path):
@@ -2443,6 +3042,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="an image"
+            )
 
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
@@ -2504,6 +3108,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        business_connection_id = self._business_connection_id_from_metadata(metadata)
+        if business_connection_id:
+            return await self._suppress_business_non_text_send(
+                chat_id=str(chat_id), business_connection_id=business_connection_id, kind="an animation"
+            )
         
         try:
             _anim_thread = self._metadata_thread_id(metadata)
@@ -2530,17 +3139,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._bot:
             try:
                 _typing_thread = self._metadata_thread_id(metadata)
+                business_connection_id = self._business_connection_id_from_metadata(metadata)
+                if business_connection_id:
+                    # Typing indicators are direct customer-facing Business API
+                    # actions. Suppress them so the only customer-visible
+                    # Business action is the owner-approved final Send.
+                    return
                 message_thread_id = self._message_thread_id_for_typing(_typing_thread)
                 # No retry-without-thread fallback here: _message_thread_id_for_typing
                 # already maps the forum General topic to None, so any non-None value
                 # reaching this call is a user-created topic. If Telegram rejects it
                 # (e.g. topic deleted mid-session), we swallow the failure rather than
                 # showing a typing indicator in the wrong chat/All Messages.
-                await self._bot.send_chat_action(
-                    chat_id=int(chat_id),
-                    action="typing",
-                    message_thread_id=message_thread_id,
-                )
+                kwargs: Dict[str, Any] = {
+                    "chat_id": self._telegram_chat_id(chat_id),
+                    "action": "typing",
+                    "message_thread_id": message_thread_id,
+                }
+                await self._bot.send_chat_action(**kwargs)
             except Exception as e:
                 # Typing failures are non-fatal; log at debug level only.
                 logger.debug(
@@ -2980,6 +3596,48 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    async def _handle_business_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Telegram Business updates without relying on PTB filters.
+
+        PTB 22.7 exposes ``Update.business_message`` and
+        ``Update.business_connection`` fields, but this checkout does not have a
+        ``filters.BUSINESS_MESSAGES`` helper.  This catch-all TypeHandler runs
+        before ordinary handlers and stops propagation for Business updates so
+        normal DM/group paths cannot process them accidentally.
+        """
+        handled = False
+
+        connection = getattr(update, "business_connection", None)
+        if connection is not None:
+            handled = True
+            self._record_business_connection(connection)
+
+        message = getattr(update, "business_message", None)
+        if message is not None:
+            handled = True
+            connection_id = self._business_connection_id_from_message(message)
+            if not connection_id:
+                logger.warning("[%s] Ignoring Telegram Business message without business_connection_id", self.name)
+            elif not getattr(message, "text", None):
+                logger.info("[%s] Ignoring non-text Telegram Business message for connection %s", self.name, connection_id)
+            elif str(message.text).lstrip().startswith("/"):
+                logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
+            else:
+                self._business_can_reply.setdefault(connection_id, None)
+                event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
+                event.text = self._clean_bot_trigger_text(event.text)
+                self._enqueue_text_event(event)
+
+        if getattr(update, "edited_business_message", None) is not None:
+            handled = True
+            logger.info("[%s] Ignoring edited Telegram Business message", self.name)
+        if getattr(update, "deleted_business_messages", None) is not None:
+            handled = True
+            logger.info("[%s] Ignoring deleted Telegram Business messages update", self.name)
+
+        if handled:
+            raise ApplicationHandlerStop
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -2987,23 +3645,25 @@ class TelegramAdapter(BasePlatformAdapter):
         rapid successive text messages from the same user/chat and aggregate
         them into a single MessageEvent before dispatching.
         """
-        if not update.message or not update.message.text:
+        msg = self._message_from_update(update)
+        if not msg or not msg.text:
             return
-        if not self._should_process_message(update.message):
+        if not self._should_process_message(msg):
             return
 
-        event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
-        if not update.message or not update.message.text:
+        msg = self._message_from_update(update)
+        if not msg or not msg.text:
             return
-        if not self._should_process_message(update.message, is_command=True):
+        if not self._should_process_message(msg, is_command=True):
             return
         
-        event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
+        event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3167,12 +3827,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
-        if not update.message:
+        msg = self._message_from_update(update)
+        if not msg:
             return
-        if not self._should_process_message(update.message):
+        if not self._should_process_message(msg):
             return
-        
-        msg = update.message
         
         # Determine media type
         if msg.sticker:
@@ -3613,6 +4272,8 @@ class TelegramAdapter(BasePlatformAdapter):
         chat = message.chat
         user = message.from_user
         
+        business_connection_id = self._business_connection_id_from_message(message)
+
         # Determine chat type
         chat_type = "dm"
         if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -3620,15 +4281,23 @@ class TelegramAdapter(BasePlatformAdapter):
         elif chat.type == ChatType.CHANNEL:
             chat_type = "channel"
 
-        # Resolve DM topic name and skill binding
+        # Resolve DM topic name and skill binding.  Telegram Business messages
+        # are private customer chats, but they must not share the normal DM
+        # session with the same Telegram user/chat.  Encode the stable Business
+        # connection id into thread_id so build_session_key and response routing
+        # both preserve the isolation without changing ordinary DM/group/topic
+        # behavior.
         thread_id_raw = message.message_thread_id
         thread_id_str = str(thread_id_raw) if thread_id_raw is not None else None
-        if chat_type == "group" and thread_id_str is None and getattr(chat, "is_forum", False):
+        if business_connection_id:
+            chat_type = "dm"
+            thread_id_str = self._business_thread_id(business_connection_id)
+        elif chat_type == "group" and thread_id_str is None and getattr(chat, "is_forum", False):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
-        chat_topic = None
+        chat_topic = "Telegram Business" if business_connection_id else None
         topic_skill = None
 
-        if chat_type == "dm" and thread_id_str:
+        if chat_type == "dm" and thread_id_str and not business_connection_id:
             topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
@@ -3721,6 +4390,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
             return
+        # Telegram Business customer chats must not be mutated without owner
+        # approval; reactions are direct customer-facing API calls.
+        if self._business_connection_id_from_thread(getattr(event.source, "thread_id", None)):
+            return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
@@ -3733,6 +4406,10 @@ class TelegramAdapter(BasePlatformAdapter):
         replaces all existing reactions in one call — no remove step needed.
         """
         if not self._reactions_enabled():
+            return
+        # Telegram Business customer chats must not be mutated without owner
+        # approval; reactions are direct customer-facing API calls.
+        if self._business_connection_id_from_thread(getattr(event.source, "thread_id", None)):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)

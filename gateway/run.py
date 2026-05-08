@@ -1553,6 +1553,43 @@ class GatewayRunner:
             return False
         return True
 
+    @staticmethod
+    def _is_telegram_business_source(source: SessionSource) -> bool:
+        """Return True for Telegram Business-originated sessions.
+
+        TelegramAdapter encodes Business sessions in ``thread_id`` as
+        ``business:<connection_id>``. Treat that marker as sensitive routing
+        metadata: gateway-native prompts should never fall back to sending
+        directly to ``source.chat_id`` without it.
+        """
+        return (
+            source.platform == Platform.TELEGRAM
+            and str(getattr(source, "thread_id", "") or "").startswith("business:")
+        )
+
+    async def _notify_telegram_business_owner(self, adapter: Any, source: SessionSource, text: str) -> bool:
+        """Best-effort owner notice for Business safety suppressions.
+
+        Returns True when a Telegram adapter accepted the notice/suppression;
+        callers should then stop normal customer-facing delivery.
+        """
+        if not self._is_telegram_business_source(source):
+            return False
+        notify = getattr(adapter, "_notify_business_owner", None)
+        if not callable(notify):
+            logger.warning(
+                "Suppressing Telegram Business notice for customer chat %s because adapter has no owner-notice helper",
+                source.chat_id,
+            )
+            return True
+        business_connection_id = str(source.thread_id or "").split(":", 1)[1]
+        await notify(
+            f"{text}\n\n"
+            f"Customer chat: {source.chat_id}\n"
+            f"Business connection: {business_connection_id}"
+        )
+        return True
+
     _TELEGRAM_LOBBY_REMINDER_COOLDOWN_S = 30.0
 
     def _should_send_telegram_lobby_reminder(self, source: SessionSource) -> bool:
@@ -4956,21 +4993,37 @@ class GatewayRunner:
                 if code:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
-                            source.chat_id,
+                        message = (
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
+                        if self._is_telegram_business_source(source):
+                            await self._notify_telegram_business_owner(
+                                adapter,
+                                source,
+                                "💼 Unauthorized Telegram Business customer pairing request suppressed\n\n"
+                                f"Pairing code for owner approval: `{code}`\n"
+                                f"Run: `hermes pairing approve {platform_name} {code}`",
+                            )
+                        else:
+                            await adapter.send(source.chat_id, message)
                 else:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
-                            source.chat_id,
+                        message = (
                             "Too many pairing requests right now~ "
                             "Please try again later!"
                         )
+                        if self._is_telegram_business_source(source):
+                            await self._notify_telegram_business_owner(
+                                adapter,
+                                source,
+                                "💼 Telegram Business pairing request rate-limit notice suppressed",
+                            )
+                        else:
+                            await adapter.send(source.chat_id, message)
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
@@ -5889,6 +5942,7 @@ class GatewayRunner:
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
+        source_metadata = {"thread_id": source.thread_id} if source.thread_id else None
 
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
@@ -5946,7 +6000,7 @@ class GatewayRunner:
                 )
                 if any(marker in message_text for marker in _stt_fail_markers):
                     _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    _stt_meta = source_metadata
                     if _stt_adapter:
                         try:
                             _stt_msg = (
@@ -6054,6 +6108,7 @@ class GatewayRunner:
                         await _adapter.send(
                             source.chat_id,
                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            metadata=source_metadata,
                         )
                     return None
                 if _ctx_result.expanded:
@@ -12818,6 +12873,11 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if self._is_telegram_business_source(source):
+            # Streaming uses send+edit helper paths that lack enough Business
+            # metadata on every edit. Suppress for Business sessions so drafts
+            # only flow through the owner-approval text path.
+            _streaming_enabled = False
 
         if source.thread_id:
             _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
@@ -13097,12 +13157,20 @@ class GatewayRunner:
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        _business_source = self._is_telegram_business_source(source)
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and not _business_source
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
-        # in chat platforms while opting into concise mid-turn updates.
+        # in chat platforms while opting into concise mid-turn updates. Disable
+        # for Telegram Business because interim/status helper sends are not
+        # customer-approved drafts.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not _business_source
             and is_truthy_value(
                 display_config.get("interim_assistant_messages"),
                 default=True,
@@ -13627,6 +13695,10 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if _business_source:
+                # Streaming edits cannot carry Telegram Business owner approval
+                # state safely, so force the normal final-send draft route.
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages

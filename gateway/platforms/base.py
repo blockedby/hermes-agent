@@ -2762,6 +2762,11 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    def _message_event_metadata(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Return platform-send metadata derived from an inbound event."""
+        thread_id = getattr(getattr(event, "source", None), "thread_id", None)
+        return {"thread_id": thread_id} if thread_id else None
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -2783,7 +2788,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = self._message_event_metadata(event)
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
