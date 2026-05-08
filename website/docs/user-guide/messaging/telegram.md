@@ -127,9 +127,15 @@ platforms:
       name: Owner
     extra:
       business_owner_chat_id: 123456789
+      # Default: true. Ignore Business updates sent by the connected owner
+      # account so Hermes does not answer its own outgoing messages.
+      business_ignore_self_messages: true
+      # Optional deny-list for Business customer chat ids.
+      business_ignored_chat_ids:
+        - 987654321
 ```
 
-`business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables.
+`business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables. `business_ignore_self_messages` defaults to `true` and can be overridden with `TELEGRAM_BUSINESS_IGNORE_SELF_MESSAGES=false`; `business_ignored_chat_ids` can also be supplied as `TELEGRAM_BUSINESS_IGNORED_CHAT_IDS=987654321,123456789`.
 
 ## Sending Generated Files from Docker-backed Terminals
 
