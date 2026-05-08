@@ -768,6 +768,14 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_policy"] = platform_cfg["group_policy"]
                 if "group_allow_from" in platform_cfg:
                     bridged["group_allow_from"] = platform_cfg["group_allow_from"]
+                if plat == Platform.TELEGRAM:
+                    for telegram_extra_key in (
+                        "business_ignore_self_messages",
+                        "business_ignored_chat_ids",
+                        "business_owner_chat_id",
+                    ):
+                        if telegram_extra_key in platform_cfg:
+                            bridged[telegram_extra_key] = platform_cfg[telegram_extra_key]
                 if plat in (Platform.DISCORD, Platform.SLACK) and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:
