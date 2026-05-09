@@ -34,7 +34,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+# HERMES_TEST_VENV lets containerized test runners use a venv outside the
+# bind/copy checkout (for example /opt/hermes-test-venv) instead of accidentally
+# picking up a host-created venv directory.
+CANDIDATES=()
+if [ -n "${HERMES_TEST_VENV:-}" ]; then
+  CANDIDATES+=("$HERMES_TEST_VENV")
+fi
+CANDIDATES+=("$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv")
+
+for candidate in "${CANDIDATES[@]}"; do
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
