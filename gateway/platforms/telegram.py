@@ -94,6 +94,14 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.platforms.telegram_business_approvals import (
+    DEFAULT_PENDING_TTL_SECONDS,
+    TelegramBusinessApprovalStore,
+)
+from gateway.session import (
+    TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+    TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -663,10 +671,108 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     def _business_owner_thread_id(self) -> Optional[str]:
+        raw = (
+            self.config.extra.get("business_owner_thread_id")
+            or self.config.extra.get("owner_thread_id")
+            or os.getenv("TELEGRAM_BUSINESS_OWNER_THREAD_ID", "").strip()
+        )
+        if raw:
+            return str(raw)
         home = getattr(self.config, "home_channel", None)
         if home and getattr(home, "thread_id", None):
             return str(home.thread_id)
         return None
+
+    def _save_business_approval_state(self) -> bool:
+        store = getattr(self, "_business_approval_store", None)
+        if store is None:
+            return True
+        try:
+            store.save(getattr(self, "_business_approval_state", {}))
+            return True
+        except Exception:
+            logger.error("[%s] Failed to persist Telegram Business approval state", self.name, exc_info=True)
+            return False
+
+    def _business_approval_entry_expired(self, entry: Dict[str, Any]) -> bool:
+        expires_at = entry.get("expires_at")
+        if expires_at is not None:
+            try:
+                return time.time() > float(expires_at)
+            except (TypeError, ValueError):
+                return True
+        store = getattr(self, "_business_approval_store", None)
+        if store is not None:
+            try:
+                return bool(store.is_expired(entry))
+            except Exception:
+                logger.debug("[%s] Failed to evaluate Telegram Business approval TTL", self.name, exc_info=True)
+                return True
+        return False
+
+    def _business_approval_callback_context_matches(
+        self,
+        entry: Dict[str, Any],
+        *,
+        query_chat_id: Any,
+        query_thread_id: Any,
+        query_message_id: Any,
+    ) -> bool:
+        owner_chat_id = entry.get("owner_chat_id")
+        if owner_chat_id is not None and str(query_chat_id) != str(owner_chat_id):
+            return False
+        owner_thread_id = entry.get("owner_thread_id")
+        if owner_thread_id is not None and str(query_thread_id) != str(owner_thread_id):
+            return False
+        approval_message_id = entry.get("approval_message_id")
+        if approval_message_id not in (None, ""):
+            if query_message_id is None:
+                return False
+            if str(query_message_id) != str(approval_message_id):
+                return False
+        return True
+
+    def _write_business_approval_audit_event(
+        self,
+        event_type: str,
+        entry: Dict[str, Any],
+        *,
+        owner_user_id: Optional[str] = None,
+        sent_message_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Best-effort audit append for Business approval outcomes."""
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            db.ensure_session(
+                TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+                source="gateway_audit",
+                user_id="telegram_business",
+            )
+            payload = {
+                "event": event_type,
+                "approval_id": entry.get("approval_id"),
+                "origin_session_key": entry.get("origin_session_key"),
+                "customer_chat_id": entry.get("customer_chat_id", entry.get("chat_id")),
+                "business_connection_id": entry.get("business_connection_id"),
+                "inbound_message_id": entry.get("inbound_message_id"),
+                "approval_message_id": entry.get("approval_message_id"),
+                "owner_user_id": str(owner_user_id) if owner_user_id is not None else None,
+                "sent_message_ids": sent_message_ids or [],
+                "audit_session_key": TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
+                "timestamp": time.time(),
+            }
+            db.append_message(
+                session_id=TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+                role="system",
+                content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                tool_name="telegram_business_approval_audit",
+            )
+            return True
+        except Exception:
+            logger.error("[%s] Failed to write Telegram Business approval audit event", self.name, exc_info=True)
+            return False
 
     def _message_event_metadata(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
         """Include Business customer context so owner approval cards are useful."""
@@ -2113,6 +2219,9 @@ class TelegramAdapter(BasePlatformAdapter):
             f"Chat ID: <code>{_html.escape(str(chat_id))}</code>",
             f"Business connection: <code>{_html.escape(str(business_connection_id))}</code>",
         ]
+        origin_session_key = str((metadata or {}).get("origin_session_key") or "").strip()
+        if origin_session_key:
+            parts.append(f"Origin session: <code>{_html.escape(origin_session_key)}</code>")
         if question:
             parts.extend([
                 "",
@@ -2197,6 +2306,13 @@ class TelegramAdapter(BasePlatformAdapter):
         origin_session_key = (metadata or {}).get("origin_session_key")
         origin_source = (metadata or {}).get("origin_source")
         inbound_message_id = (metadata or {}).get("inbound_message_id")
+        created_at = time.time()
+        store = getattr(self, "_business_approval_store", None)
+        pending_ttl = getattr(store, "pending_ttl_seconds", DEFAULT_PENDING_TTL_SECONDS)
+        try:
+            expires_at = created_at + int(pending_ttl)
+        except (TypeError, ValueError):
+            expires_at = created_at + DEFAULT_PENDING_TTL_SECONDS
         approval_entry: Dict[str, Any] = {
             "approval_id": approval_id,
             "origin_session_key": str(origin_session_key) if origin_session_key is not None else None,
@@ -2209,10 +2325,12 @@ class TelegramAdapter(BasePlatformAdapter):
             "owner_chat_id": str(owner_chat_id),
             "owner_thread_id": str(owner_thread_id) if owner_thread_id else None,
             "approval_message_id": None,
-            "created_at": time.time(),
+            "created_at": created_at,
+            "expires_at": expires_at,
             "status": "pending",
         }
         self._business_approval_state[approval_id] = approval_entry
+        self._save_business_approval_state()
 
         prompt = self._business_approval_prompt_text(
             chat_id=chat_id,
@@ -2245,6 +2363,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._bot.send_message(**kwargs)
             message_id = str(getattr(msg, "message_id", "") or "")
             approval_entry["approval_message_id"] = message_id or None
+            self._save_business_approval_state()
             return SendResult(
                 success=True,
                 message_id=message_id,
@@ -2258,6 +2377,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     owner_thread_id,
                 )
             self._business_approval_state.pop(approval_id, None)
+            self._save_business_approval_state()
             logger.error("[%s] Failed to send Telegram Business approval prompt: %s", self.name, exc, exc_info=True)
             # Treat as delivered from the base pipeline's perspective so it
             # never falls back to sending the business draft directly.

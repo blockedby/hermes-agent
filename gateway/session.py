@@ -22,6 +22,10 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY = "agent:audit:telegram:business-approvals"
+TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID = TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()

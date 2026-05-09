@@ -1,5 +1,7 @@
 """Focused tests for Telegram Business assistant-mode MVP support."""
 
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,8 +11,13 @@ from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms import telegram as telegram_mod
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
+from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
+    SessionSource,
+    build_session_key,
+)
 from telegram.constants import ChatType
 from telegram.error import BadRequest
 
@@ -73,6 +80,148 @@ def _business_message(
 
 def _allow_business_reply(adapter: TelegramAdapter, connection_id: str = "bc-1") -> None:
     adapter._business_can_reply[connection_id] = True
+
+
+def _approval_entry(**overrides):
+    approval_id = str(overrides.pop("approval_id", "approve-1"))
+    entry = {
+        "approval_id": approval_id,
+        "origin_session_key": "agent:main:telegram:dm:12345:business:bc-1",
+        "origin_source": {"platform": "telegram", "chat_id": "12345"},
+        "customer_chat_id": "12345",
+        "business_connection_id": "bc-1",
+        "direct_messages_topic_id": None,
+        "inbound_message_id": "55",
+        "draft": "Approved text",
+        "owner_chat_id": "999",
+        "owner_thread_id": None,
+        "approval_message_id": "101",
+        "created_at": time.time(),
+        "expires_at": time.time() + 3600,
+        "status": "pending",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_business_approval_store_round_trips_pending_and_prunes_expired(tmp_path):
+    store = TelegramBusinessApprovalStore(
+        tmp_path / "business_approvals.json",
+        pending_ttl_seconds=10,
+        resolved_retention_seconds=10,
+    )
+    now = time.time()
+    store.save(
+        {
+            "fresh": _approval_entry(approval_id="fresh", created_at=now, expires_at=now + 10),
+            "old": _approval_entry(approval_id="old", created_at=now - 60, expires_at=now - 50),
+        }
+    )
+
+    loaded = store.load(now=now)
+
+    assert list(loaded) == ["fresh"]
+    assert loaded["fresh"]["approval_id"] == "fresh"
+    assert (store.path.stat().st_mode & 0o777) == 0o600
+
+
+def test_business_approval_store_rejects_incomplete_pending_entries(tmp_path):
+    store = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+    valid = _approval_entry(approval_id="valid")
+    missing_id = _approval_entry(approval_id="missing_approval_id")
+    missing_id["approval_id"] = None
+    incomplete_cases = {
+        "missing_approval_id": missing_id,
+        "missing_chat": _approval_entry(approval_id="missing_chat", customer_chat_id=None, chat_id=None),
+        "missing_connection": _approval_entry(approval_id="missing_connection", business_connection_id=None),
+        "missing_draft": _approval_entry(approval_id="missing_draft", draft=None),
+        "missing_owner": _approval_entry(approval_id="missing_owner", owner_chat_id=None),
+        "missing_message": _approval_entry(approval_id="missing_message", approval_message_id=None),
+        "missing_created": _approval_entry(approval_id="missing_created", created_at=None),
+    }
+    store.save({"valid": valid, **incomplete_cases})
+
+    loaded = store.load()
+
+    assert loaded == {"valid": valid}
+
+
+@pytest.mark.asyncio
+async def test_business_send_persists_pending_approval_state(tmp_path):
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_approval_store = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+    _allow_business_reply(adapter)
+
+    result = await adapter.send(
+        "12345",
+        "Draft to approve",
+        metadata={
+            "thread_id": "business:bc-1",
+            "origin_session_key": "agent:main:telegram:dm:12345:business:bc-1",
+            "inbound_message_id": "55",
+        },
+    )
+
+    assert result.success is True
+    loaded = adapter._business_approval_store.load()
+    approval = next(iter(loaded.values()))
+    assert approval["status"] == "pending"
+    assert approval["approval_message_id"] == "101"
+    assert approval["owner_chat_id"] == "999"
+    assert approval["origin_session_key"] == "agent:main:telegram:dm:12345:business:bc-1"
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_writes_gateway_audit_session(monkeypatch):
+    import hermes_state
+
+    calls = []
+
+    class FakeSessionDB:
+        def ensure_session(self, session_id, **kwargs):
+            calls.append(("ensure_session", session_id, kwargs))
+            return session_id
+
+        def append_message(self, session_id, role, content=None, tool_name=None, **kwargs):
+            calls.append(("append_message", session_id, role, content, tool_name))
+            return 1
+
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+    adapter = _make_adapter()
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = {
+        "approval_id": "approve-1",
+        "origin_session_key": "agent:main:telegram:dm:12345:business:bc-1",
+        "chat_id": "12345",
+        "business_connection_id": "bc-1",
+        "inbound_message_id": "55",
+        "draft": "Approved text",
+    }
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=None,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    ensure_call = next(call for call in calls if call[0] == "ensure_session")
+    append_call = next(call for call in calls if call[0] == "append_message")
+    assert ensure_call[1] == TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
+    assert append_call[1] == TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
+    assert append_call[4] == "telegram_business_approval_audit"
+    payload = json.loads(append_call[3])
+    assert payload["event"] == "business_draft_sent"
+    assert payload["audit_session_key"] == TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
+    assert payload["origin_session_key"] == "agent:main:telegram:dm:12345:business:bc-1"
+    assert payload["sent_message_ids"] == ["101"]
 
 
 def test_business_thread_id_helpers_include_direct_messages_topic_identity():
@@ -393,6 +542,7 @@ async def test_business_send_creates_owner_draft_not_customer_send():
     assert approval["owner_thread_id"] is None
     assert approval["approval_message_id"] == "101"
     assert isinstance(approval["created_at"], float)
+    assert approval["expires_at"] > approval["created_at"]
     assert approval["status"] == "pending"
 
 
@@ -595,7 +745,8 @@ async def test_business_approval_callback_uses_stored_entry_without_current_owne
         "owner_chat_id": "999",
         "owner_thread_id": "338512",
         "approval_message_id": "101",
-        "created_at": 123.0,
+        "created_at": time.time(),
+        "expires_at": time.time() + 3600,
         "status": "pending",
     }
     adapter.config.home_channel = HomeChannel(Platform.TELEGRAM, "555", "Moved owner", thread_id="777")
@@ -606,6 +757,7 @@ async def test_business_approval_callback_uses_stored_entry_without_current_owne
             chat_id=999,
             chat=SimpleNamespace(type=ChatType.PRIVATE),
             message_thread_id=338512,
+            message_id=101,
         ),
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
@@ -710,6 +862,233 @@ async def test_business_approval_cancel_does_not_send_to_customer():
     assert "approve-1" not in adapter._business_approval_state
     query.answer.assert_awaited_with(text="Cancelled")
     query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_business_approval_partial_multichunk_failure_is_terminal(tmp_path):
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_approval_store = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    draft = "x" * (adapter.MAX_MESSAGE_LENGTH + 100)
+    adapter._business_approval_state["approve-1"] = _approval_entry(draft=draft)
+    adapter._bot.send_message.side_effect = [
+        SimpleNamespace(message_id=201),
+        BadRequest("chunk two failed"),
+    ]
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    entry = adapter._business_approval_state["approve-1"]
+    assert entry["status"] == "partial_manual_review"
+    assert entry["sent_message_ids"] == ["201"]
+    assert "chunk two failed" in entry["last_error"]
+    query.answer.assert_awaited_with(text="Partial send; manual review required.")
+    assert "no automatic retry" in query.edit_message_text.await_args.kwargs["text"]
+    persisted = adapter._business_approval_store.load()
+    assert persisted["approve-1"]["status"] == "partial_manual_review"
+    assert persisted["approve-1"]["sent_message_ids"] == ["201"]
+
+    adapter._bot.send_message.reset_mock(side_effect=True)
+    retry_query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=retry_query), None)
+
+    adapter._bot.send_message.assert_not_called()
+    retry_query.answer.assert_awaited_with(text="Partially sent; manual review required.")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_failure_before_any_chunk_stays_retryable(tmp_path):
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_approval_store = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(draft="short draft")
+    adapter._bot.send_message.side_effect = BadRequest("temporary send failure")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    entry = adapter._business_approval_state["approve-1"]
+    assert entry["status"] == "failed_retryable"
+    assert entry.get("sent_message_ids") is None
+    assert "temporary send failure" in entry["last_error"]
+    query.answer.assert_awaited_with(text="Send failed.")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_blocks_when_state_cannot_persist_before_customer_send():
+    class FailingStore:
+        pending_ttl_seconds = 3600
+
+        def save(self, approvals):
+            raise OSError("disk unavailable")
+
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_approval_store = FailingStore()
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(draft="short draft")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_not_called()
+    assert adapter._business_approval_state["approve-1"]["status"] == "failed_retryable"
+    assert adapter._business_approval_state["approve-1"]["last_error"] == "approval_state_persist_failed_before_send"
+    query.answer.assert_awaited_with(text="Send blocked: approval state could not be persisted.")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_runtime_ttl_expires_without_reload(tmp_path):
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_approval_store = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json", pending_ttl_seconds=1)
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(created_at=time.time() - 10, expires_at=None)
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_not_called()
+    assert adapter._business_approval_state["approve-1"]["status"] == "expired"
+    query.answer.assert_awaited_with(text="This business draft has expired.")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_callback_requires_stored_message_id_context():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry()
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_not_called()
+    query.answer.assert_awaited_with(text="⛔ You are not authorized to approve business drafts.")
+
+
+@pytest.mark.asyncio
+async def test_business_cancel_audit_failure_does_not_mark_written():
+    class CapturingDict(dict):
+        popped = None
+
+        def pop(self, key, default=None):
+            self.popped = dict(self[key])
+            return super().pop(key, default)
+
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._write_business_approval_audit_event = MagicMock(return_value=False)
+    state = CapturingDict({"approve-1": _approval_entry(draft="Cancelled text")})
+    adapter._business_approval_state = state
+    query = SimpleNamespace(
+        data="ba:c:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert state.popped["status"] == "cancelled"
+    assert "audit_cancelled_written" not in state.popped
+    query.answer.assert_awaited_with(text="Cancelled")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_owner_thread_text_does_not_mutate_business_approval_state():
+    adapter = _make_adapter(owner_chat_id="999", owner_thread_id="42")
+    adapter._business_approval_state["approve-1"] = _approval_entry(owner_chat_id="999", owner_thread_id="42")
+    before = dict(adapter._business_approval_state["approve-1"])
+    msg = _telegram_message(text="operator note near approval card")
+    msg.chat.id = 999
+    msg.chat.type = "supergroup"
+    msg.message_thread_id = 42
+    msg.from_user.id = 111
+    update = SimpleNamespace(message=msg, update_id=777, business_message=None, effective_message=msg)
+
+    await adapter._handle_text_message(update, None)
+
+    assert adapter._business_approval_state["approve-1"] == before
+    assert len(adapter._pending_text_batches) == 1
+    event = next(iter(adapter._pending_text_batches.values()))
+    assert event.source.chat_id == "999"
+    assert event.source.thread_id == "42"
+    assert not str(event.source.thread_id).startswith("business:")
+    for task in adapter._pending_text_batch_tasks.values():
+        task.cancel()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_approval_private_owner_chat_is_authorized_without_allowlist(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_BUSINESS_OWNER_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_BUSINESS_OWNER_THREAD_ID", raising=False)
+    adapter = _make_adapter(owner_chat_id="111")
+    adapter._message_handler = None
+    assert adapter._is_callback_user_authorized(
+        "111",
+        chat_id="111",
+        chat_type="private",
+        thread_id=None,
+        default_allow=False,
+    )
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    _allow_business_reply(adapter)
+    adapter._business_approval_state["approve-1"] = _approval_entry(owner_chat_id="111")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(chat_id=111, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_called_once()
+    query.answer.assert_awaited_with(text="Sent")
 
 
 @pytest.mark.asyncio
