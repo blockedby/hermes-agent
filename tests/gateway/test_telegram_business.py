@@ -380,12 +380,20 @@ async def test_business_send_creates_owner_draft_not_customer_send():
     assert "business_connection_id" not in call_kwargs
     assert "Draft to approve" in call_kwargs["text"]
     assert len(adapter._business_approval_state) == 1
-    approval = next(iter(adapter._business_approval_state.values()))
-    assert approval == {
-        "chat_id": "12345",
-        "business_connection_id": "bc-1",
-        "draft": "Draft to approve",
-    }
+    approval_id, approval = next(iter(adapter._business_approval_state.items()))
+    assert approval["approval_id"] == approval_id
+    assert approval["origin_session_key"] is None
+    assert approval["origin_source"] is None
+    assert approval["customer_chat_id"] == "12345"
+    assert approval["business_connection_id"] == "bc-1"
+    assert approval["direct_messages_topic_id"] is None
+    assert approval["inbound_message_id"] is None
+    assert approval["draft"] == "Draft to approve"
+    assert approval["owner_chat_id"] == "999"
+    assert approval["owner_thread_id"] is None
+    assert approval["approval_message_id"] == "101"
+    assert isinstance(approval["created_at"], float)
+    assert approval["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -465,6 +473,45 @@ async def test_business_owner_draft_includes_clickable_customer_and_quoted_quest
 
 
 @pytest.mark.asyncio
+async def test_business_owner_draft_entry_includes_origin_and_owner_context():
+    adapter = _make_adapter(owner_chat_id="-100999", owner_thread_id="338512")
+    _allow_business_reply(adapter)
+
+    result = await adapter.send(
+        "12345",
+        "Draft to approve",
+        metadata={
+            "thread_id": "business:bc-1",
+            "origin_session_key": "agent:main:telegram:dm:12345:business:bc-1",
+            "origin_source": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "thread_id": "business:bc-1",
+                "non_json": {"nested": True},
+            },
+            "direct_messages_topic_id": "338575",
+            "inbound_message_id": "55",
+        },
+    )
+
+    assert result.success is True
+    assert result.raw_response == {"business_approval_id": next(iter(adapter._business_approval_state))}
+    approval = next(iter(adapter._business_approval_state.values()))
+    assert approval["origin_session_key"] == "agent:main:telegram:dm:12345:business:bc-1"
+    assert approval["origin_source"] == {
+        "platform": "telegram",
+        "chat_id": "12345",
+        "thread_id": "business:bc-1",
+        "non_json": {"nested": True},
+    }
+    assert approval["direct_messages_topic_id"] == "338575"
+    assert approval["inbound_message_id"] == "55"
+    assert approval["owner_chat_id"] == "-100999"
+    assert approval["owner_thread_id"] == "338512"
+    assert approval["approval_message_id"] == "101"
+
+
+@pytest.mark.asyncio
 async def test_business_unknown_can_reply_suppresses_draft_until_connection_update():
     adapter = _make_adapter(owner_chat_id="999")
 
@@ -528,6 +575,51 @@ async def test_business_approval_send_uses_business_connection_id():
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
     assert call_kwargs["text"] == "Approved text"
+    query.answer.assert_awaited_with(text="Sent")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_callback_uses_stored_entry_without_current_owner_session():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = {
+        "approval_id": "approve-1",
+        "origin_session_key": "agent:main:telegram:dm:12345:business:bc-1",
+        "origin_source": {"platform": "telegram", "chat_id": "12345"},
+        "customer_chat_id": "12345",
+        "business_connection_id": "bc-1",
+        "direct_messages_topic_id": "338575",
+        "inbound_message_id": "55",
+        "draft": "Approved text",
+        "owner_chat_id": "999",
+        "owner_thread_id": "338512",
+        "approval_message_id": "101",
+        "created_at": 123.0,
+        "status": "pending",
+    }
+    adapter.config.home_channel = HomeChannel(Platform.TELEGRAM, "555", "Moved owner", thread_id="777")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=338512,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_called_once()
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 12345
+    assert call_kwargs["business_connection_id"] == "bc-1"
+    assert call_kwargs["direct_messages_topic_id"] == 338575
+    assert call_kwargs["text"] == "Approved text"
+    assert "approve-1" not in adapter._business_approval_state
     query.answer.assert_awaited_with(text="Sent")
 
 

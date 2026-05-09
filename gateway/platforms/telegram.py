@@ -2126,6 +2126,20 @@ class TelegramAdapter(BasePlatformAdapter):
         ])
         return "\n".join(parts)
 
+    @classmethod
+    def _json_safe_business_approval_value(cls, value: Any) -> Any:
+        """Return a JSON-safe copy for ephemeral Business approval state."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_safe_business_approval_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [cls._json_safe_business_approval_value(item) for item in value]
+        return str(value)
+
     async def _route_business_draft_for_owner_approval(
         self,
         *,
@@ -2179,14 +2193,25 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         approval_id = uuid.uuid4().hex[:16]
-        approval_entry = {
-            "chat_id": str(chat_id),
-            "business_connection_id": str(business_connection_id),
-            "draft": content,
-        }
         direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
-        if direct_topic_id:
-            approval_entry["direct_messages_topic_id"] = str(direct_topic_id)
+        origin_session_key = (metadata or {}).get("origin_session_key")
+        origin_source = (metadata or {}).get("origin_source")
+        inbound_message_id = (metadata or {}).get("inbound_message_id")
+        approval_entry: Dict[str, Any] = {
+            "approval_id": approval_id,
+            "origin_session_key": str(origin_session_key) if origin_session_key is not None else None,
+            "origin_source": self._json_safe_business_approval_value(origin_source),
+            "customer_chat_id": str(chat_id),
+            "business_connection_id": str(business_connection_id),
+            "direct_messages_topic_id": str(direct_topic_id) if direct_topic_id else None,
+            "inbound_message_id": str(inbound_message_id) if inbound_message_id is not None else None,
+            "draft": content,
+            "owner_chat_id": str(owner_chat_id),
+            "owner_thread_id": str(owner_thread_id) if owner_thread_id else None,
+            "approval_message_id": None,
+            "created_at": time.time(),
+            "status": "pending",
+        }
         self._business_approval_state[approval_id] = approval_entry
 
         prompt = self._business_approval_prompt_text(
@@ -2218,9 +2243,11 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
         try:
             msg = await self._bot.send_message(**kwargs)
+            message_id = str(getattr(msg, "message_id", "") or "")
+            approval_entry["approval_message_id"] = message_id or None
             return SendResult(
                 success=True,
-                message_id=str(getattr(msg, "message_id", "") or ""),
+                message_id=message_id,
                 raw_response={"business_approval_id": approval_id},
             )
         except Exception as exc:
