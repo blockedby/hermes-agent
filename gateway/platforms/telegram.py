@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+import time
 import uuid
 from typing import Dict, List, Optional, Any
 
@@ -92,6 +93,14 @@ from gateway.platforms.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
     parse_fallback_ip_env,
+)
+from gateway.platforms.telegram_business_approvals import (
+    DEFAULT_PENDING_TTL_SECONDS,
+    TelegramBusinessApprovalStore,
+)
+from gateway.session import (
+    TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+    TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
 )
 from utils import atomic_replace
 
@@ -317,7 +326,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Business-chat draft approvals. Telegram Business messages must never
         # receive agent replies directly; each draft is routed to the owner's
         # configured home chat and delivered only after an explicit Send click.
-        self._business_approval_state: Dict[str, Dict[str, str]] = {}
+        self._business_approval_store = TelegramBusinessApprovalStore()
+        self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
         # Business connection capabilities, keyed by BusinessConnection.id.
         # ``None`` means unknown (e.g. bot saw a message before the connection
         # update); ``False`` is a hard no-send gate.
@@ -382,6 +392,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
+            owner_chat_id = self._business_owner_chat_id()
+            normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+            if normalized_chat_type == "private":
+                normalized_chat_type = "dm"
+            if owner_chat_id and normalized_chat_type == "dm" and str(chat_id or "") == owner_chat_id == normalized_user_id:
+                return True
             return bool(default_allow)
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
@@ -500,10 +516,108 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     def _business_owner_thread_id(self) -> Optional[str]:
+        raw = (
+            self.config.extra.get("business_owner_thread_id")
+            or self.config.extra.get("owner_thread_id")
+            or os.getenv("TELEGRAM_BUSINESS_OWNER_THREAD_ID", "").strip()
+        )
+        if raw:
+            return str(raw)
         home = getattr(self.config, "home_channel", None)
         if home and getattr(home, "thread_id", None):
             return str(home.thread_id)
         return None
+
+    def _save_business_approval_state(self) -> bool:
+        store = getattr(self, "_business_approval_store", None)
+        if store is None:
+            return True
+        try:
+            store.save(getattr(self, "_business_approval_state", {}))
+            return True
+        except Exception:
+            logger.error("[%s] Failed to persist Telegram Business approval state", self.name, exc_info=True)
+            return False
+
+    def _business_approval_entry_expired(self, entry: Dict[str, Any]) -> bool:
+        expires_at = entry.get("expires_at")
+        if expires_at is not None:
+            try:
+                return time.time() > float(expires_at)
+            except (TypeError, ValueError):
+                return True
+        store = getattr(self, "_business_approval_store", None)
+        if store is not None:
+            try:
+                return bool(store.is_expired(entry))
+            except Exception:
+                logger.debug("[%s] Failed to evaluate Telegram Business approval TTL", self.name, exc_info=True)
+                return True
+        return False
+
+    def _business_approval_callback_context_matches(
+        self,
+        entry: Dict[str, Any],
+        *,
+        query_chat_id: Any,
+        query_thread_id: Any,
+        query_message_id: Any,
+    ) -> bool:
+        owner_chat_id = entry.get("owner_chat_id")
+        if owner_chat_id is not None and str(query_chat_id) != str(owner_chat_id):
+            return False
+        owner_thread_id = entry.get("owner_thread_id")
+        if owner_thread_id is not None and str(query_thread_id) != str(owner_thread_id):
+            return False
+        approval_message_id = entry.get("approval_message_id")
+        if approval_message_id not in (None, ""):
+            if query_message_id is None:
+                return False
+            if str(query_message_id) != str(approval_message_id):
+                return False
+        return True
+
+    def _write_business_approval_audit_event(
+        self,
+        event_type: str,
+        entry: Dict[str, Any],
+        *,
+        owner_user_id: Optional[str] = None,
+        sent_message_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Best-effort audit append for Business approval outcomes."""
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            db.ensure_session(
+                TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+                source="gateway_audit",
+                user_id="telegram_business",
+            )
+            payload = {
+                "event": event_type,
+                "approval_id": entry.get("approval_id"),
+                "origin_session_key": entry.get("origin_session_key"),
+                "customer_chat_id": entry.get("customer_chat_id", entry.get("chat_id")),
+                "business_connection_id": entry.get("business_connection_id"),
+                "inbound_message_id": entry.get("inbound_message_id"),
+                "approval_message_id": entry.get("approval_message_id"),
+                "owner_user_id": str(owner_user_id) if owner_user_id is not None else None,
+                "sent_message_ids": sent_message_ids or [],
+                "audit_session_key": TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
+                "timestamp": time.time(),
+            }
+            db.append_message(
+                session_id=TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
+                role="system",
+                content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                tool_name="telegram_business_approval_audit",
+            )
+            return True
+        except Exception:
+            logger.error("[%s] Failed to write Telegram Business approval audit event", self.name, exc_info=True)
+            return False
 
     def _message_event_metadata(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
         """Include Business customer context so owner approval cards are useful."""
@@ -1668,6 +1782,9 @@ class TelegramAdapter(BasePlatformAdapter):
             f"Chat ID: <code>{_html.escape(str(chat_id))}</code>",
             f"Business connection: <code>{_html.escape(str(business_connection_id))}</code>",
         ]
+        origin_session_key = str((metadata or {}).get("origin_session_key") or "").strip()
+        if origin_session_key:
+            parts.append(f"Origin session: <code>{_html.escape(origin_session_key)}</code>")
         if question:
             parts.extend([
                 "",
@@ -1680,6 +1797,20 @@ class TelegramAdapter(BasePlatformAdapter):
             f"<blockquote>{_html.escape(draft)}</blockquote>",
         ])
         return "\n".join(parts)
+
+    @classmethod
+    def _json_safe_business_approval_value(cls, value: Any) -> Any:
+        """Return a JSON-safe copy for ephemeral Business approval state."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_safe_business_approval_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [cls._json_safe_business_approval_value(item) for item in value]
+        return str(value)
 
     async def _route_business_draft_for_owner_approval(
         self,
@@ -1734,15 +1865,35 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         approval_id = uuid.uuid4().hex[:16]
-        approval_entry = {
-            "chat_id": str(chat_id),
-            "business_connection_id": str(business_connection_id),
-            "draft": content,
-        }
         direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
-        if direct_topic_id:
-            approval_entry["direct_messages_topic_id"] = str(direct_topic_id)
+        origin_session_key = (metadata or {}).get("origin_session_key")
+        origin_source = (metadata or {}).get("origin_source")
+        inbound_message_id = (metadata or {}).get("inbound_message_id")
+        created_at = time.time()
+        store = getattr(self, "_business_approval_store", None)
+        pending_ttl = getattr(store, "pending_ttl_seconds", DEFAULT_PENDING_TTL_SECONDS)
+        try:
+            expires_at = created_at + int(pending_ttl)
+        except (TypeError, ValueError):
+            expires_at = created_at + DEFAULT_PENDING_TTL_SECONDS
+        approval_entry: Dict[str, Any] = {
+            "approval_id": approval_id,
+            "origin_session_key": str(origin_session_key) if origin_session_key is not None else None,
+            "origin_source": self._json_safe_business_approval_value(origin_source),
+            "customer_chat_id": str(chat_id),
+            "business_connection_id": str(business_connection_id),
+            "direct_messages_topic_id": str(direct_topic_id) if direct_topic_id else None,
+            "inbound_message_id": str(inbound_message_id) if inbound_message_id is not None else None,
+            "draft": content,
+            "owner_chat_id": str(owner_chat_id),
+            "owner_thread_id": str(owner_thread_id) if owner_thread_id else None,
+            "approval_message_id": None,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "status": "pending",
+        }
         self._business_approval_state[approval_id] = approval_entry
+        self._save_business_approval_state()
 
         prompt = self._business_approval_prompt_text(
             chat_id=chat_id,
@@ -1773,9 +1924,12 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
         try:
             msg = await self._bot.send_message(**kwargs)
+            message_id = str(getattr(msg, "message_id", "") or "")
+            approval_entry["approval_message_id"] = message_id or None
+            self._save_business_approval_state()
             return SendResult(
                 success=True,
-                message_id=str(getattr(msg, "message_id", "") or ""),
+                message_id=message_id,
                 raw_response={"business_approval_id": approval_id},
             )
         except Exception as exc:
@@ -1786,6 +1940,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     owner_thread_id,
                 )
             self._business_approval_state.pop(approval_id, None)
+            self._save_business_approval_state()
             logger.error("[%s] Failed to send Telegram Business approval prompt: %s", self.name, exc, exc_info=True)
             # Treat as delivered from the base pipeline's perspective so it
             # never falls back to sending the business draft directly.
@@ -2626,16 +2781,37 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             caller_id = str(getattr(query.from_user, "id", ""))
-            owner_chat_id = self._business_owner_chat_id()
-            owner_thread_id = self._business_owner_thread_id()
+            action = parts[1]
+            approval_id = parts[2]
+            entry = self._business_approval_state.get(approval_id)
+            if not entry:
+                await query.answer(text="This business draft has already been resolved.")
+                return
+
+            owner_chat_id = (
+                str(entry.get("owner_chat_id"))
+                if entry.get("owner_chat_id") is not None
+                else self._business_owner_chat_id()
+            )
+            owner_thread_id = (
+                str(entry.get("owner_thread_id"))
+                if entry.get("owner_thread_id") is not None
+                else self._business_owner_thread_id()
+            )
+            query_message_id = getattr(query_message, "message_id", None)
             if (
                 not owner_chat_id
-                or str(query_chat_id) != str(owner_chat_id)
+                or not self._business_approval_callback_context_matches(
+                    entry,
+                    query_chat_id=query_chat_id,
+                    query_thread_id=query_thread_id,
+                    query_message_id=query_message_id,
+                )
                 or not self._is_callback_user_authorized(
                     caller_id,
                     chat_id=query_chat_id,
                     chat_type=str(query_chat_type) if query_chat_type is not None else None,
-                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else owner_thread_id,
                     user_name=query_user_name,
                     default_allow=False,
                 )
@@ -2643,15 +2819,43 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ You are not authorized to approve business drafts.")
                 return
 
-            action = parts[1]
-            approval_id = parts[2]
-            entry = self._business_approval_state.pop(approval_id, None)
-            if not entry:
-                await query.answer(text="This business draft has already been resolved.")
+            if self._business_approval_entry_expired(entry):
+                entry["status"] = "expired"
+                entry["resolved_at"] = time.time()
+                self._save_business_approval_state()
+                await query.answer(text="This business draft has expired.")
+                try:
+                    await query.edit_message_text(
+                        text="⌛ Business draft expired and was not sent.",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
                 return
 
+            status = str(entry.get("status") or "pending")
             user_display = getattr(query.from_user, "first_name", "User")
             if action == "c":
+                if status in {"partial_manual_review", "failed_partial"}:
+                    await query.answer(text="Partially sent; manual review required.")
+                    return
+                if status in {"sent", "sending"}:
+                    await query.answer(text="Already sent; cannot cancel.")
+                    return
+                if status == "cancelled":
+                    await query.answer(text="Already cancelled.")
+                    return
+                entry["status"] = "cancelled"
+                entry["resolved_at"] = time.time()
+                entry["cancelled_by_user_id"] = caller_id
+                if self._write_business_approval_audit_event(
+                    "business_draft_cancelled",
+                    entry,
+                    owner_user_id=caller_id,
+                ):
+                    entry["audit_cancelled_written"] = True
+                self._business_approval_state.pop(approval_id, None)
+                self._save_business_approval_state()
                 await query.answer(text="Cancelled")
                 try:
                     await query.edit_message_text(
@@ -2662,8 +2866,42 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
                 return
 
+            if status == "sent":
+                await query.answer(text="Already sent.")
+                return
+            if status == "cancelled":
+                await query.answer(text="Already cancelled.")
+                return
+            if status == "sending":
+                await query.answer(text="Send already in progress.")
+                return
+            if status in {"partial_manual_review", "failed_partial"} or entry.get("sent_message_ids"):
+                if status not in {"partial_manual_review", "failed_partial"}:
+                    entry["status"] = "partial_manual_review"
+                    entry["resolved_at"] = time.time()
+                    self._save_business_approval_state()
+                await query.answer(text="Partially sent; manual review required.")
+                return
+
+            entry["status"] = "sending"
+            if not self._save_business_approval_state():
+                entry["status"] = "failed_retryable"
+                entry["last_error"] = "approval_state_persist_failed_before_send"
+                await query.answer(text="Send blocked: approval state could not be persisted.")
+                try:
+                    await query.edit_message_text(
+                        text="❌ Business draft not sent: approval state could not be persisted safely.",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+            sent_ids: list[str] = []
             try:
                 if not await self._ensure_business_reply_allowed(entry["business_connection_id"]):
+                    entry["status"] = "failed_retryable"
+                    entry["last_error"] = "business_reply_permission_disabled"
+                    self._save_business_approval_state()
                     await query.answer(text="Cannot reply: Business permission is disabled.")
                     try:
                         await query.edit_message_text(
@@ -2676,10 +2914,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 draft = entry["draft"]
                 chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-                sent_ids: list[str] = []
                 for chunk in chunks:
+                    customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
                     kwargs = {
-                        "chat_id": self._telegram_chat_id(entry["chat_id"]),
+                        "chat_id": self._telegram_chat_id(customer_chat_id),
                         "business_connection_id": entry["business_connection_id"],
                         "text": chunk,
                         **self._link_preview_kwargs(),
@@ -2688,7 +2926,25 @@ class TelegramAdapter(BasePlatformAdapter):
                     if direct_topic_id:
                         kwargs["direct_messages_topic_id"] = int(direct_topic_id)
                     msg = await self._bot.send_message(**kwargs)
-                    sent_ids.append(str(getattr(msg, "message_id", "") or ""))
+                    sent_id = str(getattr(msg, "message_id", "") or "")
+                    if sent_id:
+                        sent_ids.append(sent_id)
+                        entry["sent_message_ids"] = sent_ids
+                        self._save_business_approval_state()
+                entry["status"] = "sent"
+                entry["resolved_at"] = time.time()
+                entry["sent_message_ids"] = sent_ids
+                entry["sent_by_user_id"] = caller_id
+                if not entry.get("audit_sent_written"):
+                    if self._write_business_approval_audit_event(
+                        "business_draft_sent",
+                        entry,
+                        owner_user_id=caller_id,
+                        sent_message_ids=sent_ids,
+                    ):
+                        entry["audit_sent_written"] = True
+                self._business_approval_state.pop(approval_id, None)
+                self._save_business_approval_state()
                 await query.answer(text="Sent")
                 try:
                     suffix = f" ({len(sent_ids)} message(s))" if len(sent_ids) != 1 else ""
@@ -2700,9 +2956,30 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.error("[%s] Telegram Business draft send failed: %s", self.name, exc, exc_info=True)
+                entry["last_error"] = str(exc)
+                if sent_ids:
+                    entry["status"] = "partial_manual_review"
+                    entry["resolved_at"] = time.time()
+                    entry["sent_message_ids"] = sent_ids
+                    entry["sent_by_user_id"] = caller_id
+                    self._save_business_approval_state()
+                    await query.answer(text="Partial send; manual review required.")
+                    try:
+                        await query.edit_message_text(
+                            text=(
+                                "⚠️ Business draft partially sent. Manual review required; "
+                                f"{len(sent_ids)} message chunk(s) were delivered and no automatic retry will be attempted.\n\n"
+                                f"Last error: {exc}"
+                            ),
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
                 await query.answer(text="Send failed.")
-                # Restore so the owner can retry after a transient Bot API error.
-                self._business_approval_state[approval_id] = entry
+                # Restore retryable state only when no customer chunk was delivered.
+                entry["status"] = "failed_retryable"
+                self._save_business_approval_state()
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

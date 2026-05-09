@@ -2789,6 +2789,16 @@ class BasePlatformAdapter(ABC):
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = self._message_event_metadata(event)
+        if _thread_metadata is not None:
+            _thread_metadata = dict(_thread_metadata)
+            _thread_metadata.setdefault("origin_session_key", session_key)
+            source = getattr(event, "source", None)
+            to_dict = getattr(source, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    _thread_metadata.setdefault("origin_source", to_dict())
+                except Exception:
+                    logger.debug("[%s] Could not serialize origin source metadata", self.name, exc_info=True)
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)

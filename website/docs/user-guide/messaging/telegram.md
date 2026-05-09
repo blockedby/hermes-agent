@@ -135,7 +135,11 @@ platforms:
         - 987654321
 ```
 
-`business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables. `business_ignore_self_messages` defaults to `true` and can be overridden with `TELEGRAM_BUSINESS_IGNORE_SELF_MESSAGES=false`; `business_ignored_chat_ids` can also be supplied as `TELEGRAM_BUSINESS_IGNORED_CHAT_IDS=987654321,123456789`.
+`business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables. Approval cards can be pinned to a specific owner forum/topic with `business_owner_thread_id` or `TELEGRAM_BUSINESS_OWNER_THREAD_ID`; if that explicit topic cannot be used, Hermes fails closed instead of retrying unthreaded. `business_ignore_self_messages` defaults to `true` and can be overridden with `TELEGRAM_BUSINESS_IGNORE_SELF_MESSAGES=false`; `business_ignored_chat_ids` can also be supplied as `TELEGRAM_BUSINESS_IGNORED_CHAT_IDS=987654321,123456789`.
+
+Approval **Send**/**Cancel** outcomes are recorded in the gateway audit session `agent:audit:telegram:business-approvals`, not in the customer, owner, or originating LLM transcript. Pending approval cards are persistent and expire after the configured TTL; stale or malformed persisted approvals fail closed.
+
+Editing a Business draft is intentionally out of scope for the current text-only MVP. Ordinary text posted near an approval card remains normal owner-thread context and does not mutate the pending Business draft. A future edit flow must be explicit and stateful: an **Edit** button tied to `approval_id`, an edit/reply mode for that one approval, then separate **Send edited**/**Cancel** actions.
 
 ## Sending Generated Files from Docker-backed Terminals
 
