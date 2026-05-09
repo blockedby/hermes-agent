@@ -972,6 +972,17 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --- Phase 1: Gather findings from both checks ---
 
+    # Gateway approval prompts must be emitted promptly.  check_command_security()
+    # can otherwise synchronously auto-install tirith before we reach the
+    # dangerous-command approval path.  Kick the installer in non-blocking mode
+    # first so the scan fails open quickly until tirith is available.
+    if is_gateway or is_ask:
+        try:
+            from tools.tirith_security import ensure_installed
+            ensure_installed(log_failures=False)
+        except Exception:
+            pass
+
     # Tirith check — wrapper guarantees no raise for expected failures.
     # Only catch ImportError (module not installed).
     tirith_result = {"action": "allow", "findings": [], "summary": ""}

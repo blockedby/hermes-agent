@@ -2998,6 +2998,28 @@ def auxiliary_max_tokens_param(value: int) -> dict:
     return {"max_tokens": value}
 
 
+def _retry_max_tokens_as_max_completion(
+    client: Any,
+    exc: Exception,
+    *,
+    is_zai_param_error: bool,
+) -> bool:
+    """True when a rejected ``max_tokens`` retry should use ``max_completion_tokens``.
+
+    Keep the ZAI vision special case as a pure strip-and-retry path: those
+    endpoints reject output-token caps on multimodal calls.  For direct
+    OpenAI/Copilot-style endpoints, or errors that explicitly name the newer
+    parameter, preserve the caller's limit under ``max_completion_tokens``.
+    """
+    if is_zai_param_error:
+        return False
+    err_lower = str(exc).lower()
+    if "max_completion_tokens" in err_lower:
+        return True
+    client_base = str(getattr(client, "base_url", "") or "")
+    return base_url_hostname(client_base) in {"api.openai.com", "api.githubcopilot.com"}
+
+
 # ── Centralized LLM Call API ────────────────────────────────────────────────
 #
 # call_llm() and async_call_llm() own the full request lifecycle:
@@ -3778,6 +3800,10 @@ def call_llm(
         ):
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
+            if _retry_max_tokens_as_max_completion(
+                client, first_err, is_zai_param_error=_is_zai_param_error
+            ):
+                kwargs["max_completion_tokens"] = max_tokens
             try:
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
@@ -4094,6 +4120,10 @@ async def async_call_llm(
         ):
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
+            if _retry_max_tokens_as_max_completion(
+                client, first_err, is_zai_param_error=_is_zai_param_error
+            ):
+                kwargs["max_completion_tokens"] = max_tokens
             try:
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)

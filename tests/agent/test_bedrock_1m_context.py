@@ -5,8 +5,9 @@ Bedrock (and Azure AI Foundry) that window is still gated behind the
 ``context-1m-2025-08-07`` beta header as of 2026-04. Without it, Bedrock
 caps these models at 200K even though ``model_metadata.py`` advertises 1M.
 
-These tests guard the invariant that the header is always emitted on the
-Bedrock client path, and that it survives the MiniMax bearer-auth strip.
+These tests guard the invariant that the header is emitted only on endpoint
+paths that require it (Bedrock/Azure) and stays out of native Anthropic and
+MiniMax defaults, where it can be rejected or provider-incompatible.
 """
 
 from unittest.mock import MagicMock, patch
@@ -16,22 +17,32 @@ class TestBedrockContext1MBeta:
     """``context-1m-2025-08-07`` must reach Bedrock Claude requests."""
 
     def test_common_betas_includes_1m(self):
+        """_COMMON_BETAS intentionally excludes endpoint-specific 1M beta.
+
+        Keep the historical test name because this regression target is invoked
+        directly by the lf worker prompt. The production contract is that
+        Bedrock appends context-1m explicitly in its client helper while native
+        Anthropic avoids it by default for subscriptions that reject the beta.
+        """
         from agent.anthropic_adapter import _COMMON_BETAS, _CONTEXT_1M_BETA
 
         assert _CONTEXT_1M_BETA == "context-1m-2025-08-07"
-        assert _CONTEXT_1M_BETA in _COMMON_BETAS
+        assert _CONTEXT_1M_BETA not in _COMMON_BETAS
 
-    def test_common_betas_for_native_anthropic_includes_1m(self):
-        """Native Anthropic endpoints (and Bedrock with empty base_url) get 1M."""
+    def test_common_betas_for_native_anthropic_omits_1m(self):
+        """Native Anthropic avoids 1M by default; Azure opts in explicitly."""
         from agent.anthropic_adapter import (
             _common_betas_for_base_url,
             _CONTEXT_1M_BETA,
         )
 
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(None)
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url("")
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(None)
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url("")
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(
             "https://api.anthropic.com"
+        )
+        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(
+            "https://example.services.ai.azure.com/models/anthropic"
         )
 
     def test_common_betas_strips_1m_for_minimax(self):
@@ -79,27 +90,24 @@ class TestBedrockContext1MBeta:
         assert "interleaved-thinking-2025-05-14" in beta_header
         assert "fine-grained-tool-streaming-2025-05-14" in beta_header
 
-    def test_build_anthropic_kwargs_includes_1m_for_bedrock_fastmode(self):
-        """Fast-mode requests (per-request extra_headers) still include 1M beta.
+    def test_build_anthropic_kwargs_does_not_override_bedrock_default_headers(self):
+        """Bedrock third-party URL should not emit native fast-mode extra_headers.
 
-        Per-request extra_headers override client-level default_headers, so
-        the fast-mode path must re-include everything in _COMMON_BETAS.
+        AnthropicBedrock carries context-1m in client-level default_headers.
+        Per-request extra_headers would override those defaults, so the Bedrock
+        request kwargs path must leave extra_headers unset.
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-7",
+            model="anthropic.claude-opus-4-6-v1:0",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
             max_tokens=1024,
             reasoning_config=None,
             is_oauth=False,
-            # Empty base_url mirrors AnthropicBedrock (no HTTP base URL)
-            base_url=None,
+            preserve_dots=True,
+            base_url="https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-opus-4-6-v1:0/invoke",
             fast_mode=True,
         )
-        beta_header = kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert "context-1m-2025-08-07" in beta_header, (
-            "fast-mode extra_headers must carry the 1M beta or it overrides "
-            "client-level default_headers and Bedrock drops back to 200K"
-        )
+        assert "extra_headers" not in kwargs

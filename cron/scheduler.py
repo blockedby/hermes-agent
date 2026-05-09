@@ -850,8 +850,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                     f"{prompt}"
                 )
             else:
-                # Script produced no output — nothing to report, skip AI call.
-                return None
+                prompt = (
+                    "## Script Output\n"
+                    "The pre-run script completed successfully but produced no output. "
+                    "Use this as context for your analysis; if there is genuinely "
+                    "nothing new to report, respond with [SILENT].\n\n"
+                    f"{prompt}"
+                )
         else:
             prompt = (
                 "## Script Error\n"
