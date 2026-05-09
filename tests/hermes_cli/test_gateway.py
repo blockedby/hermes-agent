@@ -13,6 +13,11 @@ def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
     monkeypatch.setitem(sys.modules, "gateway.run", module)
+    # These unit tests exercise foreground gateway control flow only.  The
+    # real run_gateway() also best-effort refreshes an installed user systemd
+    # unit; do not let tests running with a temporary HERMES_HOME rewrite the
+    # developer's real ~/.config/systemd/user/hermes-gateway.service.
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
 
 
 def test_run_gateway_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys):

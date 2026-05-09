@@ -1,0 +1,41 @@
+# Containerized local test/build helpers.
+#
+# Examples:
+#   docker compose -f docker-compose.test.yml run --rm test
+#   docker compose -f docker-compose.test.yml run --rm test scripts/run_tests.sh tests/hermes_cli/test_gateway.py -q
+#   docker compose -f docker-compose.test.yml run --rm build-assets
+#
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: hermes-agent:test-runner
+    working_dir: /workspace
+    environment:
+      HERMES_TEST_VENV: /opt/hermes-test-venv
+      HERMES_TEST_WORKERS: ${HERMES_TEST_WORKERS:-4}
+    command: ["scripts/run_tests.sh"]
+
+  build-assets:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: hermes-agent:test-runner
+    working_dir: /workspace
+    environment:
+      HERMES_TEST_VENV: /opt/hermes-test-venv
+    command:
+      - bash
+      - -lc
+      - |
+        npm run build --prefix web
+        npm run build --prefix ui-tui
+        python -m build
+
+  production-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hermes-agent:local
+    command: ["--help"]

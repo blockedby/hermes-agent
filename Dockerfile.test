@@ -1,0 +1,56 @@
+# Test runner image for the local Hermes fork.
+#
+# The production Dockerfile intentionally tracks the runtime image, currently
+# on Python 3.13.  CI tests run on Python 3.11, so keep a separate test image
+# that mirrors the CI Python version while still carrying Node/npm for the web
+# and TUI workspaces.
+FROM ghcr.io/astral-sh/uv:0.11.6-python3.11-trixie
+
+ENV PYTHONUNBUFFERED=1
+ENV npm_config_install_links=false
+ENV HERMES_TEST_VENV=/opt/hermes-test-venv
+ENV PATH="/opt/hermes-test-venv/bin:${PATH}"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      curl \
+      docker-cli \
+      ffmpeg \
+      gcc \
+      git \
+      libffi-dev \
+      nodejs \
+      npm \
+      openssh-client \
+      procps \
+      python3 \
+      python3-dev \
+      ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Cache Node dependency layers independently of the Python/source install.
+COPY package.json package-lock.json ./
+COPY web/package.json web/package-lock.json web/
+COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
+COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
+
+# --ignore-scripts avoids heavyweight browser downloads from optional browser
+# packages during test-image construction.  Production Docker builds still run
+# their normal install scripts in Dockerfile.
+RUN npm install --prefer-offline --no-audit --ignore-scripts && \
+    (cd web && npm install --prefer-offline --no-audit --ignore-scripts) && \
+    (cd ui-tui && npm install --prefer-offline --no-audit --ignore-scripts) && \
+    npm cache clean --force
+
+# Copy the full checkout for editable Python install + tests.  The repository's
+# .dockerignore keeps host venvs/node_modules/runtime state out of this layer.
+COPY . .
+
+RUN uv venv "$HERMES_TEST_VENV" --python 3.11 && \
+    uv pip install --python "$HERMES_TEST_VENV/bin/python" --no-cache-dir -e ".[all,dev]" && \
+    uv pip install --python "$HERMES_TEST_VENV/bin/python" --no-cache-dir build "pytest-split>=0.9,<1"
+
+CMD ["scripts/run_tests.sh"]

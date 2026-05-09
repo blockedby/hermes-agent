@@ -27,7 +27,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Prefer a .venv in the current tree, fall back to the main checkout's venv
 # (useful for worktrees where we don't always duplicate the venv).
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+# HERMES_TEST_VENV lets containerized test runners use a venv outside the
+# bind/copy checkout (for example /opt/hermes-test-venv) instead of accidentally
+# picking up a host-created venv directory.
+CANDIDATES=()
+if [ -n "${HERMES_TEST_VENV:-}" ]; then
+  CANDIDATES+=("$HERMES_TEST_VENV")
+fi
+CANDIDATES+=("$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv")
+
+for candidate in "${CANDIDATES[@]}"; do
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
@@ -44,7 +53,14 @@ PYTHON="$VENV/bin/python"
 # ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
 if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
   echo "→ installing pytest-split into $VENV"
-  "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
+  if "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
+  elif command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$PYTHON" --quiet "pytest-split>=0.9,<1"
+  else
+    echo "error: pytest-split missing and neither pip nor uv is available" >&2
+    exit 1
+  fi
 fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────

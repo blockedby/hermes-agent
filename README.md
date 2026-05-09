@@ -161,6 +161,14 @@ uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
 
+Containerized local tests/builds:
+
+```bash
+scripts/run_tests_docker.sh                 # Dockerized pytest, CI-like Python 3.11 + Node/npm
+scripts/run_tests_docker.sh tests/agent/ -q # pass pytest args through
+scripts/build_docker.sh                     # build the production Docker image as hermes-agent:local
+```
+
 > **RL Training (optional):** The RL/Atropos integration (`environments/`) — see [`CONTRIBUTING.md`](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md#development-setup) for the full setup.
 
 ---

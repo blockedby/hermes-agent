@@ -13,6 +13,77 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Fork / Upstream State (2026-05-09)
+
+This checkout is our fork/working branch, not plain upstream:
+
+- Working repo: `/home/kcnc/.hermes/hermes-agent`
+- Branch: `alex/local-hermes-tweaks`
+- Fork remote: `alex = https://github.com/blockedby/hermes-agent.git`
+- Upstream remote: `origin = https://github.com/NousResearch/hermes-agent.git`
+- Current local HEAD when this note was written: `e972f0e8c` (`Merge epic/telegram-business-approval-audit`)
+- Current fetched upstream main then: `origin/main = 369cee018`
+- Merge-base with upstream main: `674fad148`
+
+Commit-only comparison at that point:
+
+```bash
+git rev-list --left-right --count HEAD...origin/main
+# 13 155
+```
+
+Interpretation: local branch had 13 commits not in upstream (9 content commits +
+4 local merge commits), and was missing 155 commits from current upstream main.
+The local-only content commits were:
+
+```text
+938cb8d6a fix: keep local STT endpoint compatibility
+4216af66b feat: add Telegram Business approval drafts
+1f03ec541 fix: ignore Telegram Business self messages
+319fe72a2 fix: handle Telegram DM topics safely
+56d496840 test: cover telegram session key isolation
+77ea2b016 test: cover telegram business topic thread helpers
+ec0c35380 feat: store telegram business approval context
+dbd37bd45 feat: harden telegram business approval audit
+4a2adf99d fix: address local regression failures
+```
+
+Plus local merge commits:
+
+```text
+2e1a0fdd3 Merge pi/t_c6913d0c-session-isolation
+a42f44a31 Merge pi/t_aaf1366a-business-direct-topics
+d86f7ad46 Merge pi/t_60158da8-approval-entry-state
+e972f0e8c Merge epic/telegram-business-approval-audit
+```
+
+The local branch also diverged from the fork remote tracking branch
+`alex/alex/local-hermes-tweaks` (`git rev-list --left-right --count
+HEAD...alex/alex/local-hermes-tweaks` was `53 3`). The 3 remote-only commits had
+the same topics as the first three local-only commits but different hashes:
+
+```text
+6ebaa58c6 fix: keep local STT endpoint compatibility
+873692914 feat: add Telegram Business approval drafts
+53f7e5193 fix: ignore Telegram Business self messages
+```
+
+Do not blindly `git pull`/merge this tracking branch without checking for duplicate
+patches. Prefer explicit comparison against `origin/main` and `alex/...` before
+syncing.
+
+Docker test baseline from the same session:
+
+- Fork Docker full suite: `77 failed, 20921 passed, 66 skipped`
+- Upstream clone at `/home/kcnc/.hermes/hermes-agent-origin` (then HEAD
+  `0cafe7d50`) with the same Docker test scaffolding: `64 failed, 21304 passed,
+  74 skipped`
+- Fork-only failing test IDs at that time clustered around MCP cron init, Google
+  Chat env config, Telegram DM topic forwarding, model/provider persistence,
+  concurrent interrupt, delegation credentials/heartbeat, env-vs-dotenv
+  precedence, media transcription response formats, skill provenance, and
+  sandbox cwd wrapper string expectations.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
