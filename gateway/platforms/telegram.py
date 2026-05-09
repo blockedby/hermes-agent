@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+import time
 import uuid
 from typing import Dict, List, Optional, Any
 
@@ -317,7 +318,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Business-chat draft approvals. Telegram Business messages must never
         # receive agent replies directly; each draft is routed to the owner's
         # configured home chat and delivered only after an explicit Send click.
-        self._business_approval_state: Dict[str, Dict[str, str]] = {}
+        self._business_approval_state: Dict[str, Dict[str, Any]] = {}
         # Business connection capabilities, keyed by BusinessConnection.id.
         # ``None`` means unknown (e.g. bot saw a message before the connection
         # update); ``False`` is a hard no-send gate.
@@ -1681,6 +1682,20 @@ class TelegramAdapter(BasePlatformAdapter):
         ])
         return "\n".join(parts)
 
+    @classmethod
+    def _json_safe_business_approval_value(cls, value: Any) -> Any:
+        """Return a JSON-safe copy for ephemeral Business approval state."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_safe_business_approval_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [cls._json_safe_business_approval_value(item) for item in value]
+        return str(value)
+
     async def _route_business_draft_for_owner_approval(
         self,
         *,
@@ -1734,14 +1749,25 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         approval_id = uuid.uuid4().hex[:16]
-        approval_entry = {
-            "chat_id": str(chat_id),
-            "business_connection_id": str(business_connection_id),
-            "draft": content,
-        }
         direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
-        if direct_topic_id:
-            approval_entry["direct_messages_topic_id"] = str(direct_topic_id)
+        origin_session_key = (metadata or {}).get("origin_session_key")
+        origin_source = (metadata or {}).get("origin_source")
+        inbound_message_id = (metadata or {}).get("inbound_message_id")
+        approval_entry: Dict[str, Any] = {
+            "approval_id": approval_id,
+            "origin_session_key": str(origin_session_key) if origin_session_key is not None else None,
+            "origin_source": self._json_safe_business_approval_value(origin_source),
+            "customer_chat_id": str(chat_id),
+            "business_connection_id": str(business_connection_id),
+            "direct_messages_topic_id": str(direct_topic_id) if direct_topic_id else None,
+            "inbound_message_id": str(inbound_message_id) if inbound_message_id is not None else None,
+            "draft": content,
+            "owner_chat_id": str(owner_chat_id),
+            "owner_thread_id": str(owner_thread_id) if owner_thread_id else None,
+            "approval_message_id": None,
+            "created_at": time.time(),
+            "status": "pending",
+        }
         self._business_approval_state[approval_id] = approval_entry
 
         prompt = self._business_approval_prompt_text(
@@ -1773,9 +1799,11 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
         try:
             msg = await self._bot.send_message(**kwargs)
+            message_id = str(getattr(msg, "message_id", "") or "")
+            approval_entry["approval_message_id"] = message_id or None
             return SendResult(
                 success=True,
-                message_id=str(getattr(msg, "message_id", "") or ""),
+                message_id=message_id,
                 raw_response={"business_approval_id": approval_id},
             )
         except Exception as exc:
@@ -2626,8 +2654,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             caller_id = str(getattr(query.from_user, "id", ""))
-            owner_chat_id = self._business_owner_chat_id()
-            owner_thread_id = self._business_owner_thread_id()
+            action = parts[1]
+            approval_id = parts[2]
+            entry = self._business_approval_state.get(approval_id)
+            owner_chat_id = (
+                str(entry.get("owner_chat_id"))
+                if entry and entry.get("owner_chat_id") is not None
+                else self._business_owner_chat_id()
+            )
+            owner_thread_id = (
+                str(entry.get("owner_thread_id"))
+                if entry and entry.get("owner_thread_id") is not None
+                else self._business_owner_thread_id()
+            )
             if (
                 not owner_chat_id
                 or str(query_chat_id) != str(owner_chat_id)
@@ -2635,7 +2674,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     caller_id,
                     chat_id=query_chat_id,
                     chat_type=str(query_chat_type) if query_chat_type is not None else None,
-                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else owner_thread_id,
                     user_name=query_user_name,
                     default_allow=False,
                 )
@@ -2643,8 +2682,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ You are not authorized to approve business drafts.")
                 return
 
-            action = parts[1]
-            approval_id = parts[2]
             entry = self._business_approval_state.pop(approval_id, None)
             if not entry:
                 await query.answer(text="This business draft has already been resolved.")
@@ -2678,8 +2715,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
                 sent_ids: list[str] = []
                 for chunk in chunks:
+                    customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
                     kwargs = {
-                        "chat_id": self._telegram_chat_id(entry["chat_id"]),
+                        "chat_id": self._telegram_chat_id(customer_chat_id),
                         "business_connection_id": entry["business_connection_id"],
                         "text": chunk,
                         **self._link_preview_kwargs(),
