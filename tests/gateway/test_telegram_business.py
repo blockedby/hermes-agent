@@ -75,6 +75,23 @@ def _allow_business_reply(adapter: TelegramAdapter, connection_id: str = "bc-1")
     adapter._business_can_reply[connection_id] = True
 
 
+def test_business_thread_id_helpers_include_direct_messages_topic_identity():
+    non_topic_thread = TelegramAdapter._business_thread_id("bc-42")
+    topic_thread = TelegramAdapter._business_thread_id("bc-42", "338575")
+
+    assert non_topic_thread == "business:bc-42"
+    assert topic_thread == "business:bc-42:topic:338575"
+    assert topic_thread != non_topic_thread
+
+    assert TelegramAdapter._business_connection_id_from_thread(non_topic_thread) == "bc-42"
+    assert TelegramAdapter._business_connection_id_from_thread(topic_thread) == "bc-42"
+
+    assert TelegramAdapter._business_connection_id_from_thread(None) is None
+    assert TelegramAdapter._business_connection_id_from_thread("") is None
+    assert TelegramAdapter._business_connection_id_from_thread("338575") is None
+    assert TelegramAdapter._business_connection_id_from_thread("forum:338575") is None
+
+
 def test_record_business_connection_can_reply_rights():
     adapter = _make_adapter()
 
