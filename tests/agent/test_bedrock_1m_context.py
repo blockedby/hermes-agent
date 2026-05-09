@@ -5,8 +5,9 @@ Bedrock (and Microsoft Foundry) that window is still gated behind the
 ``context-1m-2025-08-07`` beta header as of 2026-04. Without it, Bedrock
 caps these models at 200K even though ``model_metadata.py`` advertises 1M.
 
-These tests guard the invariant that the header is always emitted on the
-Bedrock client path, and that it survives the MiniMax bearer-auth strip.
+These tests guard the invariant that the header is emitted only on endpoint
+paths that require it (Bedrock/Azure) and stays out of native Anthropic and
+MiniMax defaults, where it can be rejected or provider-incompatible.
 """
 
 from unittest.mock import MagicMock, patch
