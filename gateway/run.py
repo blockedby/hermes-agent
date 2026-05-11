@@ -962,7 +962,7 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_id": parts[4],
         }
         if len(parts) > 5 and parts[3] in ("dm", "thread"):
-            result["thread_id"] = parts[5]
+            result["thread_id"] = ":".join(parts[5:])
         return result
     return None
 
@@ -12579,6 +12579,7 @@ class GatewayRunner:
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_thread_id = ""
 
         if session_key:
             try:
@@ -12602,6 +12603,7 @@ class GatewayRunner:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_thread_id = _parsed.get("thread_id", "")
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -12632,7 +12634,7 @@ class GatewayRunner:
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
+            thread_id=str(evt.get("thread_id") or derived_thread_id or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
