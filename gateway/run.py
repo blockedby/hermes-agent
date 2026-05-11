@@ -5868,6 +5868,9 @@ class GatewayRunner:
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "business":
+            return await self._handle_business_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -8953,6 +8956,20 @@ class GatewayRunner:
         
         preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
         return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
+
+    async def _handle_business_command(self, event: MessageEvent) -> str:
+        """Handle /business for Telegram Business per-chat controls."""
+        source = event.source
+        if source.platform != Platform.TELEGRAM:
+            return "Telegram Business controls are available only from Telegram."
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        panel = getattr(adapter, "_send_business_control_panel", None)
+        if not callable(panel):
+            return "Telegram Business controls are not available in this Telegram adapter."
+        result = await panel()
+        if getattr(result, "success", False):
+            return "Opened Telegram Business controls."
+        return f"Failed to open Telegram Business controls: {getattr(result, 'error', 'unknown error')}"
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""

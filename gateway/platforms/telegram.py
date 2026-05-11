@@ -98,6 +98,13 @@ from gateway.platforms.telegram_business_approvals import (
     DEFAULT_PENDING_TTL_SECONDS,
     TelegramBusinessApprovalStore,
 )
+from gateway.platforms.telegram_business_chats import (
+    BUSINESS_CHAT_MODES,
+    DEFAULT_BUSINESS_BOT_MODE,
+    DEFAULT_BUSINESS_CHAT_MODE,
+    TelegramBusinessChatRegistry,
+    user_looks_like_bot,
+)
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -360,6 +367,68 @@ class TelegramAdapter(BasePlatformAdapter):
             "business_ignored_chat_ids",
             env_var="TELEGRAM_BUSINESS_IGNORED_CHAT_IDS",
         )
+        self._business_chat_registry = TelegramBusinessChatRegistry(
+            default_mode=self.config.extra.get(
+                "business_default_mode",
+                os.getenv("TELEGRAM_BUSINESS_DEFAULT_MODE", DEFAULT_BUSINESS_CHAT_MODE),
+            ),
+            bot_default_mode=self.config.extra.get(
+                "business_bot_default_mode",
+                os.getenv("TELEGRAM_BUSINESS_BOT_DEFAULT_MODE", DEFAULT_BUSINESS_BOT_MODE),
+            ),
+        )
+        # Owner chat/thread/user scoped pending "Add rule" prompts. Values are
+        # token/created_at pairs; rule text is accepted from the next owner text
+        # message in the same Telegram context.
+        self._business_pending_rule_tokens: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _business_rule_prompt_key(
+        *,
+        user_id: Optional[str],
+        chat_id: Optional[str],
+        thread_id: Optional[str] = None,
+    ) -> str:
+        return f"{str(user_id or '').strip()}|{str(chat_id or '').strip()}|{str(thread_id or '').strip()}"
+
+    def _business_rule_prompt_key_for_message(self, message: Message) -> str:
+        return self._business_rule_prompt_key(
+            user_id=self._telegram_message_user_id(message),
+            chat_id=self._telegram_message_chat_id(message),
+            thread_id=str(getattr(message, "message_thread_id", "") or ""),
+        )
+
+    async def _maybe_handle_business_rule_text(self, message: Message) -> bool:
+        """Consume next owner text message as a notify-only Business watch rule."""
+        pending = getattr(self, "_business_pending_rule_tokens", None)
+        if not isinstance(pending, dict):
+            self._business_pending_rule_tokens = pending = {}
+        prompt_key = self._business_rule_prompt_key_for_message(message)
+        state = pending.pop(prompt_key, None)
+        if not state:
+            return False
+        token = str(state.get("token") or "").strip()
+        condition = str(getattr(message, "text", "") or "").strip()
+        chat_id = self._telegram_message_chat_id(message)
+        thread_id = str(getattr(message, "message_thread_id", "") or "")
+        metadata = {"thread_id": thread_id} if thread_id else None
+        if not condition or condition.startswith("/"):
+            if chat_id:
+                await self.send(chat_id, "Rule add cancelled.", metadata=metadata)
+            return True
+        entry = self._business_chat_store().add_rule_by_token(token, condition)
+        if not entry:
+            if chat_id:
+                await self.send(chat_id, "Business chat not found; rule was not saved.", metadata=metadata)
+            return True
+        if chat_id:
+            rules_count = len(entry.get("rules", []) if isinstance(entry.get("rules"), list) else [])
+            await self.send(
+                chat_id,
+                f"✅ Notify-only rule saved for {self._business_mode_label(str(entry.get('mode') or 'watch'))} chat. Rules: {rules_count}",
+                metadata=metadata,
+            )
+        return True
 
     def _is_callback_user_authorized(
         self,
@@ -542,6 +611,226 @@ class TelegramAdapter(BasePlatformAdapter):
             return str(home.thread_id)
         return None
 
+    def _business_chat_store(self) -> TelegramBusinessChatRegistry:
+        store = getattr(self, "_business_chat_registry", None)
+        if store is None:
+            store = TelegramBusinessChatRegistry(
+                default_mode=self.config.extra.get(
+                    "business_default_mode",
+                    os.getenv("TELEGRAM_BUSINESS_DEFAULT_MODE", DEFAULT_BUSINESS_CHAT_MODE),
+                ),
+                bot_default_mode=self.config.extra.get(
+                    "business_bot_default_mode",
+                    os.getenv("TELEGRAM_BUSINESS_BOT_DEFAULT_MODE", DEFAULT_BUSINESS_BOT_MODE),
+                ),
+            )
+            self._business_chat_registry = store
+        return store
+
+    def _business_record_from_message(
+        self,
+        message: Message,
+        business_connection_id: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        chat_id = self._telegram_message_chat_id(message) or ""
+        topic_id = self._direct_messages_topic_id_from_message(message)
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        display_name = (
+            getattr(user, "full_name", None)
+            or getattr(chat, "full_name", None)
+            or getattr(chat, "title", None)
+            or getattr(user, "first_name", None)
+            or chat_id
+        )
+        username = getattr(user, "username", None) or getattr(chat, "username", None) or ""
+        is_bot = user_looks_like_bot(
+            username=str(username or ""),
+            display_name=str(display_name or ""),
+            is_bot=getattr(user, "is_bot", False),
+        )
+        return self._business_chat_store().upsert_from_message(
+            business_connection_id=business_connection_id,
+            customer_chat_id=chat_id,
+            direct_messages_topic_id=topic_id,
+            text=getattr(message, "text", "") or "",
+            display_name=str(display_name or ""),
+            username=str(username or ""),
+            is_bot=is_bot,
+        )
+
+    @staticmethod
+    def _business_mode_label(mode: str) -> str:
+        return {
+            "ignored": "Ignore",
+            "watch": "Watch",
+            "draft": "Draft",
+            "auto": "Auto",
+        }.get(str(mode), str(mode))
+
+    def _business_mode_keyboard(self, entry: Dict[str, Any], *, watch_actions: bool = False) -> InlineKeyboardMarkup:
+        token = str(entry.get("token") or "")
+        rows: list[list[Any]] = []
+        if watch_actions:
+            rows.append([
+                InlineKeyboardButton("📝 Draft once", callback_data=f"bm:d:{token}"),
+                InlineKeyboardButton("✍️ Set Draft", callback_data=f"bm:m:{token}:draft"),
+            ])
+            rows.append([
+                InlineKeyboardButton("🔕 Ignore", callback_data=f"bm:m:{token}:ignored"),
+                InlineKeyboardButton("➕ Add rule", callback_data=f"bm:r:{token}"),
+            ])
+        else:
+            rows.extend([
+                [
+                    InlineKeyboardButton("🔕 Ignore", callback_data=f"bm:m:{token}:ignored"),
+                    InlineKeyboardButton("👀 Watch", callback_data=f"bm:m:{token}:watch"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Draft", callback_data=f"bm:m:{token}:draft"),
+                    InlineKeyboardButton("⚡ Auto", callback_data=f"bm:m:{token}:auto"),
+                ],
+            ])
+        return InlineKeyboardMarkup(rows)
+
+    def _business_chat_card_text(
+        self,
+        entry: Dict[str, Any],
+        *,
+        title: str = "Telegram Business chat",
+        rule_matches: Optional[list[Dict[str, Any]]] = None,
+    ) -> str:
+        name = str(entry.get("display_name") or entry.get("customer_chat_id") or "customer")
+        username = str(entry.get("username") or "").strip()
+        mode = self._business_mode_label(str(entry.get("mode") or "watch"))
+        preview = self._truncate_business_card_field(str(entry.get("last_message_preview") or ""), 900)
+        parts = [
+            f"💼 {_html.escape(title)}",
+            "",
+            f"Customer: {_html.escape(name)}" + (f" (@{_html.escape(username)})" if username else ""),
+            f"Mode: <b>{_html.escape(mode)}</b>",
+        ]
+        if rule_matches:
+            labels = ", ".join(str(r.get("label") or r.get("condition") or "rule") for r in rule_matches)
+            parts.append(f"Matched rule: {_html.escape(labels[:200])}")
+        if preview:
+            parts.extend(["", "Message:", f"<blockquote>{_html.escape(preview)}</blockquote>"])
+        return "\n".join(parts)
+
+    async def _send_business_owner_card(
+        self,
+        entry: Dict[str, Any],
+        *,
+        title: str,
+        watch_actions: bool = False,
+        rule_matches: Optional[list[Dict[str, Any]]] = None,
+    ) -> SendResult:
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id or not self._bot:
+            return SendResult(success=True, raw_response={"business_notice": "missing_owner"})
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": self._business_chat_card_text(entry, title=title, rule_matches=rule_matches),
+            "parse_mode": "HTML",
+            "reply_markup": self._business_mode_keyboard(entry, watch_actions=watch_actions),
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
+        try:
+            msg = await self._bot.send_message(**kwargs)
+            return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+        except Exception as exc:
+            logger.error("[%s] Failed to send Telegram Business owner mode card: %s", self.name, exc, exc_info=True)
+            return SendResult(success=True, raw_response={"business_mode_notice_error": str(exc)})
+
+    async def _send_business_watch_notification(self, entry: Dict[str, Any], message: Message) -> SendResult:
+        matches = self._business_chat_store().matching_rules(entry, getattr(message, "text", "") or "")
+        title = "Telegram Business watch"
+        if matches:
+            title = "Telegram Business watch rule matched"
+        return await self._send_business_owner_card(
+            entry,
+            title=title,
+            watch_actions=True,
+            rule_matches=matches,
+        )
+
+    async def _send_business_control_panel(self) -> SendResult:
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id or not self._bot:
+            return SendResult(success=True, raw_response={"business_panel": "missing_owner"})
+        chats = self._business_chat_store().all()
+        if not chats:
+            text = "💼 Telegram Business\n\nNo Business chats seen yet. New chats will appear here with Ignore / Watch / Draft / Auto buttons."
+            keyboard = None
+        else:
+            groups: Dict[str, list[Dict[str, Any]]] = {mode: [] for mode in BUSINESS_CHAT_MODES}
+            for entry in chats.values():
+                groups.setdefault(str(entry.get("mode") or "watch"), []).append(entry)
+            parts = ["💼 Telegram Business", "", "Known chats:"]
+            rows: list[list[Any]] = []
+            for mode in ("draft", "watch", "ignored", "auto"):
+                entries = sorted(groups.get(mode, []), key=lambda e: e.get("last_seen_at", 0), reverse=True)
+                if not entries:
+                    continue
+                parts.append(f"\n<b>{_html.escape(self._business_mode_label(mode))}</b>")
+                for entry in entries[:10]:
+                    name = str(entry.get("display_name") or entry.get("customer_chat_id") or "customer")
+                    token = str(entry.get("token") or "")
+                    parts.append(f"• {_html.escape(name[:80])}")
+                    rows.append([
+                        InlineKeyboardButton(f"{self._business_mode_label(mode)}: {name[:28]}", callback_data=f"bm:noop:{token}"),
+                    ])
+                    rows.append([
+                        InlineKeyboardButton("Ignore", callback_data=f"bm:m:{token}:ignored"),
+                        InlineKeyboardButton("Watch", callback_data=f"bm:m:{token}:watch"),
+                        InlineKeyboardButton("Draft", callback_data=f"bm:m:{token}:draft"),
+                        InlineKeyboardButton("Auto", callback_data=f"bm:m:{token}:auto"),
+                    ])
+            text = "\n".join(parts)
+            keyboard = InlineKeyboardMarkup(rows[:60]) if rows else None
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": keyboard,
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
+        msg = await self._bot.send_message(**kwargs)
+        return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+
+    async def _send_business_direct_text(
+        self,
+        *,
+        chat_id: str,
+        business_connection_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not await self._ensure_business_reply_allowed(business_connection_id):
+            return SendResult(success=False, error="business_reply_permission_disabled", retryable=False)
+        sent: list[str] = []
+        for chunk in self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len):
+            kwargs = {
+                "chat_id": self._telegram_chat_id(chat_id),
+                "business_connection_id": business_connection_id,
+                "text": chunk,
+                **self._link_preview_kwargs(),
+            }
+            direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
+            if direct_topic_id:
+                kwargs["direct_messages_topic_id"] = int(direct_topic_id)
+            msg = await self._bot.send_message(**kwargs)
+            message_id = str(getattr(msg, "message_id", "") or "")
+            if message_id:
+                sent.append(message_id)
+        return SendResult(success=True, message_id=sent[0] if sent else None, raw_response={"message_ids": sent})
+
     def _save_business_approval_state(self) -> bool:
         store = getattr(self, "_business_approval_store", None)
         if store is None:
@@ -649,6 +938,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return metadata or None
 
         metadata["business_connection_id"] = business_connection_id
+        try:
+            entry = self._business_chat_store().get(
+                business_connection_id,
+                getattr(source, "chat_id", None),
+                direct_topic_id,
+            )
+            if entry and entry.get("mode"):
+                metadata["business_mode"] = str(entry.get("mode"))
+        except Exception:
+            logger.debug("[%s] Failed to attach Telegram Business mode metadata", self.name, exc_info=True)
         metadata["inbound_text"] = getattr(event, "text", "") or ""
         if getattr(event, "message_id", None):
             metadata["inbound_message_id"] = str(event.message_id)
@@ -2075,6 +2374,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         business_connection_id = self._business_connection_id_from_metadata(metadata)
         if business_connection_id:
+            if str((metadata or {}).get("business_mode") or "").lower() == "auto":
+                return await self._send_business_direct_text(
+                    chat_id=str(chat_id),
+                    business_connection_id=business_connection_id,
+                    content=content,
+                    metadata=metadata,
+                )
             return await self._route_business_draft_for_owner_approval(
                 chat_id=str(chat_id),
                 business_connection_id=business_connection_id,
@@ -2950,6 +3256,85 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Telegram Business mode/control callbacks (bm:...) ---
+        if data.startswith("bm:"):
+            parts = data.split(":")
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else self._business_owner_thread_id(),
+                user_name=query_user_name,
+                default_allow=False,
+            ):
+                await query.answer(text="⛔ You are not authorized to manage Business chats.")
+                return
+            if len(parts) >= 3 and parts[1] == "noop":
+                await query.answer()
+                return
+            if len(parts) == 4 and parts[1] == "m":
+                _prefix, _action, token, mode = parts
+                entry = self._business_chat_store().set_mode_by_token(token, mode)
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                await query.answer(text=f"Mode: {self._business_mode_label(str(entry.get('mode')))}")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(entry, title="Telegram Business mode updated"),
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry),
+                    )
+                except Exception:
+                    pass
+                return
+            if len(parts) == 3 and parts[1] == "d":
+                entry = self._business_chat_store().update_entry_by_token(parts[2], draft_once=True)
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                await query.answer(text="Draft once armed for the next customer message.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(entry, title="Draft once armed for next message"),
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry, watch_actions=True),
+                    )
+                except Exception:
+                    pass
+                return
+            if len(parts) == 3 and parts[1] == "r":
+                token = parts[2]
+                entry = self._business_chat_store().find_by_token(token)[1]
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                prompt_key = self._business_rule_prompt_key(
+                    user_id=caller_id,
+                    chat_id=str(query_chat_id or ""),
+                    thread_id=str(query_thread_id or ""),
+                )
+                self._business_pending_rule_tokens[prompt_key] = {
+                    "token": token,
+                    "created_at": time.time(),
+                }
+                await query.answer(text="Send the rule text as your next message.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(
+                            entry,
+                            title="Add notify-only watch rule",
+                        ) + "\n\nReply here with a short condition, e.g. <code>mentions payment or invoice</code>. Send any command to cancel.",
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry, watch_actions=True),
+                    )
+                except Exception:
+                    pass
+                return
+            await query.answer(text="Invalid Business mode callback.")
             return
 
         # --- Telegram Business draft approval callbacks (ba:s|c:id) ---
@@ -4549,9 +4934,31 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                 else:
                     self._business_can_reply.setdefault(connection_id, None)
-                    event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
-                    event.text = self._clean_bot_trigger_text(event.text)
-                    self._enqueue_text_event(event)
+                    entry, is_new_chat = self._business_record_from_message(message, connection_id)
+                    mode = str(entry.get("mode") or "watch")
+                    if entry.pop("draft_once", False):
+                        self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
+                        mode = "draft"
+                    if is_new_chat and mode != "ignored":
+                        await self._send_business_owner_card(
+                            entry,
+                            title="New Telegram Business chat",
+                            watch_actions=False,
+                        )
+                    elif mode == "ignored":
+                        logger.info(
+                            "[%s] Ignoring Telegram Business message from chat %s due to per-chat mode",
+                            self.name,
+                            self._telegram_message_chat_id(message),
+                        )
+                    elif mode == "watch":
+                        await self._send_business_watch_notification(entry, message)
+                    elif mode in {"draft", "auto"}:
+                        event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
+                        event.text = self._clean_bot_trigger_text(event.text)
+                        self._enqueue_text_event(event)
+                    else:
+                        await self._send_business_watch_notification(entry, message)
 
         if getattr(update, "edited_business_message", None) is not None:
             handled = True
@@ -4575,6 +4982,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg):
             return
+        if await self._maybe_handle_business_rule_text(msg):
+            return
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -4586,6 +4995,21 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg, is_command=True):
+            return
+        command = str(msg.text or "").strip().split()[0].split("@", 1)[0].lower()
+        if command == "/business":
+            caller_id = self._telegram_message_user_id(msg) or ""
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=self._telegram_message_chat_id(msg),
+                chat_type=str(getattr(getattr(msg, "chat", None), "type", "dm")),
+                thread_id=str(getattr(msg, "message_thread_id", "")) if getattr(msg, "message_thread_id", None) is not None else None,
+                user_name=getattr(getattr(msg, "from_user", None), "full_name", None),
+                default_allow=False,
+            ):
+                logger.info("[%s] Ignoring unauthorized /business command", self.name)
+                return
+            await self._send_business_control_panel()
             return
         
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)

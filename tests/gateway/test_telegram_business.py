@@ -1,7 +1,9 @@
 """Focused tests for Telegram Business assistant-mode MVP support."""
 
 import json
+import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +14,7 @@ from gateway.platforms import telegram as telegram_mod
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
+from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
 from gateway.run import GatewayRunner
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -40,6 +43,10 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._business_owner_user_ids = {}
     adapter._business_ignore_self_messages = True
     adapter._business_ignored_chat_ids = set()
+    adapter._business_chat_registry = TelegramBusinessChatRegistry(
+        Path(tempfile.mkdtemp(prefix="telegram-business-chats-")) / "business_chats.json"
+    )
+    adapter._business_pending_rule_tokens = {}
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0
@@ -144,6 +151,201 @@ def test_business_approval_store_rejects_incomplete_pending_entries(tmp_path):
     loaded = store.load()
 
     assert loaded == {"valid": valid}
+
+
+def test_business_chat_registry_round_trips_modes_and_rules(tmp_path):
+    store = TelegramBusinessChatRegistry(tmp_path / "business_chats.json")
+
+    entry, is_new = store.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="Катя готова гулять",
+        display_name="Катя",
+        username="katya",
+    )
+    token = entry["token"]
+
+    assert is_new is True
+    assert entry["mode"] == "watch"
+    assert store.set_mode_by_token(token, "draft")["mode"] == "draft"
+    store.add_rule_by_token(token, "Катя готова гулять", label="walk")
+
+    loaded = TelegramBusinessChatRegistry(tmp_path / "business_chats.json").load()
+    loaded_entry = next(iter(loaded.values()))
+    assert loaded_entry["mode"] == "draft"
+    assert loaded_entry["customer_chat_id"] == "12345"
+    assert (store.path.stat().st_mode & 0o777) == 0o600
+    assert TelegramBusinessChatRegistry.matching_rules(loaded_entry, "ну Катя готова гулять сейчас")[0]["label"] == "walk"
+
+
+@pytest.mark.asyncio
+async def test_business_unknown_chat_sends_owner_mode_card_before_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=888,
+        business_connection=None,
+        business_message=_business_message(text="hi", connection_id="bc-new"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_called_once()
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "New Telegram Business chat" in kwargs["text"]
+    assert kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_business_watch_chat_notifies_owner_without_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-watch",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=889,
+        business_connection=None,
+        business_message=_business_message(text="vpn плохо работает", connection_id="bc-watch"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    assert adapter._bot.send_message.await_count == 1
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert "Telegram Business watch" in kwargs["text"]
+    assert "business_connection_id" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_business_mode_callback_requires_owner_and_updates_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:m:{token}:ignored",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_chat_registry.find_by_token(token)[1]["mode"] == "ignored"
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited()
+
+    adapter._is_callback_user_authorized = MagicMock(return_value=False)
+    denied = SimpleNamespace(
+        data=f"bm:m:{token}:draft",
+        from_user=SimpleNamespace(id=111, first_name="Other"),
+        message=query.message,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=denied), None)
+
+    assert adapter._business_chat_registry.find_by_token(token)[1]["mode"] == "ignored"
+    denied.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_add_rule_button_stores_next_owner_text_as_notify_rule():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:r:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_pending_rule_tokens
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited()
+
+    owner_msg = _telegram_message(text="mentions invoice")
+    owner_msg.chat.id = 999
+    owner_msg.from_user.id = 999
+    handled = await adapter._maybe_handle_business_rule_text(owner_msg)
+
+    assert handled is True
+    assert adapter._business_pending_rule_tokens == {}
+    saved = adapter._business_chat_registry.find_by_token(token)[1]
+    assert saved["rules"][0]["condition"] == "mentions invoice"
+    assert adapter._business_chat_registry.matching_rules(saved, "customer mentions invoice today")
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_command_opens_owner_control_panel():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    update = SimpleNamespace(update_id=7, message=_telegram_message(text="/business"))
+    update.message.chat.id = 999
+    update.message.from_user.id = 999
+
+    await adapter._handle_command(update, None)
+
+    adapter._bot.send_message.assert_called_once()
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "Known chats" in kwargs["text"]
+    assert kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_business_auto_mode_sends_direct_customer_message():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+
+    result = await adapter.send(
+        "12345",
+        "Auto reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["business_connection_id"] == "bc-1"
+    assert kwargs["text"] == "Auto reply"
 
 
 @pytest.mark.asyncio
@@ -290,6 +492,13 @@ async def test_business_update_ignores_owner_self_message_by_default():
 async def test_business_update_can_process_owner_self_message_when_flag_disabled():
     adapter = _make_adapter(owner_chat_id="227049836")
     adapter._business_ignore_self_messages = False
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-9",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
     adapter._enqueue_text_event = MagicMock()
     update = SimpleNamespace(
         update_id=90,
@@ -496,6 +705,14 @@ async def test_business_busy_ack_is_suppressed_but_interrupt_still_happens():
 @pytest.mark.asyncio
 async def test_business_update_enqueues_text_and_stops_normal_handlers():
     adapter = _make_adapter()
+    adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-9",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    token = next(iter(adapter._business_chat_registry.all().values()))["token"]
+    adapter._business_chat_registry.set_mode_by_token(token, "draft")
     adapter._enqueue_text_event = MagicMock()
     update = SimpleNamespace(
         update_id=88,
