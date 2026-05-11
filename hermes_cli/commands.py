@@ -67,6 +67,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("reset",), args_hint="[name]"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("business", "Open Telegram Business per-chat controls", "Session",
+               gateway_only=True),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
