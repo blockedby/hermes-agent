@@ -178,6 +178,132 @@ def test_business_chat_registry_round_trips_modes_and_rules(tmp_path):
     assert TelegramBusinessChatRegistry.matching_rules(loaded_entry, "ну Катя готова гулять сейчас")[0]["label"] == "walk"
 
 
+def test_business_chat_registry_stores_last_message_context(tmp_path):
+    store = TelegramBusinessChatRegistry(tmp_path / "business_chats.json")
+
+    entry, _ = store.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        direct_messages_topic_id="777",
+        text="Потише пж",
+        message_id="55",
+        display_name="ggg69",
+        username="Ggg6969",
+        user_id="67890",
+        user_name="Customer User",
+    )
+
+    assert entry["last_message_text"] == "Потише пж"
+    assert entry["last_message_preview"] == "Потише пж"
+    assert entry["last_message_id"] == "55"
+    assert entry["customer_user_id"] == "67890"
+    assert entry["customer_user_name"] == "Customer User"
+
+    loaded_entry = next(iter(TelegramBusinessChatRegistry(tmp_path / "business_chats.json").load().values()))
+    assert loaded_entry["last_message_text"] == "Потише пж"
+    assert loaded_entry["last_message_id"] == "55"
+
+
+@pytest.mark.asyncio
+async def test_business_mode_callback_immediately_enqueues_latest_message_for_draft_and_dedupes():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="Потише пж",
+        message_id="55",
+        display_name="ggg69",
+        username="Ggg6969",
+        user_id="67890",
+        user_name="Customer User",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._enqueue_text_event = MagicMock()
+    query = SimpleNamespace(
+        data=f"bm:m:{token}:draft",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "Потише пж"
+    assert event.raw_message is None
+    assert event.message_id == "55"
+    assert event.source.chat_id == "12345"
+    assert event.source.user_id == "67890"
+    assert event.source.user_name == "Customer User"
+    assert event.source.thread_id == "business:bc-1"
+    metadata = adapter._message_event_metadata(event)
+    assert metadata["business_connection_id"] == "bc-1"
+    assert metadata["business_mode"] == "draft"
+    assert metadata["inbound_message_id"] == "55"
+
+
+@pytest.mark.asyncio
+async def test_business_mode_callback_immediately_enqueues_latest_message_for_auto_with_topic_metadata():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        direct_messages_topic_id="777",
+        text="Потише пж",
+        message_id="55",
+        display_name="ggg69",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._enqueue_text_event = MagicMock()
+    query = SimpleNamespace(
+        data=f"bm:m:{token}:auto",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.source.thread_id == "business:bc-1:topic:777"
+    metadata = adapter._message_event_metadata(event)
+    assert metadata["business_connection_id"] == "bc-1"
+    assert metadata["business_mode"] == "auto"
+    assert metadata["direct_messages_topic_id"] == "777"
+
+
+@pytest.mark.asyncio
+async def test_business_mode_callback_without_last_message_context_only_updates_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        display_name="ggg69",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._enqueue_text_event = MagicMock()
+    query = SimpleNamespace(
+        data=f"bm:m:{token}:draft",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_chat_registry.find_by_token(token)[1]["mode"] == "draft"
+    adapter._enqueue_text_event.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_business_unknown_chat_sends_owner_mode_card_before_agent():
     adapter = _make_adapter(owner_chat_id="999")
