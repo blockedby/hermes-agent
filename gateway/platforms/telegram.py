@@ -547,6 +547,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return connection_id or None
 
     @classmethod
+    def _business_direct_topic_id_from_thread(cls, thread_id: Optional[str]) -> Optional[str]:
+        if not thread_id:
+            return None
+        value = str(thread_id)
+        if not value.startswith(cls._BUSINESS_THREAD_PREFIX):
+            return None
+        if cls._BUSINESS_TOPIC_MARKER not in value:
+            return None
+        topic_id = value.rsplit(cls._BUSINESS_TOPIC_MARKER, 1)[1].strip()
+        return topic_id or None
+
+    @classmethod
     def _business_connection_id_from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
             return None
@@ -654,10 +666,66 @@ class TelegramAdapter(BasePlatformAdapter):
             customer_chat_id=chat_id,
             direct_messages_topic_id=topic_id,
             text=getattr(message, "text", "") or "",
+            message_id=getattr(message, "message_id", None),
             display_name=str(display_name or ""),
             username=str(username or ""),
+            user_id=getattr(user, "id", None),
+            user_name=str(getattr(user, "full_name", "") or getattr(user, "first_name", "") or display_name or ""),
             is_bot=is_bot,
         )
+
+    def _business_event_from_chat_entry(self, entry: Dict[str, Any]) -> Optional[MessageEvent]:
+        text = str(entry.get("last_message_text") or "")
+        business_connection_id = str(entry.get("business_connection_id") or "").strip()
+        customer_chat_id = str(entry.get("customer_chat_id") or entry.get("chat_id") or "").strip()
+        if not text or not business_connection_id or not customer_chat_id:
+            return None
+        direct_topic_id = entry.get("direct_messages_topic_id")
+        direct_topic_id = str(direct_topic_id).strip() if direct_topic_id else None
+        message_id = entry.get("last_message_id")
+        user_id = entry.get("customer_user_id") or customer_chat_id
+        user_name = entry.get("customer_user_name") or entry.get("display_name") or customer_chat_id
+        source = self.build_source(
+            chat_id=customer_chat_id,
+            chat_name=str(entry.get("display_name") or customer_chat_id),
+            chat_type="dm",
+            user_id=str(user_id) if user_id is not None else None,
+            user_name=str(user_name) if user_name is not None else None,
+            thread_id=self._business_thread_id(business_connection_id, direct_topic_id),
+            chat_topic="Telegram Business",
+        )
+        if message_id is not None:
+            source.message_id = str(message_id)
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=None,
+            message_id=str(message_id) if message_id is not None else None,
+        )
+
+    def _maybe_enqueue_business_mode_event(self, entry: Dict[str, Any], mode: str) -> bool:
+        normalized = TelegramBusinessChatRegistry.normalize_mode(mode)
+        if normalized not in {"draft", "auto"}:
+            return False
+        message_id = str(entry.get("last_message_id") or "")
+        if not message_id:
+            return False
+        fingerprint = f"{normalized}:{message_id}"
+        if str(entry.get("last_mode_action_fingerprint") or "") == fingerprint:
+            return False
+        event = self._business_event_from_chat_entry(entry)
+        if event is None:
+            return False
+        updated = self._business_chat_store().update_entry_by_token(
+            str(entry.get("token") or ""),
+            last_mode_action_fingerprint=fingerprint,
+            last_mode_action_at=time.time(),
+        )
+        if updated:
+            entry.update(updated)
+        self._enqueue_text_event(event)
+        return True
 
     @staticmethod
     def _business_mode_label(mode: str) -> str:
@@ -929,9 +997,12 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = getattr(source, "thread_id", None)
 
         direct_topic_id = self._direct_messages_topic_id_from_message(getattr(event, "raw_message", None))
+        if not direct_topic_id:
+            direct_topic_id = self._business_direct_topic_id_from_thread(thread_id)
         if direct_topic_id:
             metadata["direct_messages_topic_id"] = direct_topic_id
-            metadata.setdefault("thread_id", direct_topic_id)
+            if not self._business_connection_id_from_thread(thread_id):
+                metadata.setdefault("thread_id", direct_topic_id)
 
         business_connection_id = self._business_connection_id_from_thread(thread_id)
         if not business_connection_id:
@@ -3281,6 +3352,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not entry:
                     await query.answer(text="Business chat not found.")
                     return
+                self._maybe_enqueue_business_mode_event(entry, mode)
                 await query.answer(text=f"Mode: {self._business_mode_label(str(entry.get('mode')))}")
                 try:
                     await query.edit_message_text(

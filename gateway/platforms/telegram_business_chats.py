@@ -147,8 +147,11 @@ class TelegramBusinessChatRegistry:
         customer_chat_id: Any,
         direct_messages_topic_id: Any = None,
         text: str = "",
+        message_id: Any = None,
         display_name: str = "",
         username: str = "",
+        user_id: Any = None,
+        user_name: str = "",
         is_bot: bool = False,
         now: Optional[float] = None,
     ) -> tuple[Dict[str, Any], bool]:
@@ -156,7 +159,8 @@ class TelegramBusinessChatRegistry:
         chats = self.load()
         now_ts = time.time() if now is None else float(now)
         is_new = key not in chats
-        preview = self.preview(text)
+        text_value = str(text or "")
+        preview = self.preview(text_value)
         entry = dict(chats.get(key) or {})
         entry.setdefault("created_at", now_ts)
         entry.setdefault("first_seen_at", now_ts)
@@ -169,7 +173,11 @@ class TelegramBusinessChatRegistry:
                 "username": str(username or "").strip().lstrip("@")[:64],
                 "is_bot": bool(is_bot),
                 "last_seen_at": now_ts,
+                "last_message_text": text_value,
                 "last_message_preview": preview,
+                "last_message_id": str(message_id) if message_id is not None else None,
+                "customer_user_id": str(user_id) if user_id is not None else None,
+                "customer_user_name": str(user_name or display_name or "").strip()[:120],
                 "token": self.token_for_key(key),
             }
         )
