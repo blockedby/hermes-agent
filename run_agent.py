@@ -3303,12 +3303,7 @@ class AIAgent:
                 continue
 
             if ptype in {"image_url", "input_image"}:
-                image_data = part.get("image_url", {})
-                image_url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data or "")
-                if image_url:
-                    image_notes.append(self._describe_image_for_anthropic_fallback(image_url, role))
-                else:
-                    image_notes.append("[An image was attached but no image source was available.]")
+                image_notes.append(_nonvision_image_fallback_note(part, server_rejected=False))
                 continue
 
             text = str(part.get("text", "") or "").strip()
@@ -3360,7 +3355,7 @@ class AIAgent:
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
-        # compat): replace each image part with a vision_analyze text note.
+        # compat): replace each image part with an explicit text-only note.
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -3377,8 +3372,8 @@ class AIAgent:
         Runs on the chat.completions / codex_responses paths. Vision-capable
         models pass through unchanged (provider and any downstream translator
         handle the image parts natively). Non-vision models get each image
-        replaced by a cached vision_analyze text description so the turn
-        doesn't fail with "model does not support image input".
+        replaced by an explicit text-only note so the turn doesn't fail with
+        "model does not support image input" or imply pixels were inspected.
         """
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -3394,8 +3389,8 @@ class AIAgent:
             if not isinstance(msg, dict):
                 continue
             # Reuse the Anthropic text-fallback preprocessor — the behaviour is
-            # identical (walk content parts, replace images with cached
-            # descriptions, merge back into a single text or structured
+            # identical (walk content parts, replace images with honest
+            # non-inspection notes, merge back into a single text or structured
             # content). Naming is historical.
             msg["content"] = self._preprocess_anthropic_content(
                 msg.get("content"),

@@ -300,6 +300,9 @@ class TestReadImageExposure:
         assert "next model call" in description
         assert "vision-capable main model" in description
         assert "does not analyze" in description
+        assert "non-vision" in description
+        assert "pixels were not inspected" in description
+        assert "vision_analyze" in description
 
     def test_vision_analyze_guidance_is_compatibility_fallback(self):
         from tools.vision_tools import VISION_ANALYZE_SCHEMA
