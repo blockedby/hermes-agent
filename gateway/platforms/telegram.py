@@ -105,6 +105,7 @@ from gateway.platforms.telegram_business_chats import (
     TelegramBusinessChatRegistry,
     user_looks_like_bot,
 )
+from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -349,6 +350,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # configured home chat and delivered only after an explicit Send click.
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
+        self._business_history_store = TelegramBusinessHistoryStore()
         # Business connection capabilities, keyed by BusinessConnection.id.
         # ``None`` means unknown (e.g. bot saw a message before the connection
         # update); ``False`` is a hard no-send gate.
@@ -639,6 +641,114 @@ class TelegramAdapter(BasePlatformAdapter):
             self._business_chat_registry = store
         return store
 
+    def _business_history(self) -> TelegramBusinessHistoryStore:
+        store = getattr(self, "_business_history_store", None)
+        if store is None:
+            store = TelegramBusinessHistoryStore()
+            self._business_history_store = store
+        return store
+
+    @staticmethod
+    def _business_message_text(message: Message) -> str:
+        return str(getattr(message, "text", None) or getattr(message, "caption", None) or "")
+
+    @staticmethod
+    def _telegram_message_timestamp(message: Message) -> Optional[float]:
+        value = getattr(message, "date", None)
+        if value is None:
+            return None
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except Exception:
+                return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _business_media_metadata_from_message(cls, message: Message) -> list[Dict[str, Any]]:
+        media: list[Dict[str, Any]] = []
+
+        def add(kind: str, obj: Any) -> None:
+            if obj is None:
+                return
+            item: Dict[str, Any] = {"media_type": kind}
+            for attr in ("file_id", "file_unique_id", "file_size", "width", "height", "duration", "mime_type", "file_name"):
+                value = getattr(obj, attr, None)
+                if value is not None:
+                    item[attr] = value
+            if len(item) > 1:
+                media.append(item)
+
+        photos = getattr(message, "photo", None) or []
+        if photos:
+            try:
+                add("photo", list(photos)[-1])
+            except Exception:
+                pass
+        for attr, kind in (
+            ("voice", "voice"),
+            ("audio", "audio"),
+            ("document", "document"),
+            ("video", "video"),
+            ("animation", "animation"),
+            ("sticker", "sticker"),
+            ("video_note", "video"),
+        ):
+            add(kind, getattr(message, attr, None))
+        return media
+
+    def _record_business_history_from_message(
+        self,
+        message: Message,
+        business_connection_id: str,
+        *,
+        role: str = "customer",
+        direction: str = "inbound",
+        update_id: Optional[int] = None,
+    ) -> None:
+        try:
+            self._business_history().record_message(
+                business_connection_id=business_connection_id,
+                customer_chat_id=self._telegram_message_chat_id(message) or "",
+                direct_messages_topic_id=self._direct_messages_topic_id_from_message(message),
+                telegram_message_id=str(getattr(message, "message_id", "") or ""),
+                role=role,
+                direction=direction,
+                text=self._business_message_text(message),
+                message_date=self._telegram_message_timestamp(message),
+                source_update_id=update_id,
+                media=self._business_media_metadata_from_message(message),
+            )
+        except Exception:
+            logger.warning("[%s] Failed to persist Telegram Business history message", self.name, exc_info=True)
+
+    def _record_business_outbound_history(
+        self,
+        *,
+        business_connection_id: str,
+        customer_chat_id: Any,
+        text: str,
+        role: str,
+        telegram_message_id: Any = None,
+        direct_messages_topic_id: Any = None,
+    ) -> None:
+        try:
+            self._business_history().record_message(
+                business_connection_id=business_connection_id,
+                customer_chat_id=str(customer_chat_id or ""),
+                direct_messages_topic_id=direct_messages_topic_id,
+                telegram_message_id=str(telegram_message_id) if telegram_message_id not in (None, "") else None,
+                role=role,
+                direction="outbound",
+                text=text,
+                message_date=time.time(),
+            )
+        except Exception:
+            logger.warning("[%s] Failed to persist Telegram Business outbound history", self.name, exc_info=True)
+
     def _business_record_from_message(
         self,
         message: Message,
@@ -665,7 +775,7 @@ class TelegramAdapter(BasePlatformAdapter):
             business_connection_id=business_connection_id,
             customer_chat_id=chat_id,
             direct_messages_topic_id=topic_id,
-            text=getattr(message, "text", "") or "",
+            text=self._business_message_text(message),
             message_id=getattr(message, "message_id", None),
             display_name=str(display_name or ""),
             username=str(username or ""),
@@ -897,6 +1007,14 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = str(getattr(msg, "message_id", "") or "")
             if message_id:
                 sent.append(message_id)
+            self._record_business_outbound_history(
+                business_connection_id=business_connection_id,
+                customer_chat_id=chat_id,
+                direct_messages_topic_id=direct_topic_id,
+                telegram_message_id=message_id or None,
+                role="hermes_auto",
+                text=chunk,
+            )
         return SendResult(success=True, message_id=sent[0] if sent else None, raw_response={"message_ids": sent})
 
     def _save_business_approval_state(self) -> bool:
@@ -3567,6 +3685,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         sent_ids.append(sent_id)
                         entry["sent_message_ids"] = sent_ids
                         self._save_business_approval_state()
+                    self._record_business_outbound_history(
+                        business_connection_id=entry["business_connection_id"],
+                        customer_chat_id=customer_chat_id,
+                        direct_messages_topic_id=direct_topic_id,
+                        telegram_message_id=sent_id or None,
+                        role="hermes_approved",
+                        text=chunk,
+                    )
                 entry["status"] = "sent"
                 entry["resolved_at"] = time.time()
                 entry["sent_message_ids"] = sent_ids
@@ -4981,63 +5107,121 @@ class TelegramAdapter(BasePlatformAdapter):
             connection_id = self._business_connection_id_from_message(message)
             if not connection_id:
                 logger.warning("[%s] Ignoring Telegram Business message without business_connection_id", self.name)
-            elif self._is_ignored_business_chat(message):
-                logger.info(
-                    "[%s] Ignoring Telegram Business message from configured ignored chat %s for connection %s",
-                    self.name,
-                    self._telegram_message_chat_id(message),
-                    connection_id,
-                )
             else:
                 if (
                     self._business_ignore_self_messages_enabled()
                     and connection_id not in getattr(self, "_business_owner_user_ids", {})
                 ):
                     await self._refresh_business_connection(connection_id)
-                if self._is_business_self_message(message, connection_id):
+                is_self_message = self._is_business_self_message(message, connection_id)
+                self._record_business_history_from_message(
+                    message,
+                    connection_id,
+                    role="owner_manual" if is_self_message else "customer",
+                    direction="outbound" if is_self_message else "inbound",
+                    update_id=getattr(update, "update_id", None),
+                )
+                if self._is_ignored_business_chat(message):
+                    logger.info(
+                        "[%s] Ignoring Telegram Business message from configured ignored chat %s for connection %s",
+                        self.name,
+                        self._telegram_message_chat_id(message),
+                        connection_id,
+                    )
+                elif is_self_message:
                     logger.info(
                         "[%s] Ignoring outgoing/self Telegram Business message for connection %s",
                         self.name,
                         connection_id,
                     )
-                elif not getattr(message, "text", None):
-                    logger.info("[%s] Ignoring non-text Telegram Business message for connection %s", self.name, connection_id)
-                elif str(message.text).lstrip().startswith("/"):
-                    logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                 else:
-                    self._business_can_reply.setdefault(connection_id, None)
-                    entry, is_new_chat = self._business_record_from_message(message, connection_id)
-                    mode = str(entry.get("mode") or "watch")
-                    if entry.pop("draft_once", False):
-                        self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
-                        mode = "draft"
-                    if is_new_chat and mode != "ignored":
-                        await self._send_business_owner_card(
-                            entry,
-                            title="New Telegram Business chat",
-                            watch_actions=False,
-                        )
-                    elif mode == "ignored":
-                        logger.info(
-                            "[%s] Ignoring Telegram Business message from chat %s due to per-chat mode",
-                            self.name,
-                            self._telegram_message_chat_id(message),
-                        )
-                    elif mode == "watch":
-                        await self._send_business_watch_notification(entry, message)
-                    elif mode in {"draft", "auto"}:
-                        event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
-                        event.text = self._clean_bot_trigger_text(event.text)
-                        self._enqueue_text_event(event)
+                    message_text = self._business_message_text(message)
+                    if not message_text:
+                        logger.info("[%s] Ignoring non-text Telegram Business message for connection %s", self.name, connection_id)
+                    elif message_text.lstrip().startswith("/"):
+                        logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                     else:
-                        await self._send_business_watch_notification(entry, message)
+                        self._business_can_reply.setdefault(connection_id, None)
+                        entry, is_new_chat = self._business_record_from_message(message, connection_id)
+                        mode = str(entry.get("mode") or "watch")
+                        if entry.pop("draft_once", False):
+                            self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
+                            mode = "draft"
+                        if is_new_chat and mode != "ignored":
+                            await self._send_business_owner_card(
+                                entry,
+                                title="New Telegram Business chat",
+                                watch_actions=False,
+                            )
+                        elif mode == "ignored":
+                            logger.info(
+                                "[%s] Ignoring Telegram Business message from chat %s due to per-chat mode",
+                                self.name,
+                                self._telegram_message_chat_id(message),
+                            )
+                        elif mode == "watch":
+                            await self._send_business_watch_notification(entry, message)
+                        elif mode in {"draft", "auto"}:
+                            event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
+                            event.text = self._clean_bot_trigger_text(event.text)
+                            self._enqueue_text_event(event)
+                        else:
+                            await self._send_business_watch_notification(entry, message)
 
-        if getattr(update, "edited_business_message", None) is not None:
+        edited_message = getattr(update, "edited_business_message", None)
+        if edited_message is not None:
             handled = True
-            logger.info("[%s] Ignoring edited Telegram Business message", self.name)
-        if getattr(update, "deleted_business_messages", None) is not None:
+            connection_id = self._business_connection_id_from_message(edited_message)
+            if connection_id:
+                if (
+                    self._business_ignore_self_messages_enabled()
+                    and connection_id not in getattr(self, "_business_owner_user_ids", {})
+                ):
+                    await self._refresh_business_connection(connection_id)
+                is_self_message = self._is_business_self_message(edited_message, connection_id)
+                self._record_business_history_from_message(
+                    edited_message,
+                    connection_id,
+                    role="owner_manual" if is_self_message else "customer",
+                    direction="outbound" if is_self_message else "inbound",
+                    update_id=getattr(update, "update_id", None),
+                )
+                try:
+                    self._business_history().mark_edited(
+                        business_connection_id=connection_id,
+                        customer_chat_id=self._telegram_message_chat_id(edited_message) or "",
+                        direct_messages_topic_id=self._direct_messages_topic_id_from_message(edited_message),
+                        telegram_message_id=str(getattr(edited_message, "message_id", "") or ""),
+                        role="owner_manual" if is_self_message else "customer",
+                        direction="outbound" if is_self_message else "inbound",
+                        text=self._business_message_text(edited_message),
+                        edited_at=self._telegram_message_timestamp(edited_message),
+                        media=self._business_media_metadata_from_message(edited_message),
+                    )
+                except Exception:
+                    logger.warning("[%s] Failed to mark Telegram Business history edit", self.name, exc_info=True)
+            else:
+                logger.info("[%s] Ignoring edited Telegram Business message without connection id", self.name)
+        deleted_update = getattr(update, "deleted_business_messages", None)
+        if deleted_update is not None:
             handled = True
-            logger.info("[%s] Ignoring deleted Telegram Business messages update", self.name)
+            connection_id = getattr(deleted_update, "business_connection_id", None)
+            if isinstance(connection_id, str) and connection_id.strip():
+                chat = getattr(deleted_update, "chat", None)
+                message_ids = getattr(deleted_update, "message_ids", None) or getattr(deleted_update, "message_id", None) or []
+                if not isinstance(message_ids, (list, tuple, set)):
+                    message_ids = [message_ids]
+                try:
+                    self._business_history().mark_deleted(
+                        business_connection_id=connection_id,
+                        customer_chat_id=str(getattr(chat, "id", "") or ""),
+                        direct_messages_topic_id=self._direct_messages_topic_id_from_message(deleted_update),
+                        telegram_message_ids=[str(mid) for mid in message_ids if mid is not None],
+                    )
+                except Exception:
+                    logger.warning("[%s] Failed to mark Telegram Business history delete", self.name, exc_info=True)
+            else:
+                logger.info("[%s] Ignoring deleted Telegram Business messages update without connection id", self.name)
 
         if handled:
             raise ApplicationHandlerStop
@@ -5790,7 +5974,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=message.text or getattr(message, "caption", None) or "",
             message_type=msg_type,
             source=source,
             raw_message=message,

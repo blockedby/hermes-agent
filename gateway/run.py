@@ -6231,6 +6231,27 @@ class GatewayRunner:
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
+        if self._is_telegram_business_source(source):
+            try:
+                from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+
+                thread_id = str(getattr(source, "thread_id", "") or "")
+                connection_id = thread_id[len("business:"):]
+                direct_topic_id = None
+                if ":topic:" in connection_id:
+                    connection_id, direct_topic_id = connection_id.split(":topic:", 1)
+                block = TelegramBusinessHistoryStore().build_context_block(
+                    business_connection_id=connection_id,
+                    customer_chat_id=str(getattr(source, "chat_id", "") or ""),
+                    direct_messages_topic_id=direct_topic_id,
+                    limit=20,
+                    exclude_telegram_message_id=getattr(event, "message_id", None),
+                )
+                if block:
+                    message_text = f"{block}\n\n{message_text}"
+            except Exception:
+                logger.debug("Failed to prepend Telegram Business history context", exc_info=True)
+
         if event.media_urls:
             image_paths = []
             audio_paths = []
