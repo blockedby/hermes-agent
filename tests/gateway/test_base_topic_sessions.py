@@ -126,20 +126,16 @@ class TestBasePlatformTopicSessions:
         event = _make_event("-1001", "17585")
         await adapter._process_message_background(event, build_session_key(event.source))
 
-        assert adapter.sent == [
-            {
-                "chat_id": "-1001",
-                "content": "ack",
-                "reply_to": "1",
-                "metadata": {"thread_id": "17585"},
-            }
-        ]
-        assert typing_calls == [
-            {
-                "chat_id": "-1001",
-                "metadata": {"thread_id": "17585"},
-            }
-        ]
+        assert len(adapter.sent) == 1
+        sent = adapter.sent[0]
+        assert sent["chat_id"] == "-1001"
+        assert sent["content"] == "ack"
+        assert sent["reply_to"] is None
+        assert sent["metadata"]["thread_id"] == "17585"
+        assert sent["metadata"]["origin_session_key"] == build_session_key(event.source)
+        assert sent["metadata"]["origin_source"]["thread_id"] == "17585"
+        assert typing_calls[0]["chat_id"] == "-1001"
+        assert typing_calls[0]["metadata"]["thread_id"] == "17585"
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),

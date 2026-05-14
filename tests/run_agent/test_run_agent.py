@@ -4062,8 +4062,9 @@ class TestAnthropicImageFallback:
             ],
         }]
 
+        mock_vision = AsyncMock(return_value=json.dumps({"success": True, "analysis": "A cat sitting on a chair."}))
         with (
-            patch("tools.vision_tools.vision_analyze_tool", new=AsyncMock(return_value=json.dumps({"success": True, "analysis": "A cat sitting on a chair."}))),
+            patch("tools.vision_tools.vision_analyze_tool", new=mock_vision),
             patch("agent.anthropic_adapter.build_anthropic_kwargs") as mock_build,
         ):
             mock_build.return_value = {"model": "claude-sonnet-4-20250514", "messages": [], "max_tokens": 4096}
@@ -4074,12 +4075,16 @@ class TestAnthropicImageFallback:
             mock_build.call_args.args,
         ))
         transformed = kwargs["messages"]
-        assert isinstance(transformed[0]["content"], str)
-        assert "A cat sitting on a chair." in transformed[0]["content"]
-        assert "Can you see this now?" in transformed[0]["content"]
-        assert "vision_analyze with image_url: https://example.com/cat.png" in transformed[0]["content"]
+        content = transformed[0]["content"]
+        assert isinstance(content, str)
+        assert "Can you see this now?" in content
+        assert "pixels were not inspected by the active main model" in content.lower()
+        assert "vision_analyze" in content
+        assert "Source reference: https://example.com/cat.png" in content
+        assert "A cat sitting on a chair." not in content
+        mock_vision.assert_not_awaited()
 
-    def test_build_api_kwargs_reuses_cached_image_analysis_for_duplicate_images(self, agent):
+    def test_build_api_kwargs_does_not_analyze_duplicate_images_for_nonvision_fallback(self, agent):
         agent.api_mode = "anthropic_messages"
         agent.reasoning_config = None
         data_url = "data:image/png;base64,QUFBQQ=="
@@ -4109,7 +4114,14 @@ class TestAnthropicImageFallback:
             mock_build.return_value = {"model": "claude-sonnet-4-20250514", "messages": [], "max_tokens": 4096}
             agent._build_api_kwargs(api_messages)
 
-        assert mock_vision.await_count == 1
+        assert mock_vision.await_count == 0
+        kwargs = mock_build.call_args.kwargs or dict(zip(
+            ["model", "messages", "tools", "max_tokens", "reasoning_config"],
+            mock_build.call_args.args,
+        ))
+        for transformed in kwargs["messages"]:
+            assert "pixels were not inspected by the active main model" in transformed["content"].lower()
+            assert "base64" not in transformed["content"]
 
 
 class TestFallbackAnthropicProvider:
