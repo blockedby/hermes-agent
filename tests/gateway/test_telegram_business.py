@@ -829,6 +829,102 @@ async def test_business_busy_ack_is_suppressed_but_interrupt_still_happens():
 
 
 @pytest.mark.asyncio
+async def test_business_update_persists_text_before_mode_dispatch():
+    adapter = _make_adapter()
+    history_store = SimpleNamespace(record_message=MagicMock())
+    adapter._business_history_store = history_store
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-ignored",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "ignored")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=87,
+        business_connection=None,
+        business_message=_business_message(text="persist me", connection_id="bc-ignored"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    history_store.record_message.assert_called_once()
+    kwargs = history_store.record_message.call_args.kwargs
+    assert kwargs["business_connection_id"] == "bc-ignored"
+    assert kwargs["customer_chat_id"] == "12345"
+    assert kwargs["telegram_message_id"] == "55"
+    assert kwargs["role"] == "customer"
+    assert kwargs["direction"] == "inbound"
+    assert kwargs["text"] == "persist me"
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_watch_mode_persists_but_does_not_enqueue_agent():
+    adapter = _make_adapter()
+    history_store = SimpleNamespace(record_message=MagicMock())
+    adapter._business_history_store = history_store
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-watch-persist",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=87,
+        business_connection=None,
+        business_message=_business_message(text="watch me", connection_id="bc-watch-persist"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    history_store.record_message.assert_called_once()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_update_records_edited_and_deleted_state():
+    adapter = _make_adapter()
+    history_store = SimpleNamespace(record_message=MagicMock(), mark_edited=MagicMock(), mark_deleted=MagicMock())
+    adapter._business_history_store = history_store
+    edited = _business_message(text="edited text", connection_id="bc-edit")
+    deleted = SimpleNamespace(
+        business_connection_id="bc-edit",
+        chat=SimpleNamespace(id=12345),
+        message_ids=[55, 56],
+    )
+    update = SimpleNamespace(
+        update_id=89,
+        business_connection=None,
+        business_message=None,
+        edited_business_message=edited,
+        deleted_business_messages=deleted,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    history_store.record_message.assert_called_once()
+    history_store.mark_edited.assert_called_once()
+    assert history_store.mark_edited.call_args.kwargs["text"] == "edited text"
+    history_store.mark_deleted.assert_called_once_with(
+        business_connection_id="bc-edit",
+        customer_chat_id="12345",
+        direct_messages_topic_id=None,
+        telegram_message_ids=["55", "56"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_business_update_enqueues_text_and_stops_normal_handlers():
     adapter = _make_adapter()
     adapter._business_chat_registry.upsert_from_message(
