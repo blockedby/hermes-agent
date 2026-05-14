@@ -30,16 +30,18 @@ READ_IMAGE_SCHEMA = {
     "name": "read_image",
     "description": (
         "Load a local image file or safe HTTP(S) image URL and attach its "
-        "pixels to the conversation for the active main model to inspect. "
+        "pixels to the next model call for the active vision-capable main "
+        "model to inspect. Prefer this primary image-read path for "
+        "agent-discovered images when the main model supports vision. "
         "Blocks private/internal URLs, revalidates redirects, enforces a "
-        "download cap, and does not call an external vision model."
+        "download cap, and does not analyze by itself or call any LLM/API."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "path_or_url": {
                 "type": "string",
-                "description": "Local filesystem path or safe http(s) URL to the image to load.",
+                "description": "Local filesystem path or safe HTTP(S) URL to the image to load.",
             },
             "question": {
                 "type": "string",
