@@ -198,6 +198,17 @@ class TestRegistryOwnedToolsets:
         assert resolve_toolset("test-live-toolset") == ["test_live_toolset_tool"]
 
 
+class TestReadImageToolsetExposure:
+    def test_vision_toolset_exposes_read_image_without_removing_vision_analyze(self):
+        tools = set(resolve_toolset("vision"))
+        assert "read_image" in tools
+        assert "vision_analyze" in tools
+
+    def test_default_hermes_surfaces_include_read_image(self):
+        for toolset_name in ("hermes-cli", "hermes-acp", "hermes-api-server"):
+            assert "read_image" in resolve_toolset(toolset_name)
+
+
 class TestToolsetConsistency:
     """Verify structural integrity of the built-in TOOLSETS dict."""
 
