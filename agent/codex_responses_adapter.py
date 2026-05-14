@@ -54,6 +54,10 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
     - ``"user"`` (default) → ``"input_text"``
     - ``"assistant"`` → ``"output_text"``
 
+    Tool/function-call outputs also use the ``"user"`` text flavor because
+    they are new input evidence to the model.  In all cases chat-only
+    ``image_url`` parts are normalized to Responses ``input_image`` parts.
+
     The Responses API rejects ``input_text`` inside assistant messages and
     ``output_text`` inside user messages, so callers MUST pass the correct
     role for the message being converted.
@@ -410,10 +414,18 @@ def _chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Di
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
                 continue
+            content = msg.get("content", "")
+            output: Any
+            if isinstance(content, list):
+                output = _chat_content_to_responses_parts(content, role="user")
+                if not output:
+                    output = ""
+            else:
+                output = str(content or "")
             items.append({
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": str(msg.get("content", "") or ""),
+                "output": output,
             })
 
     return items
@@ -466,14 +478,18 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
             output = item.get("output", "")
             if output is None:
                 output = ""
-            if not isinstance(output, str):
-                output = str(output)
+            if isinstance(output, list):
+                normalized_output: Any = _chat_content_to_responses_parts(output, role="user")
+            elif isinstance(output, str):
+                normalized_output = output
+            else:
+                normalized_output = str(output)
 
             normalized.append(
                 {
                     "type": "function_call_output",
                     "call_id": call_id.strip(),
-                    "output": output,
+                    "output": normalized_output,
                 }
             )
             continue
