@@ -9,6 +9,7 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
@@ -267,6 +268,46 @@ class TestPreToolCallBlocking:
             f"across the run_agent (block-check + dispatch) path; "
             f"expected exactly 1. hook_calls={hook_calls}"
         )
+
+
+# =========================================================================
+# read_image exposure
+# =========================================================================
+
+class TestReadImageExposure:
+    def test_vision_toolset_and_legacy_alias_expose_read_image(self):
+        modern = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(enabled_toolsets=["vision"], quiet_mode=True)
+        }
+        legacy = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(enabled_toolsets=["vision_tools"], quiet_mode=True)
+        }
+
+        assert "read_image" in modern
+        assert "read_image" in legacy
+
+    def test_read_image_schema_guides_primary_main_model_path(self):
+        tools = get_tool_definitions(enabled_toolsets=["vision"], quiet_mode=True)
+        read_image_schema = next(
+            tool["function"] for tool in tools if tool["function"]["name"] == "read_image"
+        )
+
+        description = read_image_schema["description"].lower()
+        assert "local" in description
+        assert "url" in description
+        assert "next model call" in description
+        assert "vision-capable main model" in description
+        assert "does not analyze" in description
+
+    def test_vision_analyze_guidance_is_compatibility_fallback(self):
+        from tools.vision_tools import VISION_ANALYZE_SCHEMA
+
+        description = VISION_ANALYZE_SCHEMA["description"].lower()
+        assert "prefer read_image" in description
+        assert "auxiliary vision" in description
+        assert "fallback" in description
 
 
 # =========================================================================

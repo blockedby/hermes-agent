@@ -758,13 +758,15 @@ from tools.registry import registry, tool_error
 VISION_ANALYZE_SCHEMA = {
     "name": "vision_analyze",
     "description": (
-        "Inspect an image from a URL, file path, or tool output when you need "
-        "closer detail than what's visible in the conversation. If the user's "
+        "Compatibility fallback that analyzes an image with the configured "
+        "auxiliary vision model. Prefer read_image for local files or HTTP(S) "
+        "image URLs when the active main model is vision-capable, because "
+        "read_image attaches pixels to the next model call. If the user's "
         "image is already attached to the conversation and you can see it, "
-        "just answer directly — only call this tool for images referenced by "
-        "URL/path, images returned inside other tool results (browser "
-        "screenshots, search thumbnails), or when you need a deeper look at "
-        "a specific region the main model's vision may have missed."
+        "just answer directly. Use vision_analyze only when the main model "
+        "cannot inspect images, you explicitly need the auxiliary vision path, "
+        "or you need a deeper look at a specific region the main model's "
+        "vision may have missed."
     ),
     "parameters": {
         "type": "object",
