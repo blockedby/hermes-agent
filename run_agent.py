@@ -3941,18 +3941,30 @@ class AIAgent:
         self,
         tool_name: str,
         function_args: dict,
-        function_result: str,
+        function_result: Any,
         *,
         failed: bool,
-    ) -> str:
+    ) -> Any:
+        # Runtime guardrails hash and compare text.  Multimodal tool results
+        # carry image bytes in OpenAI-style content parts, so use the safe
+        # text summary for guardrail bookkeeping and only append warnings to
+        # the visible text part if needed.  This preserves the multipart
+        # payload for the next model call without leaking base64 to logs.
+        guardrail_result = _multimodal_text_summary(function_result)
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
-            function_result,
+            guardrail_result,
             failed=failed,
         )
         if decision.action in {"warn", "halt"}:
-            function_result = append_toolguard_guidance(function_result, decision)
+            if _is_multimodal_tool_result(function_result):
+                _append_subdir_hint_to_multimodal(
+                    function_result,
+                    append_toolguard_guidance("", decision),
+                )
+            else:
+                function_result = append_toolguard_guidance(guardrail_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
