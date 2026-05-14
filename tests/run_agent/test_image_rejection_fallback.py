@@ -31,7 +31,7 @@ class TestStripImagesPreservesAlternation:
         assert changed is False
         assert msgs[0]["content"] == "just text"
 
-    def test_strips_image_url_part_preserves_text(self):
+    def test_strips_image_url_part_preserves_text_with_honest_note(self):
         msgs = [{
             "role": "user",
             "content": [
@@ -41,7 +41,12 @@ class TestStripImagesPreservesAlternation:
         }]
         changed = _strip_images_from_messages(msgs)
         assert changed is True
-        assert msgs[0]["content"] == [{"type": "text", "text": "describe"}]
+        assert msgs[0]["content"][0] == {"type": "text", "text": "describe"}
+        note = msgs[0]["content"][1]
+        assert note["type"] == "text"
+        assert "pixels were not inspected by the active main model" in note["text"].lower()
+        assert "vision_analyze" in note["text"]
+        assert "base64" not in note["text"]
 
     def test_strips_all_recognized_image_types(self):
         msgs = [{
@@ -55,7 +60,8 @@ class TestStripImagesPreservesAlternation:
         }]
         changed = _strip_images_from_messages(msgs)
         assert changed is True
-        assert msgs[0]["content"] == [{"type": "text", "text": "hi"}]
+        assert msgs[0]["content"][0] == {"type": "text", "text": "hi"}
+        assert "pixels were not inspected" in msgs[0]["content"][1]["text"].lower()
 
     def test_tool_message_with_all_images_replaced_not_deleted(self):
         """CRITICAL: tool messages must NEVER be deleted — their tool_call_id
@@ -86,9 +92,10 @@ class TestStripImagesPreservesAlternation:
         assert len(msgs) == 3
         # tool_call_id still present
         assert msgs[2]["tool_call_id"] == "call_abc"
-        # Content replaced with text placeholder (now a string, not a list)
+        # Content replaced with honest text-only note (now a string, not a list)
         assert isinstance(msgs[2]["content"], str)
-        assert "image content removed" in msgs[2]["content"].lower()
+        assert "pixels were not inspected by the active main model" in msgs[2]["content"].lower()
+        assert "vision_analyze" in msgs[2]["content"]
 
     def test_tool_message_with_mixed_content_keeps_text_parts(self):
         msgs = [
@@ -110,7 +117,8 @@ class TestStripImagesPreservesAlternation:
         changed = _strip_images_from_messages(msgs)
         assert changed is True
         assert len(msgs) == 3
-        assert msgs[2]["content"] == [{"type": "text", "text": "Captured 1024x768"}]
+        assert msgs[2]["content"][0] == {"type": "text", "text": "Captured 1024x768"}
+        assert "pixels were not inspected" in msgs[2]["content"][1]["text"].lower()
         assert msgs[2]["tool_call_id"] == "call_1"
 
     def test_image_only_user_message_dropped(self):

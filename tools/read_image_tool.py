@@ -33,8 +33,11 @@ READ_IMAGE_SCHEMA = {
         "pixels to the next model call for the active vision-capable main "
         "model to inspect. Prefer this primary image-read path for "
         "agent-discovered images when the main model supports vision. "
-        "Blocks private/internal URLs, revalidates redirects, enforces a "
-        "download cap, and does not analyze by itself or call any LLM/API."
+        "With a non-vision main model, pixels were not inspected by the "
+        "active main model; switch to a vision-capable main model or use "
+        "vision_analyze for an auxiliary vision fallback. Blocks "
+        "private/internal URLs, revalidates redirects, enforces a download "
+        "cap, and does not analyze by itself or call any LLM/API."
     ),
     "parameters": {
         "type": "object",
