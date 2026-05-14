@@ -9776,18 +9776,30 @@ class AIAgent:
         self,
         tool_name: str,
         function_args: dict,
-        function_result: str,
+        function_result: Any,
         *,
         failed: bool,
-    ) -> str:
+    ) -> Any:
+        # Runtime guardrails hash and compare text.  Multimodal tool results
+        # carry image bytes in OpenAI-style content parts, so use the safe
+        # text summary for guardrail bookkeeping and only append warnings to
+        # the visible text part if needed.  This preserves the multipart
+        # payload for the next model call without leaking base64 to logs.
+        guardrail_result = _multimodal_text_summary(function_result)
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
-            function_result,
+            guardrail_result,
             failed=failed,
         )
         if decision.action in {"warn", "halt"}:
-            function_result = append_toolguard_guidance(function_result, decision)
+            if _is_multimodal_tool_result(function_result):
+                _append_subdir_hint_to_multimodal(
+                    function_result,
+                    append_toolguard_guidance("", decision),
+                )
+            else:
+                function_result = append_toolguard_guidance(guardrail_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
@@ -10678,8 +10690,9 @@ class AIAgent:
                     function_result,
                     failed=_is_error_result,
                 )
-                result_preview = function_result if self.verbose_logging else (
-                    function_result[:200] if len(function_result) > 200 else function_result
+                _safe_preview_text = _multimodal_text_summary(function_result)
+                result_preview = _safe_preview_text if self.verbose_logging else (
+                    _safe_preview_text[:200] if len(_safe_preview_text) > 200 else _safe_preview_text
                 )
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -10746,12 +10759,12 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, 1)
 
             if not self.quiet_mode:
+                _display_result = _multimodal_text_summary(function_result)
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-                    print(self._wrap_verbose("Result: ", function_result))
+                    print(self._wrap_verbose("Result: ", _display_result))
                 else:
-                    _fr_str = function_result if isinstance(function_result, str) else str(function_result)
-                    response_preview = _fr_str[:self.log_prefix_chars] + "..." if len(_fr_str) > self.log_prefix_chars else _fr_str
+                    response_preview = _display_result[:self.log_prefix_chars] + "..." if len(_display_result) > self.log_prefix_chars else _display_result
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):
