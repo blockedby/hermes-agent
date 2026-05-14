@@ -275,7 +275,7 @@ def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_pat
     whisper_result = transcription_tools.transcribe_audio(str(audio_path), model="whisper-1")
     assert whisper_result["success"] is True
     assert whisper_capture["base_url"] == "https://openai-audio-gateway.nousresearch.com/v1"
-    assert whisper_capture["transcription_kwargs"]["response_format"] == "text"
+    assert whisper_capture["transcription_kwargs"]["response_format"] == "json"
     assert whisper_capture["close_calls"] == 1
 
     json_capture = {}
