@@ -9435,9 +9435,15 @@ class GatewayRunner:
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            from gateway.platforms.base import (
+                _reply_anchor_for_event as _base_reply_anchor_for_event,
+                _thread_metadata_for_source as _base_thread_metadata_for_source,
+                should_send_media_as_audio,
+            )
 
-            from gateway.platforms.base import should_send_media_as_audio
+            reply_anchor_fn = getattr(self, "_reply_anchor_for_event", _base_reply_anchor_for_event)
+            thread_meta_fn = getattr(self, "_thread_metadata_for_source", _base_thread_metadata_for_source)
+            _thread_meta = thread_meta_fn(event.source, reply_anchor_fn(event))
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
