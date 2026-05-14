@@ -61,22 +61,25 @@ class TestPrepareAnthropicMessages:
         # Passes through unchanged — image_url parts still present.
         assert out[0]["content"][1]["type"] == "image_url"
 
-    def test_non_vision_replaces_images_with_text(self):
+    def test_non_vision_replaces_images_with_honest_text_only_note(self):
         agent = _make_agent()
         with patch.object(agent, "_model_supports_vision", return_value=False), \
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
-                 return_value="[Image description: a cat]",
+                 side_effect=AssertionError("non-vision fallback must not call auxiliary vision implicitly"),
              ):
             out = agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
-        # Content collapsed to a string containing the description + user text.
+        # Content collapsed to a string containing an honest non-inspection note + user text.
         content = out[0]["content"]
         assert isinstance(content, str)
-        assert "[Image description: a cat]" in content
         assert "What's in this image?" in content
-        # No more image parts.
+        assert "pixels were not inspected by the active main model" in content.lower()
+        assert "vision_analyze" in content
+        assert "vision-capable main model" in content
+        # No more image parts or fake image descriptions.
         assert "image_url" not in content
+        assert "here's what it contains" not in content.lower()
 
 
 # ─── _prepare_messages_for_non_vision_model ──────────────────────────────────
@@ -98,7 +101,7 @@ class TestPrepareMessagesForNonVision:
             out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
         assert out[0]["content"][1]["type"] == "image_url"
 
-    def test_non_vision_strips_images(self):
+    def test_non_vision_strips_images_with_honest_text_only_note(self):
         agent = _make_agent()
         agent.provider = "openrouter"
         agent.model = "qwen/qwen3-235b-a22b"
@@ -106,13 +109,15 @@ class TestPrepareMessagesForNonVision:
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
-                 return_value="[Image description: a dog]",
+                 side_effect=AssertionError("non-vision fallback must not call auxiliary vision implicitly"),
              ):
             out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
         content = out[0]["content"]
         assert isinstance(content, str)
-        assert "[Image description: a dog]" in content
+        assert "pixels were not inspected by the active main model" in content.lower()
+        assert "vision_analyze" in content
         assert "image_url" not in content
+        assert "Image description" not in content
 
     def test_multiple_messages_with_mixed_content(self):
         agent = _make_agent()
@@ -126,14 +131,14 @@ class TestPrepareMessagesForNonVision:
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
-                 return_value="[Image: thing]",
+                 side_effect=AssertionError("non-vision fallback must not call auxiliary vision implicitly"),
              ):
             out = agent._prepare_messages_for_non_vision_model(msgs)
-        # First two messages unchanged (no images), third stripped.
+        # First two messages unchanged (no images), third stripped with an honest note.
         assert out[0]["content"] == "first turn"
         assert out[1]["content"] == "ack"
         assert isinstance(out[2]["content"], str)
-        assert "[Image: thing]" in out[2]["content"]
+        assert "pixels were not inspected by the active main model" in out[2]["content"].lower()
 
 
 # ─── _model_supports_vision ──────────────────────────────────────────────────

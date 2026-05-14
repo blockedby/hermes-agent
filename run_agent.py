@@ -875,6 +875,37 @@ def _sanitize_tools_non_ascii(tools: list) -> bool:
     return _sanitize_structure_non_ascii(tools)
 
 
+def _nonvision_image_fallback_note(part: Any = None, *, server_rejected: bool = False) -> str:
+    """Plain-text replacement for image parts that cannot be sent natively.
+
+    The wording is intentionally explicit: once image parts are stripped, the
+    active main model did not receive pixels and must not infer that it
+    inspected the image.  Never include data URLs/base64 in this note.
+    """
+    source = ""
+    if isinstance(part, dict):
+        image_ref = part.get("image_url")
+        url = ""
+        if isinstance(image_ref, dict):
+            url = str(image_ref.get("url") or "")
+        elif image_ref:
+            url = str(image_ref)
+        if url and not url.startswith("data:"):
+            source = f" Source reference: {url}."
+
+    prefix = (
+        "The server rejected image content, so image pixels were removed before retry."
+        if server_rejected
+        else "This active main model is configured as non-vision, so image pixels were removed before the model call."
+    )
+    return (
+        f"[{prefix} Pixels were not inspected by the active main model."
+        " Switch to a vision-capable main model and use read_image to inspect pixels directly,"
+        " or call vision_analyze if an auxiliary vision summary is acceptable."
+        f"{source}]"
+    )
+
+
 def _strip_images_from_messages(messages: list) -> bool:
     """Remove image_url content parts from all messages in-place.
 
@@ -883,13 +914,15 @@ def _strip_images_from_messages(messages: list) -> bool:
     next API call sends text only.
 
     Preserves message alternation invariants:
+      * Messages with text plus images keep their text and get an explicit
+        note that pixels were not inspected by the active main model.
       * ``tool``-role messages whose content was entirely images are replaced
-        with a plaintext placeholder, NOT deleted — deleting them would leave
+        with a plaintext non-inspection note, NOT deleted — deleting them would leave
         the paired ``tool_call_id`` on the prior assistant message unmatched,
         which providers reject with HTTP 400.
       * Non-tool messages whose content becomes empty are dropped.  In
         practice this only hits synthetic image-only user messages appended
-        for attachment delivery; real user turns always include text.
+        for attachment delivery; real user turns normally include text.
 
     Returns True if any image parts were removed.
     """
@@ -902,18 +935,25 @@ def _strip_images_from_messages(messages: list) -> bool:
         if not isinstance(content, list):
             continue
         new_parts = []
+        removed_parts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
                 found = True
+                removed_parts.append(part)
             else:
                 new_parts.append(part)
         if len(new_parts) < len(content):
+            note = _nonvision_image_fallback_note(
+                removed_parts[0] if removed_parts else None,
+                server_rejected=True,
+            )
             if new_parts:
+                new_parts.append({"type": "text", "text": note})
                 msg["content"] = new_parts
             elif msg.get("role") == "tool":
                 # Preserve tool_call_id linkage — providers require every
                 # assistant tool_call to have a matching tool response.
-                msg["content"] = "[image content removed — server does not support images]"
+                msg["content"] = note
             else:
                 # Synthetic image-only user/assistant message with no text;
                 # safe to drop.
@@ -8486,12 +8526,7 @@ class AIAgent:
                 continue
 
             if ptype in {"image_url", "input_image"}:
-                image_data = part.get("image_url", {})
-                image_url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data or "")
-                if image_url:
-                    image_notes.append(self._describe_image_for_anthropic_fallback(image_url, role))
-                else:
-                    image_notes.append("[An image was attached but no image source was available.]")
+                image_notes.append(_nonvision_image_fallback_note(part, server_rejected=False))
                 continue
 
             text = str(part.get("text", "") or "").strip()
@@ -8543,7 +8578,7 @@ class AIAgent:
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
-        # compat): replace each image part with a vision_analyze text note.
+        # compat): replace each image part with an explicit text-only note.
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -8560,8 +8595,8 @@ class AIAgent:
         Runs on the chat.completions / codex_responses paths. Vision-capable
         models pass through unchanged (provider and any downstream translator
         handle the image parts natively). Non-vision models get each image
-        replaced by a cached vision_analyze text description so the turn
-        doesn't fail with "model does not support image input".
+        replaced by an explicit text-only note so the turn doesn't fail with
+        "model does not support image input" or imply pixels were inspected.
         """
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -8577,8 +8612,8 @@ class AIAgent:
             if not isinstance(msg, dict):
                 continue
             # Reuse the Anthropic text-fallback preprocessor — the behaviour is
-            # identical (walk content parts, replace images with cached
-            # descriptions, merge back into a single text or structured
+            # identical (walk content parts, replace images with honest
+            # non-inspection notes, merge back into a single text or structured
             # content). Naming is historical.
             msg["content"] = self._preprocess_anthropic_content(
                 msg.get("content"),

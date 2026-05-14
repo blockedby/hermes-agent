@@ -78,7 +78,7 @@ Or in-session:
 | `terminal` | `process`, `terminal` | Shell command execution and background process management. |
 | `todo` | `todo` | Task list management within a session. |
 | `tts` | `text_to_speech` | Text-to-speech audio generation. |
-| `vision` | `vision_analyze` | Image analysis via vision-capable models. |
+| `vision` | `vision_analyze`, `read_image` | Image analysis and loading. Use `read_image` for local files or safe HTTP(S) image URLs when the active main model is vision-capable; it attaches pixels to the next model call and does not analyze by itself. Use `vision_analyze` when the main model cannot inspect images or you explicitly need the auxiliary vision fallback. Non-vision `read_image` fallback is text-only and must not be treated as pixel inspection by the active main model. |
 | `web` | `web_extract`, `web_search` | Web search and page content extraction. |
 | `yuanbao` | `yb_query_group_info`, `yb_query_group_members`, `yb_search_sticker`, `yb_send_dm`, `yb_send_sticker` | Yuanbao DM/group actions and sticker search. Registered only on `hermes-yuanbao`. |
 
