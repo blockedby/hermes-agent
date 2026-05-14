@@ -319,7 +319,22 @@ def build_session_context_prompt(
         lines.append(f"**User ID:** {uid}")
 
     # Platform-specific behavioral notes
-    if context.source.platform == Platform.SLACK:
+    is_telegram_business = context.source.platform == Platform.TELEGRAM and (
+        str(context.source.chat_topic or "").strip().lower() == "telegram business"
+        or str(context.source.thread_id or "").startswith("business:")
+    )
+    if is_telegram_business:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are handling a Telegram Business customer chat "
+            "on behalf of the business owner. Treat your response as the exact "
+            "customer-facing message or draft from the owner, written in first person "
+            "as appropriate. Do not speak as Hermes, an assistant, or an agent; do not "
+            "address the owner; and do not include meta commentary such as “draft”, "
+            "“I would reply”, or explanations unless the customer asked for them. "
+            "Keep it natural for Telegram."
+        )
+    elif context.source.platform == Platform.SLACK:
         lines.append("")
         lines.append(
             "**Platform notes:** You are running inside Slack. "
