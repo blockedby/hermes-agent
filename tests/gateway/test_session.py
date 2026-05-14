@@ -194,6 +194,29 @@ class TestBuildSessionContextPrompt:
         assert "Telegram" in prompt
         assert "Home Chat" in prompt
 
+    def test_telegram_business_prompt_frames_response_as_owner_draft(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="222",
+            chat_name="Customer",
+            chat_type="dm",
+            user_name="Customer",
+            thread_id="business:conn-123",
+            chat_topic="Telegram Business",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Telegram Business customer chat" in prompt
+        assert "exact customer-facing message or draft from the owner" in prompt
+        assert "Do not speak as Hermes, an assistant, or an agent" in prompt
+        assert "do not address the owner" in prompt
+
     def test_bluebubbles_prompt_mentions_short_conversational_i_message_format(self):
         config = GatewayConfig(
             platforms={
