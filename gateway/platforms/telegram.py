@@ -497,6 +497,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # Telegram Business state. Rights are updated by business_connection
+        # updates and lazily refreshed by getBusinessConnection when possible.
+        self._business_can_reply: Dict[str, Optional[bool]] = {}
+        self._business_pending_rule_tokens: Dict[str, Dict[str, Any]] = {}
+        self._business_approval_store = TelegramBusinessApprovalStore()
+        self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
