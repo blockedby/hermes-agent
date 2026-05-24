@@ -182,6 +182,7 @@ from agent.message_sanitization import (
     _sanitize_messages_non_ascii,
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
+    _nonvision_image_fallback_note,
     _sanitize_structure_non_ascii,
 )
 from agent.tool_dispatch_helpers import (
@@ -3412,6 +3413,9 @@ class AIAgent:
 
         content = result.get("content") or []
         if not self._content_has_image_parts(content):
+            return content
+
+        if not (getattr(self, "provider", "") or "").strip() and not (getattr(self, "model", "") or "").strip():
             return content
 
         if self._model_supports_vision():

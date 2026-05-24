@@ -391,15 +391,12 @@ async def test_send_retries_without_thread_on_thread_not_found():
         metadata={"thread_id": "99999", "direct_messages_topic_id": "99999"},
     )
 
-    assert result.success is True
-    assert result.message_id == "42"
-    assert result.raw_response["requested_thread_id"] == 99999
-    assert result.raw_response["thread_fallback"] is True
-    # First two calls keep the configured thread, then final fallback drops it.
-    assert len(call_log) == 3
-    assert call_log[0]["message_thread_id"] == 99999
-    assert call_log[1]["message_thread_id"] == 99999
-    assert call_log[2]["message_thread_id"] is None
+    assert result.success is False
+    # Explicit Direct Messages topics must fail closed instead of leaking into
+    # the unthreaded/root chat.
+    assert len(call_log) == 1
+    assert call_log[0]["direct_messages_topic_id"] == 99999
+    assert "message_thread_id" not in call_log[0]
 
 
 @pytest.mark.asyncio
@@ -451,7 +448,7 @@ async def test_send_private_dm_topic_uses_direct_messages_topic_id():
     )
 
     assert result.success is True
-    assert call_log[0]["message_thread_id"] is None
+    assert "message_thread_id" not in call_log[0]
     assert call_log[0]["direct_messages_topic_id"] == 99999
 
 
@@ -709,7 +706,7 @@ async def test_send_dm_topic_fallback_without_anchor_does_not_crash():
 
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] is None
-    assert call_log[0]["message_thread_id"] is None
+    assert "message_thread_id" not in call_log[0]
     assert call_log[0]["direct_messages_topic_id"] == 20197
 
 

@@ -352,6 +352,32 @@ def _sanitize_tools_non_ascii(tools: list) -> bool:
     return _sanitize_structure_non_ascii(tools)
 
 
+
+def _nonvision_image_fallback_note(part: Any = None, *, server_rejected: bool = False) -> str:
+    """Plain-text replacement for image parts that cannot be sent natively."""
+    source = ""
+    if isinstance(part, dict):
+        image_ref = part.get("image_url")
+        url = ""
+        if isinstance(image_ref, dict):
+            url = str(image_ref.get("url") or "")
+        elif image_ref:
+            url = str(image_ref)
+        if url and not url.startswith("data:"):
+            source = f" Source reference: {url}."
+
+    prefix = (
+        "The server rejected image content, so image pixels were removed before retry."
+        if server_rejected
+        else "This active main model is configured as non-vision, so image pixels were removed before the model call."
+    )
+    return (
+        f"[{prefix} Pixels were not inspected by the active main model."
+        " Switch to a vision-capable main model and use read_image to inspect pixels directly,"
+        " or call vision_analyze if an auxiliary vision summary is acceptable."
+        f"{source}]"
+    )
+
 def _strip_images_from_messages(messages: list) -> bool:
     """Remove image_url content parts from all messages in-place.
 
@@ -379,18 +405,25 @@ def _strip_images_from_messages(messages: list) -> bool:
         if not isinstance(content, list):
             continue
         new_parts = []
+        removed_parts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") in {"image_url", "image", "input_image"}:
                 found = True
+                removed_parts.append(part)
             else:
                 new_parts.append(part)
         if len(new_parts) < len(content):
+            note = _nonvision_image_fallback_note(
+                removed_parts[0] if removed_parts else None,
+                server_rejected=True,
+            )
             if new_parts:
+                new_parts.append({"type": "text", "text": note})
                 msg["content"] = new_parts
             elif msg.get("role") == "tool":
                 # Preserve tool_call_id linkage — providers require every
                 # assistant tool_call to have a matching tool response.
-                msg["content"] = "[image content removed — server does not support images]"
+                msg["content"] = note
             else:
                 # Synthetic image-only user/assistant message with no text;
                 # safe to drop.
@@ -440,5 +473,6 @@ __all__ = [
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
+    "_nonvision_image_fallback_note",
     "_sanitize_structure_non_ascii",
 ]

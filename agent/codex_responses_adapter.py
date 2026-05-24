@@ -520,12 +520,13 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                     if not isinstance(part, dict):
                         continue
                     ptype = part.get("type")
-                    if ptype == "input_text":
+                    if ptype in {"input_text", "text"}:
                         text = part.get("text")
                         if isinstance(text, str) and text:
                             cleaned.append({"type": "input_text", "text": text})
-                    elif ptype == "input_image":
-                        url = part.get("image_url")
+                    elif ptype in {"input_image", "image_url"}:
+                        image_ref = part.get("image_url")
+                        url = image_ref.get("url") if isinstance(image_ref, dict) else image_ref
                         if isinstance(url, str) and url:
                             entry: Dict[str, Any] = {"type": "input_image", "image_url": url}
                             detail = part.get("detail")
@@ -547,7 +548,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 {
                     "type": "function_call_output",
                     "call_id": call_id.strip(),
-                    "output": normalized_output,
+                    "output": output,
                 }
             )
             continue

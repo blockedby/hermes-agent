@@ -991,7 +991,8 @@ VISION_ANALYZE_SCHEMA = {
         "and you read the pixels yourself on the next turn — call this "
         "any time the user references an image (filepath in their message, "
         "URL in tool output, screenshot from the browser, etc.). For "
-        "non-vision models, falls back to an auxiliary vision model that "
+        "non-vision models, prefer read_image with a vision-capable main model; "
+        "vision_analyze remains an auxiliary vision compatibility fallback that "
         "returns a text description."
     ),
     "parameters": {

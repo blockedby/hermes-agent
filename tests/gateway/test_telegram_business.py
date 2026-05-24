@@ -55,6 +55,12 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._dm_topics = {}
     adapter._dm_topics_config = []
     adapter._disable_link_previews = False
+    adapter._reply_to_mode = "first"
+    adapter._notifications_mode = "important"
+    adapter._status_message_ids = {}
+    adapter._forum_lock = __import__("asyncio").Lock()
+    adapter._forum_command_registered = set()
+    adapter._clarify_state = {}
     return adapter
 
 

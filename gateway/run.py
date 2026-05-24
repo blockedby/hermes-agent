@@ -1402,7 +1402,7 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_id": parts[4],
         }
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
-            result["thread_id"] = parts[5]
+            result["thread_id"] = ":".join(parts[5:])
         return result
     return None
 
@@ -11355,6 +11355,9 @@ class GatewayRunner:
                 _thread_metadata_for_source as _base_thread_metadata_for_source,
                 should_send_media_as_audio,
             )
+
+            reply_anchor = self._reply_anchor_for_event(event)
+            _thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
