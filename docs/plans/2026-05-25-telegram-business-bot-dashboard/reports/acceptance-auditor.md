@@ -1,72 +1,62 @@
 ## Task package
-- Task name: Telegram Business Telegram Web App dashboard — Task 1 Next.js + shadcn setup
+- Task name: Telegram Business Telegram Web App dashboard — final acceptance audit
 - Task package: `docs/plans/2026-05-25-telegram-business-bot-dashboard/`
 - Report path: `docs/plans/2026-05-25-telegram-business-bot-dashboard/reports/acceptance-auditor.md`
 - Acceptance plan path: `docs/plans/2026-05-25-telegram-business-bot-dashboard/verification/acceptance-plan.md`
 
 ## Acceptance verdict
-- Status: accepted
-- Summary: Task 1 is fully evidenced: the app skeleton, auth/bootstrap flow, docs, screenshots, and fresh build/auth checks all pass.
+- Status: accepted with limitations
+- Summary: Local implementation is accepted; the only uncovered items are the explicitly not-run live VPS/Vercel/Telegram deployment checks.
 
 ## Acceptance coverage
-- AC1: Separate Next.js app exists at `apps/telegram-business-dashboard/`
-  - Evidence present: `apps/telegram-business-dashboard/package.json`, `src/app/*`
+- Backend focused tests pass
+  - Evidence present: `verification/final.md`
   - Result: passed
   - Gap: none
-- AC2: App uses App Router, TypeScript, Tailwind, and shadcn/ui
-  - Evidence present: `package.json`, `src/app/layout.tsx`, `src/components/ui/*`
+- Frontend lint/typecheck/build pass
+  - Evidence present: `verification/final.md`
   - Result: passed
   - Gap: none
-- AC3: Telegram Web App bootstrap loads Telegram JS, calls `ready()`/`expand()`, and degrades gracefully outside Telegram
-  - Evidence present: `src/lib/telegram/use-telegram-webapp.ts`, `src/app/page.tsx`, screenshot artifact
+- Browser smoke outside Telegram is safe and readable
+  - Evidence present: `reports/browser-smoke.md`, `verification/browser.md`, screenshots
   - Result: passed
-  - Gap: none
-- AC4: Server-only Telegram initData validation helper exists
-  - Evidence present: `src/lib/server/telegram-auth.ts`
+  - Gap: only unauthorized/outside-Telegram smoke; live Telegram not run
+- `/business` launcher fallback/config behavior
+  - Evidence present: `reports/reviewer-fixes.md`, `verification/final.md`
+  - Result: passed locally
+  - Gap: live bot/menu smoke not run
+- Auth/session rejects invalid or non-owner access
+  - Evidence present: `verification/final.md`, `apps/telegram-business-dashboard` auth tests
   - Result: passed
-  - Gap: none
-- AC5: Owner/admin-only session route exists
-  - Evidence present: `src/app/api/session/route.ts`, auth smoke results
-  - Result: passed
-  - Gap: none
-- AC6: `.env.example` includes required env names and no secrets
-  - Evidence present: `apps/telegram-business-dashboard/.env.example`
-  - Result: passed
-  - Gap: none
-- AC7: App builds locally without Hermes API implementation
-  - Evidence present: `npm run lint`, `npm run typecheck`, `npm run build`
-  - Result: passed
-  - Gap: none
-- AC8: Vercel root directory is documented
-  - Evidence present: `apps/telegram-business-dashboard/README.md`, `reports/task-1-next-shadcn-telegram-setup.md`
-  - Result: passed
-  - Gap: none
-- AC9: BotFather/menu setup is documented
-  - Evidence present: `reports/task-1-next-shadcn-telegram-setup.md`
-  - Result: passed
-  - Gap: none
-- AC10: Caddy/Nginx notes for later VPS API exposure are documented
-  - Evidence present: `reports/task-1-next-shadcn-telegram-setup.md`
-  - Result: passed
-  - Gap: none
+  - Gap: none locally
+- Owner can list chats, open detail/history, request draft, change mode
+  - Evidence present: `verification/final.md`
+  - Result: passed locally
+  - Gap: live Telegram/Vercel/VPS end-to-end not run
+- No customer direct sends from `Generate draft now`
+  - Evidence present: `verification/final.md`, `reports/reviewer-fixes.md`
+  - Result: passed locally
+  - Gap: none locally
 
 ## System readiness coverage
-- Routes / registration: covered
-- Services / APIs: covered for session route only; Hermes VPS API intentionally out of scope for Task 1
-- Config / env / secrets: covered via `.env.example` and app README
+- Routes / registration: covered locally
+- Services / APIs: covered locally for dashboard API and BFF; live service start not checked
+- Config / env / secrets: covered locally via config bridge and docs
 - Docker / containers: not relevant
-- Permissions / access: covered via admin-only allowlist and auth smoke
+- Permissions / access: covered locally via owner/non-owner auth tests
 - Database / migrations: not relevant
-- Frontend-backend integration: covered for local session bootstrap only
-- Runtime / deployment wiring: covered via Vercel root directory and launcher/deployment docs
+- Frontend-backend integration: covered locally by route tests/build
+- Runtime / deployment wiring: partially covered; live VPS/Vercel/TG checks not run
 
 ## Check freshness
 - Targeted checks: fresh
-- Full local checks: fresh
+- Full local checks: fresh enough for local acceptance
 - Remote checks / CI: not available before push
 
 ## Required before done
-- None.
+- Run live VPS gateway/service status checks.
+- Run Vercel deployment smoke.
+- Run live Telegram owner/non-owner Web App smoke.
 
 ## Files written
 - `docs/plans/2026-05-25-telegram-business-bot-dashboard/verification/acceptance-plan.md`: updated
