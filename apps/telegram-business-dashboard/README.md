@@ -38,6 +38,18 @@ HERMES_DASHBOARD_API_TOKEN=
 
 Keep both Hermes values server-only. Do not create `NEXT_PUBLIC_` mirrors for the service token.
 
+After deploying, set the same public Web App URL in the Hermes gateway on the
+VPS as either config or env so `/business` sends the Telegram Web App button:
+
+```yaml
+telegram:
+  business_dashboard_webapp_url: https://<your-vercel-app>.vercel.app
+```
+
+```bash
+TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL=https://<your-vercel-app>.vercel.app
+```
+
 ## Vercel project settings
 
 ```text

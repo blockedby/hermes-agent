@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -48,6 +48,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    WebAppInfo = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -143,7 +144,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, WebAppInfo, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -155,7 +156,7 @@ def check_telegram_requirements() -> bool:
         return False
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
-        from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM, WebAppInfo as _WAI
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -175,6 +176,7 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    WebAppInfo = _WAI
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -778,6 +780,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return str(home.thread_id)
         return None
 
+    def _business_dashboard_webapp_url(self) -> Optional[str]:
+        raw = self.config.extra.get("business_dashboard_webapp_url")
+        if raw is None or str(raw).strip() == "":
+            raw = os.getenv("TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL", "")
+        url = str(raw or "").strip()
+        return url or None
+
     def _business_chat_store(self) -> TelegramBusinessChatRegistry:
         store = getattr(self, "_business_chat_registry", None)
         if store is None:
@@ -1039,10 +1048,33 @@ class TelegramAdapter(BasePlatformAdapter):
             rule_matches=matches,
         )
 
+    async def _send_business_dashboard_launcher(self, owner_chat_id: str, dashboard_url: str) -> SendResult:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Open dashboard", web_app=WebAppInfo(url=dashboard_url))]
+        ])
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": (
+                "💼 Open Telegram Business Dashboard\n\n"
+                "Tap the button below to manage Business chats, modes, history, and draft requests."
+            ),
+            "parse_mode": "HTML",
+            "reply_markup": keyboard,
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
+        msg = await self._bot.send_message(**kwargs)
+        return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+
     async def _send_business_control_panel(self) -> SendResult:
         owner_chat_id = self._business_owner_chat_id()
         if not owner_chat_id or not self._bot:
             return SendResult(success=True, raw_response={"business_panel": "missing_owner"})
+        dashboard_url = self._business_dashboard_webapp_url()
+        if dashboard_url:
+            return await self._send_business_dashboard_launcher(owner_chat_id, dashboard_url)
         chats = self._business_chat_store().all()
         if not chats:
             text = "💼 Telegram Business\n\nNo Business chats seen yet. New chats will appear here with Ignore / Watch / Draft / Auto buttons."

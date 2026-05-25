@@ -26,9 +26,15 @@ Defaults:
 
 - New human Business chats send a card to the configured owner/home chat with
   buttons: **Ignore**, **Watch**, **Draft**, **Auto**.
-- `/business` opens the owner control panel listing known Business chats by
-  mode, with inline mode-switch buttons. Raw chat IDs are not part of the main
-  UX; callback data uses opaque tokens.
+- `/business` opens the Telegram Web App dashboard when
+  `telegram.business_dashboard_webapp_url` (or
+  `TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL`) is configured. The bot sends an
+  **Open dashboard** Telegram Web App button and does not log the configured
+  URL.
+- If no dashboard URL is configured, `/business` falls back to the owner
+  control panel listing known Business chats by mode, with inline mode-switch
+  buttons. Raw chat IDs are not part of the main UX; callback data uses opaque
+  tokens.
 - Mode callbacks require owner authorization.
 
 ## Watch mode and rules
@@ -56,6 +62,24 @@ The file and parent directory are written with private permissions. Entries are
 keyed by Business connection + customer chat + optional direct-message topic;
 display names are metadata only and are not used for routing. The registry keeps
 short message previews for owner cards and watch notifications.
+
+## Dashboard launcher config
+
+Use config.yaml for the canonical non-secret Web App URL:
+
+```yaml
+telegram:
+  business_dashboard_webapp_url: https://<your-vercel-app>.vercel.app
+```
+
+For VPS/systemd deployments you can set the equivalent environment variable;
+it takes precedence in the gateway runtime config loader:
+
+```text
+TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL=https://<your-vercel-app>.vercel.app
+```
+
+Unset both values to roll back `/business` to the inline owner panel.
 
 ## Dashboard VPS API runtime
 
@@ -92,6 +116,13 @@ injected gateway callback when embedded, or mark the registry request state when
 run as a separate service. The API never sends customer-facing Telegram text
 itself.
 
+The module has a standalone entrypoint, so the API can run as a separate user
+service:
+
+```bash
+python -m gateway.platforms.telegram_business_dashboard_api
+```
+
 Example user systemd unit for a standalone localhost service behind Caddy/nginx:
 
 ```ini
@@ -116,3 +147,44 @@ WantedBy=default.target
 Expose it only over HTTPS from the VPS reverse proxy to the Vercel server-side
 BFF, and keep browser CORS closed unless a later deployment explicitly needs an
 allowlisted origin. Do not log or commit the bearer token.
+
+Caddy example:
+
+```caddyfile
+business-api.example.com {
+  reverse_proxy 127.0.0.1:8765
+}
+```
+
+Nginx example:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name business-api.example.com;
+
+  location / {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+}
+```
+
+## Vercel dashboard app env
+
+Set the Vercel project root to `apps/telegram-business-dashboard` and configure
+these environment variable names in Vercel:
+
+```text
+TELEGRAM_BOT_TOKEN              # server-only; validates Telegram initData
+TELEGRAM_ADMIN_USER_IDS         # comma-separated owner Telegram user IDs
+NEXT_PUBLIC_TELEGRAM_BOT_USERNAME
+NEXT_PUBLIC_TELEGRAM_WEBAPP_URL # public Vercel app URL shown in fallback UI
+HERMES_DASHBOARD_API_BASE_URL   # HTTPS URL for the VPS API reverse proxy
+HERMES_DASHBOARD_API_TOKEN      # server-only; matches the VPS API token
+```
+
+After Vercel deploys, copy the public app URL into the Hermes gateway setting
+`telegram.business_dashboard_webapp_url` or the VPS env var
+`TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL` so `/business` launches the Web App.

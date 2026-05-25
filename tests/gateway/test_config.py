@@ -571,6 +571,49 @@ class TestLoadGatewayConfig:
             == "https://custom-proxy.example.com/bot"
         )
 
+    def test_bridges_telegram_business_dashboard_webapp_url_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  business_dashboard_webapp_url: https://dashboard.example.com/business\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL", raising=False)
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.TELEGRAM].extra["business_dashboard_webapp_url"]
+            == "https://dashboard.example.com/business"
+        )
+
+    def test_telegram_business_dashboard_webapp_url_env_takes_precedence(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  business_dashboard_webapp_url: https://from-config.example.com/business\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv(
+            "TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL",
+            "https://from-env.example.com/business",
+        )
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.TELEGRAM].extra["business_dashboard_webapp_url"]
+            == "https://from-env.example.com/business"
+        )
+
     def test_bridges_notice_delivery_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

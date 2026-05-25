@@ -1,6 +1,7 @@
 """Focused tests for Telegram Business assistant-mode MVP support."""
 
 import json
+import logging
 import tempfile
 import time
 from pathlib import Path
@@ -529,7 +530,57 @@ async def test_business_add_rule_button_stores_next_owner_text_as_notify_rule():
 
 
 @pytest.mark.asyncio
-async def test_business_command_opens_owner_control_panel():
+async def test_business_command_sends_webapp_launcher_when_dashboard_url_configured(caplog, monkeypatch):
+    monkeypatch.setattr(telegram_mod, "WebAppInfo", lambda url: SimpleNamespace(url=url))
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardButton",
+        lambda text, **kwargs: SimpleNamespace(text=text, **kwargs),
+    )
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
+    dashboard_url = "https://dashboard.example.com/business?preview_secret=do-not-log"
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter.config.extra["business_dashboard_webapp_url"] = dashboard_url
+    adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    update = SimpleNamespace(update_id=7, message=_telegram_message(text="/business"))
+    update.message.chat.id = 999
+    update.message.from_user.id = 999
+
+    with caplog.at_level(logging.DEBUG, logger=telegram_mod.__name__):
+        await adapter._handle_command(update, None)
+
+    adapter._bot.send_message.assert_called_once()
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "Open Telegram Business Dashboard" in kwargs["text"]
+    keyboard = kwargs["reply_markup"].inline_keyboard
+    assert keyboard[0][0].text == "Open dashboard"
+    assert keyboard[0][0].web_app.url == dashboard_url
+    assert all(dashboard_url not in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_business_command_falls_back_to_inline_panel_without_dashboard_url(monkeypatch):
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardButton",
+        lambda text, **kwargs: SimpleNamespace(text=text, **kwargs),
+    )
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
     adapter = _make_adapter(owner_chat_id="999")
     adapter._business_chat_registry.upsert_from_message(
         business_connection_id="bc-1",
@@ -549,6 +600,19 @@ async def test_business_command_opens_owner_control_panel():
     assert kwargs["chat_id"] == 999
     assert "Known chats" in kwargs["text"]
     assert kwargs["reply_markup"] is not None
+    assert not any(
+        getattr(button, "web_app", None)
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    )
+
+
+def test_business_dashboard_webapp_url_prefers_config_over_env(monkeypatch):
+    adapter = _make_adapter(owner_chat_id="999")
+    monkeypatch.setenv("TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL", "https://env.example.com/business")
+    adapter.config.extra["business_dashboard_webapp_url"] = " https://config.example.com/business "
+
+    assert adapter._business_dashboard_webapp_url() == "https://config.example.com/business"
 
 
 @pytest.mark.asyncio

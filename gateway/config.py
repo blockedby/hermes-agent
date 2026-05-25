@@ -988,6 +988,15 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+                dashboard_url = telegram_cfg.get("business_dashboard_webapp_url")
+                env_dashboard_url = os.getenv("TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL", "").strip()
+                if env_dashboard_url or dashboard_url is not None:
+                    _tg_plat, _tg_extra = _ensure_platform_extra_dict(
+                        platforms_data, Platform.TELEGRAM.value
+                    )
+                    _resolved_dashboard_url = env_dashboard_url or str(dashboard_url or "").strip()
+                    if _resolved_dashboard_url:
+                        _tg_extra["business_dashboard_webapp_url"] = _resolved_dashboard_url
                 # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode
                 # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
                 _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}

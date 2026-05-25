@@ -1397,6 +1397,7 @@ DEFAULT_CONFIG = {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "business_dashboard_webapp_url": "",  # Telegram Web App URL launched by /business when configured
     },
 
     # Mattermost platform settings (gateway mode)
@@ -2474,6 +2475,13 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Telegram proxy URL (optional)",
         "password": False,
         "category": "messaging",
+    },
+    "TELEGRAM_BUSINESS_DASHBOARD_WEBAPP_URL": {
+        "description": "Telegram Web App URL opened by the /business launcher",
+        "prompt": "Telegram Business dashboard Web App URL",
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
     },
     "DISCORD_BOT_TOKEN": {
         "description": "Discord bot token from Developer Portal",
