@@ -4,7 +4,7 @@ TASK_PACKAGE: docs/plans/2026-05-25-telegram-business-bot-dashboard
 REPORT_PATH: docs/plans/2026-05-25-telegram-business-bot-dashboard/reports/task-2-auth.md
 PROGRESS_PATH: docs/plans/2026-05-25-telegram-business-bot-dashboard/progress/aad-implementer-task-2-auth.md
 COMMITS:
-- not committed yet: ready to commit after report write
+- 4e7582668: test: cover Telegram dashboard auth
 FILES_CHANGED:
 - apps/telegram-business-dashboard/package.json: added `test:auth` command and Vitest dev dependency.
 - apps/telegram-business-dashboard/package-lock.json: locked Vitest test dependency tree.
