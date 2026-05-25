@@ -12,6 +12,14 @@ npm run dev
 
 Opening `http://localhost:3000` outside Telegram should show the safe `Open from Telegram` state.
 
+## Auth tests
+
+```bash
+npm run test:auth
+```
+
+The auth tests generate signed Telegram Web App `initData` fixtures with `@tma.js/init-data-node` and do not require real bot credentials.
+
 ## Required Vercel env
 
 ```bash
