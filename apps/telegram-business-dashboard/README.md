@@ -29,12 +29,14 @@ NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=
 NEXT_PUBLIC_TELEGRAM_WEBAPP_URL=
 ```
 
-Later Hermes API tasks will use:
+Server-side Business dashboard BFF routes also require:
 
 ```bash
 HERMES_DASHBOARD_API_BASE_URL=
 HERMES_DASHBOARD_API_TOKEN=
 ```
+
+Keep both Hermes values server-only. Do not create `NEXT_PUBLIC_` mirrors for the service token.
 
 ## Vercel project settings
 
