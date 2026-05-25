@@ -89,7 +89,7 @@ function StateCard({ status, errorMessage, onRefresh }: Pick<DashboardViewProps,
         <AlertTitle>Could not load dashboard</AlertTitle>
         <AlertDescription className="space-y-3">
           <span className="block">{errorMessage ?? "The Hermes dashboard API is unavailable."}</span>
-          <Button variant="outline" size="sm" onClick={onRefresh}>
+          <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
             Try again
           </Button>
         </AlertDescription>
@@ -107,7 +107,7 @@ function StateCard({ status, errorMessage, onRefresh }: Pick<DashboardViewProps,
             New Telegram Business conversations will appear here after Hermes records them.
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={onRefresh}>
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
           Refresh
         </Button>
       </CardContent>
@@ -185,7 +185,7 @@ export function DashboardView({
               <h1 className="truncate text-2xl font-semibold tracking-tight">Business</h1>
               <p className="text-sm text-muted-foreground">Owner dashboard for replies, drafts, and modes.</p>
             </div>
-            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
+            <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
               <RefreshCw className={cn("size-4", isLoading && "animate-spin")} aria-hidden="true" />
               Refresh
             </Button>

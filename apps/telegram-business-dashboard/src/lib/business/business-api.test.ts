@@ -77,7 +77,22 @@ describe("Business dashboard client API", () => {
         headers: { "content-type": "application/json" },
       }),
     );
-    await generateBusinessDraft("tok-1", INIT_DATA);
+    await generateBusinessDraft("tok-1", INIT_DATA, "  mention spring launch  ");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/business/chats/tok-1/draft",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ source: "latest", prompt: "mention spring launch" }),
+      }),
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ draft: { status: "queued", chatToken: "tok-1", source: "latest", sentToCustomer: false } }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await generateBusinessDraft("tok-1", INIT_DATA, "   ");
     expect(fetchMock).toHaveBeenLastCalledWith(
       "/api/business/chats/tok-1/draft",
       expect.objectContaining({

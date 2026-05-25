@@ -20,10 +20,12 @@ type ChatDetailViewProps = {
   status: DetailStatus;
   errorMessage?: string;
   actionStatus: ActionStatus;
+  draftPrompt?: string;
   nowSeconds?: number;
   onBack: () => void;
   onRefresh: () => void;
   onModeChange: (mode: BusinessChatMode) => void;
+  onDraftPromptChange?: (prompt: string) => void;
   onGenerateDraft: () => void;
 };
 
@@ -81,7 +83,7 @@ function EmptyOrError({ status, errorMessage, onRefresh }: Pick<ChatDetailViewPr
       <AlertTitle>Could not load chat</AlertTitle>
       <AlertDescription className="space-y-3">
         <span className="block">{errorMessage ?? "The Hermes dashboard API is unavailable."}</span>
-        <Button variant="outline" size="sm" onClick={onRefresh}>
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
           Try again
         </Button>
       </AlertDescription>
@@ -120,10 +122,12 @@ export function ChatDetailView({
   status,
   errorMessage,
   actionStatus,
+  draftPrompt = "",
   nowSeconds,
   onBack,
   onRefresh,
   onModeChange,
+  onDraftPromptChange,
   onGenerateDraft,
 }: ChatDetailViewProps) {
   const isLoading = status === "loading";
@@ -134,11 +138,11 @@ export function ChatDetailView({
       <section className="mx-auto flex max-w-2xl flex-col gap-4 pb-[env(safe-area-inset-bottom)]">
         <header className="sticky top-0 z-10 -mx-3 border-b bg-background/95 px-3 py-3 backdrop-blur sm:-mx-6 sm:px-6">
           <div className="flex items-center justify-between gap-2">
-            <Button variant="ghost" size="sm" onClick={onBack}>
+            <Button type="button" variant="ghost" size="sm" onClick={onBack}>
               <ArrowLeft className="size-4" aria-hidden="true" />
               Back
             </Button>
-            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
+            <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
               <RefreshCw className={cn("size-4", isLoading && "animate-spin")} aria-hidden="true" />
               Refresh
             </Button>
@@ -211,6 +215,7 @@ export function ChatDetailView({
                   {MODE_OPTIONS.map((option) => (
                     <Button
                       key={option.value}
+                      type="button"
                       variant={chat.mode === option.value ? "default" : "outline"}
                       className={modeButtonClass(option.value, chat.mode)}
                       onClick={() => onModeChange(option.value)}
@@ -220,14 +225,28 @@ export function ChatDetailView({
                     </Button>
                   ))}
                 </div>
-                <Button className="w-full" onClick={onGenerateDraft} disabled={actionLoading}>
+                <div className="space-y-2">
+                  <label htmlFor="business-draft-prompt" className="text-sm font-medium">
+                    Optional draft topic
+                  </label>
+                  <input
+                    id="business-draft-prompt"
+                    className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+                    value={draftPrompt}
+                    onChange={(event) => onDraftPromptChange?.(event.target.value)}
+                    placeholder="Optional: ask Hermes to focus the draft on a theme or answer angle"
+                    disabled={actionLoading}
+                  />
+                  <p className="text-xs text-muted-foreground">Leave empty to draft from the latest customer message.</p>
+                </div>
+                <Button type="button" className="w-full" onClick={onGenerateDraft} disabled={actionLoading}>
                   <Send className="size-4" aria-hidden="true" />
-                  Generate draft now
+                  {actionLoading ? "Queueing draft..." : "Generate draft now"}
                 </Button>
                 {actionStatus ? (
                   <Alert variant={actionStatus.kind === "error" ? "destructive" : "default"}>
                     <Sparkles className="size-4" aria-hidden="true" />
-                    <AlertTitle>{actionStatus.kind === "error" ? "Action failed" : "Action queued"}</AlertTitle>
+                    <AlertTitle>{actionStatus.kind === "error" ? "Action failed" : actionStatus.kind === "loading" ? "Generating draft" : "Draft request queued"}</AlertTitle>
                     <AlertDescription>{actionStatus.message}</AlertDescription>
                   </Alert>
                 ) : null}

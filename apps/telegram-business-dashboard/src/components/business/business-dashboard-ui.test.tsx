@@ -168,9 +168,11 @@ describe("Business dashboard UI view models", () => {
         nowSeconds={1_800_000}
         status="ready"
         actionStatus={null}
+        draftPrompt="mention warranty"
         onBack={vi.fn()}
         onRefresh={vi.fn()}
         onModeChange={vi.fn()}
+        onDraftPromptChange={vi.fn()}
         onGenerateDraft={vi.fn()}
       />,
     );
@@ -178,6 +180,8 @@ describe("Business dashboard UI view models", () => {
     expect(html).toContain("Ada Lovelace");
     expect(html).toContain("Reply allowed");
     expect(html).toContain("Generate draft now");
+    expect(html).toContain("Optional draft topic");
+    expect(html).toContain("mention warranty");
     expect(html).toContain("Ignore");
     expect(html).toContain("Watch");
     expect(html).toContain("Draft");

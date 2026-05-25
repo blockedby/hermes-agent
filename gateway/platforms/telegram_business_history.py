@@ -63,6 +63,7 @@ _STRING_FIELDS = (
 
 _TEXT_FIELDS = {
     "transcript": 4000,
+    "prompt": 1000,
     "error": 1000,
 }
 

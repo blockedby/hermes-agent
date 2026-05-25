@@ -358,21 +358,26 @@ def test_draft_request_enqueues_latest_message_without_sending_customer_text(reg
         return True
 
     resp = _api(registry, approvals, history, enqueue=enqueue).handle_request(
-        "POST", f"/api/business/chats/{entry['token']}/draft", headers=_auth(), body={"source": "latest"}
+        "POST", f"/api/business/chats/{entry['token']}/draft", headers=_auth(), body={"source": "latest", "prompt": "focus on warranty"}
     )
 
     assert resp.status == 202
     assert resp.body["draft"]["status"] == "queued"
     assert resp.body["draft"]["sentToCustomer"] is False
+    assert resp.body["draft"]["prompt"] == "focus on warranty"
     assert "Please draft this" not in json.dumps(resp.body, ensure_ascii=False)
     assert len(calls) == 1
     event, chat_entry, actor_user_id, reason = calls[0]
     assert event.text == "Please draft this"
+    assert event.metadata["business_dashboard_prompt"] == "focus on warranty"
+    assert "focus on warranty" in event.channel_context
     assert chat_entry["token"] == entry["token"]
     assert actor_user_id == "4242"
     assert reason == "draft_request"
     stored = registry.find_by_token(entry["token"])[1]
     assert stored["last_dashboard_draft_status"] == "queued"
+    [history_event] = history.list_events("bc-1|123|")
+    assert history_event["prompt"] == "focus on warranty"
 
 
 def test_draft_request_requires_latest_message_context(registry, approvals, history):

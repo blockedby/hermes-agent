@@ -207,7 +207,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
       request("http://localhost/api/business/chats/chat-token-1/draft", {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ source: "latest" }),
+        body: JSON.stringify({ source: "latest", prompt: "focus on warranty" }),
       }),
       tokenCtx(),
     );
@@ -217,7 +217,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
       "https://hermes.example.test/dashboard/api/business/chats/chat-token-1/draft",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ source: "latest", actorUserId: String(TEST_ADMIN_USER_ID) }),
+        body: JSON.stringify({ source: "latest", prompt: "focus on warranty", actorUserId: String(TEST_ADMIN_USER_ID) }),
       }),
     );
   });

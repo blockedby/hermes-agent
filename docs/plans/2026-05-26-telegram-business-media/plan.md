@@ -402,3 +402,88 @@ Executor:
 - Watch notifications may remain text-only for first pass; do not accidentally send customer media to owner unless product policy allows it.
 - Voice transcript persistence creates more sensitive stored text than media-only metadata; keep fields bounded, private, and avoid storing raw credentials/URLs beyond safe local cache references.
 - Do not make tool availability assumptions: automatic image handling is native vision/`vision_analyze`; `read_image` is available but not the auto path.
+
+---
+
+# Added slice: Telegram Business dashboard Generate draft now behavior (2026-05-26)
+
+## Task intake
+
+Goal: make the Telegram Business dashboard chat-detail "Generate draft now" action an in-place Web App action that does not navigate/refresh away, shows submitting/queued/generating/result/error states in the mounted detail UI, and accepts an optional prompt/topic/theme while preserving empty-prompt generation.
+
+In scope:
+- `apps/telegram-business-dashboard` chat-detail controls/client API/BFF route for draft generation.
+- Python Hermes dashboard API draft request path if needed to pass optional prompt to the existing draft system.
+- Nearby Telegram Business dashboard buttons/forms for unintended submit/navigation behavior.
+- Targeted dashboard tests and focused Python dashboard API tests for prompt pass-through if backend changes.
+
+Out of scope:
+- VPS deploy/restart.
+- Broad visual redesign or unrelated dashboard architecture refactor.
+- Changing approval policy beyond prompt metadata pass-through for dashboard-requested drafts.
+
+Done-state:
+- AC1-AC5 from the routing packet satisfied or explicitly waived with evidence.
+- Final report: `reports/dashboard-draft-owner.md`.
+- Verification evidence: `verification/dashboard-draft.md`.
+
+Blocking unknowns:
+- None known after initial orientation; exact backend storage/consumption field names to be confirmed in implementation.
+
+## Repo orientation and reuse discovery
+
+Local guidance:
+- Root `AGENTS.md`: live runtime is on `EverydayWiteVPS`; do not assume/deploy local runtime. Use `scripts/run_tests.sh` for Python tests.
+- `apps/telegram-business-dashboard/AGENTS.md`: this is Next.js 16.2.6; read relevant `node_modules/next/dist/docs/` before Next-specific changes. Initial doc read: `node_modules/next/dist/docs/01-app/index.md` (App Router overview; route handlers/client components remain file-system App Router surfaces).
+
+Likely files/areas:
+- Frontend detail state/UI: `apps/telegram-business-dashboard/src/components/business/chat-detail-shell.tsx`, `chat-detail-view.tsx`.
+- Frontend API client/types/tests: `apps/telegram-business-dashboard/src/lib/business/api.ts`, `types.ts`, `business-api.test.ts`.
+- BFF route/tests: `apps/telegram-business-dashboard/src/app/api/business/chats/[token]/draft/route.ts`, `route-handlers.test.ts`.
+- Backend dashboard API/tests: `gateway/platforms/telegram_business_dashboard_api.py`, `tests/gateway/test_telegram_business_dashboard_api.py`.
+
+Existing patterns to reuse:
+- Client APIs use `businessFetch()` with Telegram init data only in headers and JSON body only for action payloads.
+- BFF route authenticates via `authenticateTelegramAdmin()`, strips `initData` via `postBodyWithoutInitData()`, adds `actorUserId`, and proxies through `callHermesDashboard()`.
+- Detail shell already owns mounted state and calls `generateBusinessDraft()`; detail view already uses explicit `Button` controls and action `Alert`.
+- Backend `BusinessDashboardAPI.request_draft()` records `draft_requested` history and returns queued status.
+
+Missing pieces:
+- Frontend draft API accepts prompt parameter and sends `{source:"latest", prompt?: string}` (including preserving non-empty prompt; empty/omitted valid).
+- BFF proxy allows prompt in forwarded body.
+- Backend accepts optional prompt/topic/theme and records/passes it where existing draft generation can consume it.
+- Detail UI has a prompt input and more explicit queued/generating/result/error feedback without remount/navigate.
+- Related controls audited for missing `type="button"` / accidental form navigation; fixes/waivers recorded.
+- Tests updated for API pass-through, UI rendering/state, and backend prompt acceptance.
+
+## Plan tasks and dependency graph
+
+### Task DD-1: Implement dashboard draft in-place prompt/status behavior
+
+Goal:
+- Clicking/tapping Generate draft now remains in the mounted chat detail UI, sends optional prompt/topic when non-empty, accepts empty prompt, and displays submitting/queued/result/error feedback.
+
+Boundary:
+- System area: Telegram Business dashboard frontend + BFF + Hermes dashboard API draft request.
+- Primary verification: targeted dashboard Vitest tests plus focused Python dashboard API tests if backend changes.
+
+Acceptance criteria:
+- AC1: Generate draft control is not a link/form-submit navigation; any relevant buttons explicitly avoid accidental submit where applicable.
+- AC2: Detail UI exposes draft action states: submitting/queueing, queued/generating/pending from API status, success/result text or recoverable error.
+- AC3: Empty prompt works; non-empty prompt is sent through client API, BFF, and backend request/history/draft context without breaking `source: latest`.
+- AC4: Nearby dashboard controls are audited for redirect/refresh risks; direct inconsistencies fixed or waived with evidence.
+- AC5: Targeted tests/checks pass.
+
+Test plan:
+- `cd apps/telegram-business-dashboard && npm run test:auth -- src/lib/business/business-api.test.ts src/app/api/business/route-handlers.test.ts src/components/business/business-dashboard-ui.test.tsx`
+- `cd apps/telegram-business-dashboard && npm run typecheck`
+- If `gateway/platforms/telegram_business_dashboard_api.py` changes: `scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py -q` from repo root.
+
+Dependencies:
+- Depends on: none.
+- Blocks: final owner verification/report.
+- Executor: `aad-implementer`.
+
+Execution ledger:
+- 2026-05-26 owner: plan gate completed for DD-1; dispatching one `aad-implementer` because this is a coherent single-slice implementation with one verification story.
+- 2026-05-26 owner: DD-1 implemented directly due nested subagent depth limit. Verification recorded in `verification/dashboard-draft.md`. Status: done pending parent review/deploy.

@@ -44,6 +44,7 @@ export function ChatDetailShell({ token }: { token: string }) {
   const [history, setHistory] = useState<BusinessHistoryEvent[]>([]);
   const [errorMessage, setErrorMessage] = useState<string>();
   const [actionStatus, setActionStatus] = useState<ActionStatus>(null);
+  const [draftPrompt, setDraftPrompt] = useState("");
 
   const loadDetail = useCallback(async () => {
     if (telegram.status === "missing") {
@@ -79,6 +80,56 @@ export function ChatDetailShell({ token }: { token: string }) {
     void Promise.resolve().then(loadDetail);
   }, [loadDetail]);
 
+  const refreshDetailInPlace = useCallback(async (): Promise<BusinessHistoryEvent[] | undefined> => {
+    if (telegram.status !== "ready") {
+      return;
+    }
+    try {
+      const [detailResponse, historyResponse] = await Promise.all([
+        fetchBusinessChatDetail(token, telegram.initData),
+        fetchBusinessHistory(token, telegram.initData),
+      ]);
+      setChat(detailResponse.chat);
+      const nextHistory = historyResponse.history ?? detailResponse.history ?? [];
+      setHistory(nextHistory);
+      setStatus("ready");
+      return nextHistory;
+    } catch {
+      // Keep the current detail mounted; the action status already communicates
+      // the draft request result, and a manual Refresh remains available.
+      return undefined;
+    }
+  }, [telegram, token]);
+
+  const waitForGeneratedDraft = useCallback(
+    async (knownEventIds: Set<string>, requestStartedAt: number): Promise<BusinessHistoryEvent | undefined> => {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+        const nextHistory = await refreshDetailInPlace();
+        const generated = nextHistory?.find((event) => {
+          if (event.type !== "draft_generated") {
+            return false;
+          }
+          if (event.event_id) {
+            return !knownEventIds.has(event.event_id);
+          }
+          return (event.created_at ?? 0) >= requestStartedAt - 5;
+        });
+        if (generated) {
+          return generated;
+        }
+        setActionStatus({
+          kind: "loading",
+          message: "Draft request queued. Waiting for the generated draft to appear below...",
+        });
+      }
+      return undefined;
+    },
+    [refreshDetailInPlace],
+  );
+
   const handleModeChange = useCallback(
     async (mode: BusinessChatMode) => {
       if (telegram.status !== "ready") {
@@ -106,13 +157,31 @@ export function ChatDetailShell({ token }: { token: string }) {
     }
     setActionStatus({ kind: "loading", message: "Queueing draft generation..." });
     try {
-      const response = await generateBusinessDraft(token, telegram.initData);
-      setActionStatus({ kind: "success", message: `Draft ${response.draft.status}. Approval remains required.` });
-      await loadDetail();
+      const prompt = draftPrompt.trim();
+      const knownEventIds = new Set(history.map((event) => event.event_id).filter((id): id is string => Boolean(id)));
+      const requestStartedAt = Date.now() / 1000;
+      const response = await generateBusinessDraft(token, telegram.initData, prompt);
+      const promptSuffix = prompt ? " Prompt sent with the request." : "";
+      setActionStatus({
+        kind: "loading",
+        message: `Draft ${response.draft.status}. Waiting for the generated draft to appear below...${promptSuffix}`,
+      });
+      const generated = await waitForGeneratedDraft(knownEventIds, requestStartedAt);
+      if (generated) {
+        setActionStatus({
+          kind: "success",
+          message: `Draft generated and added to history below. Approval remains required.${promptSuffix}`,
+        });
+      } else {
+        setActionStatus({
+          kind: "success",
+          message: `Draft ${response.draft.status}. It is still generating; keep this chat open or tap Refresh in a moment.${promptSuffix}`,
+        });
+      }
     } catch (error) {
       setActionStatus({ kind: "error", message: messageForError(error) });
     }
-  }, [loadDetail, telegram, token]);
+  }, [draftPrompt, history, telegram, token, waitForGeneratedDraft]);
 
   return (
     <ChatDetailView
@@ -124,6 +193,8 @@ export function ChatDetailShell({ token }: { token: string }) {
       onBack={() => router.push("/")}
       onRefresh={loadDetail}
       onModeChange={handleModeChange}
+      draftPrompt={draftPrompt}
+      onDraftPromptChange={setDraftPrompt}
       onGenerateDraft={handleGenerateDraft}
     />
   );

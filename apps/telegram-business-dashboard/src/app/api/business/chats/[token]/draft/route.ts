@@ -37,7 +37,7 @@ export async function POST(request: NextRequest, { params }: ChatTokenContext) {
       {
         method: "POST",
         actorUserId: session.telegramUserId,
-        body: postBodyWithoutInitData(body, ["source"]),
+        body: postBodyWithoutInitData(body, ["source", "prompt"]),
       },
     ),
   );

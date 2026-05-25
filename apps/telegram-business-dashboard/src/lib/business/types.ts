@@ -56,6 +56,7 @@ export type BusinessDraftResponse = {
     chatToken: string;
     source: "latest";
     sentToCustomer: false;
+    prompt?: string;
   };
 };
 

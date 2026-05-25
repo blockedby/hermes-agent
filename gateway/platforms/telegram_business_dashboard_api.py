@@ -113,7 +113,12 @@ class BusinessDashboardAPI:
 
         if len(path_parts) == 5 and path_parts[:3] == ["api", "business", "chats"] and path_parts[4] == "draft" and method == "POST":
             payload = _coerce_body(body)
-            return self.request_draft(path_parts[3], source=payload.get("source", "latest"), actor_user_id=actor_user_id)
+            return self.request_draft(
+                path_parts[3],
+                source=payload.get("source", "latest"),
+                prompt=payload.get("prompt"),
+                actor_user_id=actor_user_id,
+            )
 
         if path_parts == ["api", "business", "approvals"] and method == "GET":
             return self.list_approvals(chat_token=(query or {}).get("chatToken"))
@@ -215,15 +220,33 @@ class BusinessDashboardAPI:
             body["modeChange"] = mode_change
         return APIResponse(200, body)
 
-    def request_draft(self, token: str, *, source: Any = "latest", actor_user_id: Optional[str] = None) -> APIResponse:
+    def request_draft(
+        self,
+        token: str,
+        *,
+        source: Any = "latest",
+        prompt: Any = None,
+        actor_user_id: Optional[str] = None,
+    ) -> APIResponse:
         if str(source or "latest") != "latest":
             return _error(400, "invalid_source", "Only latest-message draft requests are supported.")
+        prompt_text = str(prompt or "").strip()
         key, entry = self.chat_registry.find_by_token(token)
         if key is None or entry is None:
             return _error(404, "chat_not_found", "Business chat not found.")
         event = _message_event_from_entry(entry)
         if event is None:
             return _error(409, "missing_latest_message", "Business chat has no latest customer message to draft from.")
+
+        if prompt_text:
+            metadata = dict(getattr(event, "metadata", None) or {})
+            metadata["business_dashboard_prompt"] = prompt_text
+            event.metadata = metadata
+            event.channel_context = (
+                f"Dashboard draft request prompt/topic: {prompt_text}"
+                if not event.channel_context
+                else f"{event.channel_context}\nDashboard draft request prompt/topic: {prompt_text}"
+            )
 
         if self.enqueue_latest_message is None:
             return _error(503, "not_connected", "Dashboard API is not embedded with the Telegram enqueue callback.")
@@ -253,6 +276,7 @@ class BusinessDashboardAPI:
                 "message_id": entry.get("last_message_id"),
                 "actor_user_id": actor_user_id,
                 "created_at": now_ts,
+                "prompt": prompt_text or None,
             },
         )
         return APIResponse(
@@ -263,6 +287,7 @@ class BusinessDashboardAPI:
                     "chatToken": str(entry.get("token") or token),
                     "source": "latest",
                     "sentToCustomer": False,
+                    "prompt": prompt_text or None,
                 }
             },
         )

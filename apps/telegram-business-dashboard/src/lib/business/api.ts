@@ -82,10 +82,15 @@ export function updateBusinessChatMode(
   });
 }
 
-export function generateBusinessDraft(token: string, initData: string): Promise<BusinessDraftResponse> {
+export function generateBusinessDraft(
+  token: string,
+  initData: string,
+  prompt?: string,
+): Promise<BusinessDraftResponse> {
+  const normalizedPrompt = prompt?.trim() ?? "";
   return businessFetch<BusinessDraftResponse>(`/api/business/chats/${encodeURIComponent(token)}/draft`, {
     method: "POST",
     initData,
-    body: { source: "latest" },
+    body: normalizedPrompt ? { source: "latest", prompt: normalizedPrompt } : { source: "latest" },
   });
 }
