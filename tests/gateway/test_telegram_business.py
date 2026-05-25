@@ -95,6 +95,58 @@ def _allow_business_reply(adapter: TelegramAdapter, connection_id: str = "bc-1")
     adapter._business_can_reply[connection_id] = True
 
 
+def _gateway_runner_for_metadata() -> GatewayRunner:
+    return object.__new__(GatewayRunner)
+
+
+def test_business_thread_metadata_does_not_treat_connection_marker_as_dm_topic():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="business:bc-1",
+    )
+
+    metadata = _gateway_runner_for_metadata()._thread_metadata_for_source(source, reply_to_message_id="55")
+
+    assert metadata == {"thread_id": "business:bc-1"}
+
+
+def test_business_thread_metadata_extracts_numeric_direct_topic_marker():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="business:bc-1:topic:338575",
+    )
+
+    metadata = _gateway_runner_for_metadata()._thread_metadata_for_source(source, reply_to_message_id="55")
+
+    assert metadata == {
+        "thread_id": "business:bc-1:topic:338575",
+        "direct_messages_topic_id": "338575",
+    }
+
+
+def test_normal_dm_topic_metadata_still_uses_numeric_direct_topic_fallback():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="338575",
+        message_id="44",
+    )
+
+    metadata = _gateway_runner_for_metadata()._thread_metadata_for_source(source, reply_to_message_id="55")
+
+    assert metadata == {
+        "thread_id": "338575",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "338575",
+        "telegram_reply_to_message_id": "55",
+    }
+
+
 def _approval_entry(**overrides):
     approval_id = str(overrides.pop("approval_id", "approve-1"))
     entry = {
@@ -1073,6 +1125,38 @@ async def test_business_approval_send_uses_business_connection_id():
     call_kwargs = adapter._bot.send_message.call_args.kwargs
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
+    assert call_kwargs["text"] == "Approved text"
+    query.answer.assert_awaited_with(text="Sent")
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_ignores_corrupt_non_numeric_direct_topic_id():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(
+        direct_messages_topic_id="business:bc-1",
+    )
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=None,
+            message_id=101,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    adapter._bot.send_message.assert_called_once()
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 12345
+    assert call_kwargs["business_connection_id"] == "bc-1"
+    assert "direct_messages_topic_id" not in call_kwargs
     assert call_kwargs["text"] == "Approved text"
     query.answer.assert_awaited_with(text="Sent")
 

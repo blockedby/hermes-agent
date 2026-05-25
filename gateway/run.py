@@ -13561,12 +13561,21 @@ class GatewayRunner:
             getattr(source, "platform", None) == Platform.TELEGRAM
             and getattr(source, "chat_type", None) == "dm"
         ):
+            tid = str(thread_id)
+            if tid.startswith("business:"):
+                # Telegram Business sessions use an internal Hermes thread marker,
+                # not a Telegram Direct Messages topic id.  Only propagate the
+                # optional numeric `:topic:<id>` suffix when it is present.
+                match = re.search(r":topic:(\d+)\s*$", tid)
+                if match:
+                    metadata["direct_messages_topic_id"] = match.group(1)
+                return metadata
+
             metadata["telegram_dm_topic_reply_fallback"] = True
             # Telegram DM topic lanes need direct_messages_topic_id in metadata
             # so synthetic/queued messages (goal continuations, status notices)
             # route to the correct topic even when reply anchor is unavailable.
-            tid = str(thread_id)
-            if tid and tid not in {"", "1"}:
+            if tid and tid not in {"", "1"} and re.fullmatch(r"\d+", tid):
                 metadata["direct_messages_topic_id"] = tid
             anchor = reply_to_message_id or getattr(source, "message_id", None)
             if anchor is not None:

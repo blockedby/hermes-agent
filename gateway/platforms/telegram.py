@@ -632,6 +632,15 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
 
+    @staticmethod
+    def _normalize_direct_messages_topic_id(value: Any) -> Optional[str]:
+        if value is None or isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        if not text or not re.fullmatch(r"\d+", text):
+            return None
+        return text
+
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
@@ -641,7 +650,7 @@ class TelegramAdapter(BasePlatformAdapter):
             or metadata.get("direct_message_topic_id")
             or metadata.get("telegram_direct_messages_topic_id")
         )
-        return str(topic_id) if topic_id is not None else None
+        return cls._normalize_direct_messages_topic_id(topic_id)
 
     @staticmethod
     def _direct_messages_topic_id_from_message(message: Message) -> Optional[str]:
@@ -4345,7 +4354,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "text": chunk,
                         **self._link_preview_kwargs(),
                     }
-                    direct_topic_id = entry.get("direct_messages_topic_id")
+                    direct_topic_id = self._normalize_direct_messages_topic_id(entry.get("direct_messages_topic_id"))
                     if direct_topic_id:
                         kwargs["direct_messages_topic_id"] = int(direct_topic_id)
                     msg = await self._bot.send_message(**kwargs)
