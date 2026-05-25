@@ -2,10 +2,18 @@
 
 import { useEffect, useState } from "react";
 
+import {
+  getStoredTelegramLaunchParams,
+  parseTelegramLaunchParamsHash,
+  parseTelegramUserFromInitData,
+  storeTelegramLaunchParams,
+  type TelegramLaunchParams,
+} from "./launch-params";
+
 export type TelegramWebAppState =
   | { status: "loading" }
   | { status: "missing" }
-  | { status: "ready"; initData: string; user?: TelegramWebAppUser };
+  | { status: "ready"; initData: string; user?: TelegramWebAppUser; startParam?: string };
 
 const TELEGRAM_THEME_VARIABLES: Record<string, string> = {
   bg_color: "--background",
@@ -28,6 +36,30 @@ function applyTelegramTheme(webApp: TelegramWebApp) {
   }
 }
 
+function sessionStorageOrUndefined(): Storage | undefined {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function readTelegramLaunchParams(webApp?: TelegramWebApp): TelegramLaunchParams | null {
+  if (webApp?.initData) {
+    return {
+      initData: webApp.initData,
+      startParam: webApp.initDataUnsafe.start_param,
+    };
+  }
+
+  const hashParams = parseTelegramLaunchParamsHash(window.location.hash);
+  if (hashParams?.initData) {
+    return hashParams;
+  }
+
+  return getStoredTelegramLaunchParams(sessionStorageOrUndefined());
+}
+
 export function useTelegramWebApp(): TelegramWebAppState {
   const [state, setState] = useState<TelegramWebAppState>({ status: "loading" });
 
@@ -42,21 +74,27 @@ export function useTelegramWebApp(): TelegramWebAppState {
       }
 
       const webApp = window.Telegram?.WebApp;
-      if (webApp?.initData) {
+      if (webApp) {
         webApp.ready();
         webApp.expand();
         applyTelegramTheme(webApp);
+      }
+
+      const launchParams = readTelegramLaunchParams(webApp);
+      if (launchParams?.initData) {
+        storeTelegramLaunchParams(sessionStorageOrUndefined(), launchParams);
         setState({
           status: "ready",
-          initData: webApp.initData,
-          user: webApp.initDataUnsafe.user,
+          initData: launchParams.initData,
+          user: webApp?.initDataUnsafe.user ?? parseTelegramUserFromInitData(launchParams.initData),
+          startParam: webApp?.initDataUnsafe.start_param ?? launchParams.startParam,
         });
         return;
       }
 
       attempts += 1;
-      if (attempts < 20) {
-        timer = window.setTimeout(checkTelegram, 50);
+      if (attempts < 100) {
+        timer = window.setTimeout(checkTelegram, 100);
         return;
       }
 
