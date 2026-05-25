@@ -511,6 +511,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._business_voice_history_semaphore = asyncio.Semaphore(
             int(self.config.extra.get("business_voice_history_concurrency", 2) or 2)
         )
+        self._business_dashboard_api_runner = None
+        self._business_dashboard_api_site = None
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -2488,6 +2490,113 @@ class TelegramAdapter(BasePlatformAdapter):
                             self.name, topic_name, seed_err,
                         )
 
+    def _business_dashboard_api_embedded_enabled(self) -> bool:
+        raw = self.config.extra.get("business_dashboard_api_embedded")
+        if raw is None:
+            raw = os.getenv("HERMES_BUSINESS_DASHBOARD_API_EMBEDDED", "")
+        return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _enqueue_business_dashboard_latest_message(
+        self,
+        event: MessageEvent,
+        *,
+        chat_entry: Optional[Dict[str, Any]] = None,
+        actor_user_id: Optional[str] = None,
+        reason: str = "draft_request",
+    ) -> bool:
+        """Queue a dashboard-requested Business latest-message draft in the live gateway.
+
+        The standalone dashboard API process can read registry/history data but
+        cannot reach the in-memory Telegram adapter queue.  When the API is
+        embedded in this adapter, this callback is the safety boundary that
+        turns a dashboard button click into the same internal event path used by
+        Business draft mode; it never sends customer-facing text directly.
+        """
+        try:
+            metadata = dict(getattr(event, "metadata", None) or {})
+            metadata.update(
+                {
+                    "business_dashboard_action": reason,
+                    "business_dashboard_actor_user_id": str(actor_user_id or "") or None,
+                }
+            )
+            event.metadata = metadata
+            self._enqueue_text_event(event)
+            return True
+        except Exception:
+            logger.error("[%s] Failed to enqueue Telegram Business dashboard draft", self.name, exc_info=True)
+            return False
+
+    async def _start_business_dashboard_api(self) -> None:
+        if not self._business_dashboard_api_embedded_enabled():
+            return
+        if self._business_dashboard_api_runner is not None:
+            return
+        try:
+            from aiohttp import web
+            from gateway.platforms.telegram_business_dashboard_api import (
+                BusinessDashboardAPI,
+                DEFAULT_HOST,
+                DEFAULT_PORT,
+                create_app,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Embedded Telegram Business dashboard API unavailable: %s", self.name, exc, exc_info=True)
+            return
+
+        host = str(
+            os.getenv(
+                "HERMES_BUSINESS_DASHBOARD_API_HOST",
+                self.config.extra.get("business_dashboard_api_host", DEFAULT_HOST),
+            )
+            or DEFAULT_HOST
+        )
+        try:
+            port = int(
+                os.getenv(
+                    "HERMES_BUSINESS_DASHBOARD_API_PORT",
+                    str(self.config.extra.get("business_dashboard_api_port", DEFAULT_PORT)),
+                )
+            )
+        except (TypeError, ValueError):
+            port = DEFAULT_PORT
+
+        api = BusinessDashboardAPI(
+            config=self.config.extra,
+            chat_registry=self._business_chat_store(),
+            approval_store=self._business_approval_store,
+            history_store=self._business_history_store,
+            enqueue_latest_message=self._enqueue_business_dashboard_latest_message,
+        )
+        app = create_app(api)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, host=host, port=port)
+            await site.start()
+        except Exception:
+            await runner.cleanup()
+            raise
+        self._business_dashboard_api_runner = runner
+        self._business_dashboard_api_site = site
+        logger.info(
+            "[%s] Embedded Telegram Business Dashboard API listening on http://%s:%d",
+            self.name,
+            host,
+            port,
+        )
+
+    async def _stop_business_dashboard_api(self) -> None:
+        runner = getattr(self, "_business_dashboard_api_runner", None)
+        if runner is None:
+            return
+        self._business_dashboard_api_runner = None
+        self._business_dashboard_api_site = None
+        try:
+            await runner.cleanup()
+        except Exception as exc:
+            logger.warning("[%s] Error stopping embedded Telegram Business dashboard API: %s", self.name, exc, exc_info=True)
+
     async def connect(self) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -2769,6 +2878,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
             
+            try:
+                await self._start_business_dashboard_api()
+            except Exception as dashboard_err:
+                logger.error(
+                    "[%s] Failed to start embedded Telegram Business dashboard API: %s",
+                    self.name,
+                    dashboard_err,
+                    exc_info=True,
+                )
+
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
@@ -2795,6 +2914,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        await self._stop_business_dashboard_api()
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
