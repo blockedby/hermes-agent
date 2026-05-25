@@ -1,0 +1,103 @@
+{
+  "baseUrl": "http://127.0.0.1:3107",
+  "results": [
+    {
+      "viewport": {
+        "name": "390x844-mobile",
+        "width": 390,
+        "height": 844
+      },
+      "screenshotPath": "docs/plans/2026-05-25-telegram-business-bot-dashboard/artifacts/screenshots/browser-smoke/2026-05-25T191123Z/390x844-mobile-unauthorized.png",
+      "elapsedMs": 2473,
+      "hasOpenFromTelegram": true,
+      "hasLaunchText": true,
+      "metrics": {
+        "title": "Hermes Business Dashboard",
+        "url": "http://127.0.0.1:3107/",
+        "innerWidth": 390,
+        "scrollWidth": 390,
+        "clientWidth": 390,
+        "horizontalOverflow": false,
+        "offenders": []
+      },
+      "consoleMessages": [
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_set_header_color {color_key: bg_color}"
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_set_bottom_bar_color {color: #ffffff}"
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_theme "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_viewport "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_safe_area "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_content_safe_area "
+        }
+      ],
+      "requestFailures": [],
+      "errorResponses": [],
+      "bodyExcerpt": "Telegram Business\nBusiness\n\nOwner dashboard for replies, drafts, and modes.\n\nRefresh\nALL\n0\nWATCH\n0\nDRAFT\n0\nAUTO\n0\nIGNORED\n0\nPENDING DRAFTS\n0\nFAILED DRAFTS\n0\nSearch chats\nAll\n0\nWatch\n0\nDraft\n0\nAuto\n0\nIgnored\n0\nOpen from Telegram\nLaunch this dashboard from the Telegram bot with an allowed owner account.\n\nGenerate draft now queues approval-safe drafts; it does not send directly to customers."
+    },
+    {
+      "viewport": {
+        "name": "1280x800-desktop",
+        "width": 1280,
+        "height": 800
+      },
+      "screenshotPath": "docs/plans/2026-05-25-telegram-business-bot-dashboard/artifacts/screenshots/browser-smoke/2026-05-25T191123Z/1280x800-desktop-unauthorized.png",
+      "elapsedMs": 2262,
+      "hasOpenFromTelegram": true,
+      "hasLaunchText": true,
+      "metrics": {
+        "title": "Hermes Business Dashboard",
+        "url": "http://127.0.0.1:3107/",
+        "innerWidth": 1280,
+        "scrollWidth": 1280,
+        "clientWidth": 1280,
+        "horizontalOverflow": false,
+        "offenders": []
+      },
+      "consoleMessages": [
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_set_header_color {color_key: bg_color}"
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_set_bottom_bar_color {color: #ffffff}"
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_theme "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_viewport "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_safe_area "
+        },
+        {
+          "type": "log",
+          "text": "[Telegram.WebView] > postEvent web_app_request_content_safe_area "
+        }
+      ],
+      "requestFailures": [],
+      "errorResponses": [],
+      "bodyExcerpt": "Telegram Business\nBusiness\n\nOwner dashboard for replies, drafts, and modes.\n\nRefresh\nALL\n0\nWATCH\n0\nDRAFT\n0\nAUTO\n0\nIGNORED\n0\nPENDING DRAFTS\n0\nFAILED DRAFTS\n0\nSearch chats\nAll\n0\nWatch\n0\nDraft\n0\nAuto\n0\nIgnored\n0\nOpen from Telegram\nLaunch this dashboard from the Telegram bot with an allowed owner account.\n\nGenerate draft now queues approval-safe drafts; it does not send directly to customers."
+    }
+  ]
+}
