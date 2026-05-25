@@ -8,3 +8,4 @@
 - 2026-05-25: Full focused gateway Business/API run found one duplicate mode-history failure on repeated callback; adjusted adapter to only record `mode_changed` when the mode actually changes.
 - 2026-05-25: Full focused check passed after duplicate-mode fix: `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business.py -- -q --tb=short` → 77 passed.
 - 2026-05-25: Quality checks passed: `venv/bin/python -m py_compile gateway/platforms/telegram_business_history.py gateway/platforms/telegram_business_dashboard_api.py gateway/platforms/telegram.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business.py`; `git diff --check`.
+- 2026-05-25: Implementation committed as `f3be21ea1b4a541edcd29ecd08b2d4bea8263ba8 feat: record telegram business dashboard history`. Wrote final report at `reports/task-6-history.md`.
