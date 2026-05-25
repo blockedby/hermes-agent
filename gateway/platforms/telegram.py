@@ -107,6 +107,7 @@ from gateway.platforms.telegram_business_chats import (
     TelegramBusinessChatRegistry,
     user_looks_like_bot,
 )
+from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -503,6 +504,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._business_pending_rule_tokens: Dict[str, Dict[str, Any]] = {}
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
+        self._business_history_store = TelegramBusinessHistoryStore()
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -792,6 +794,33 @@ class TelegramAdapter(BasePlatformAdapter):
             self._business_chat_registry = store
         return store
 
+    def _business_history_store_obj(self) -> TelegramBusinessHistoryStore:
+        store = getattr(self, "_business_history_store", None)
+        if store is None:
+            store = TelegramBusinessHistoryStore()
+            self._business_history_store = store
+        return store
+
+    def _business_history_key_from_entry(self, entry: Dict[str, Any]) -> Optional[str]:
+        try:
+            return TelegramBusinessHistoryStore.key(
+                entry.get("business_connection_id"),
+                entry.get("customer_chat_id", entry.get("chat_id")),
+                entry.get("direct_messages_topic_id"),
+            )
+        except ValueError:
+            return None
+
+    def _record_business_history_event(self, entry: Dict[str, Any], event: Dict[str, Any]) -> None:
+        """Best-effort append for dashboard history; never block gateway flow."""
+        key = self._business_history_key_from_entry(entry)
+        if not key:
+            return
+        try:
+            self._business_history_store_obj().append_event(key, event)
+        except Exception:
+            logger.debug("[%s] Failed to append Telegram Business history event", self.name, exc_info=True)
+
     def _business_record_from_message(
         self,
         message: Message,
@@ -814,7 +843,7 @@ class TelegramAdapter(BasePlatformAdapter):
             display_name=str(display_name or ""),
             is_bot=getattr(user, "is_bot", False),
         )
-        return self._business_chat_store().upsert_from_message(
+        entry, is_new = self._business_chat_store().upsert_from_message(
             business_connection_id=business_connection_id,
             customer_chat_id=chat_id,
             direct_messages_topic_id=topic_id,
@@ -826,6 +855,16 @@ class TelegramAdapter(BasePlatformAdapter):
             user_name=str(getattr(user, "full_name", "") or getattr(user, "first_name", "") or display_name or ""),
             is_bot=is_bot,
         )
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "inbound",
+                "preview": getattr(message, "text", "") or "",
+                "message_id": getattr(message, "message_id", None),
+                "created_at": time.time(),
+            },
+        )
+        return entry, is_new
 
     def _business_event_from_chat_entry(self, entry: Dict[str, Any]) -> Optional[MessageEvent]:
         text = str(entry.get("last_message_text") or "")
@@ -875,8 +914,18 @@ class TelegramAdapter(BasePlatformAdapter):
             last_mode_action_fingerprint=fingerprint,
             last_mode_action_at=time.time(),
         )
+        now_ts = time.time()
         if updated:
             entry.update(updated)
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "draft_requested",
+                "mode": normalized,
+                "message_id": message_id,
+                "created_at": now_ts,
+            },
+        )
         self._enqueue_text_event(event)
         return True
 
@@ -971,6 +1020,18 @@ class TelegramAdapter(BasePlatformAdapter):
         title = "Telegram Business watch"
         if matches:
             title = "Telegram Business watch rule matched"
+            for rule in matches[:3]:
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "rule_matched",
+                        "rule_id": rule.get("id"),
+                        "rule_label": rule.get("label") or rule.get("condition"),
+                        "preview": getattr(message, "text", "") or "",
+                        "message_id": getattr(message, "message_id", None),
+                        "created_at": time.time(),
+                    },
+                )
         return await self._send_business_owner_card(
             entry,
             title=title,
@@ -1050,6 +1111,20 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = str(getattr(msg, "message_id", "") or "")
             if message_id:
                 sent.append(message_id)
+        history_entry = {
+            "business_connection_id": str(business_connection_id),
+            "customer_chat_id": str(chat_id),
+            "direct_messages_topic_id": self._metadata_direct_messages_topic_id(metadata),
+        }
+        self._record_business_history_event(
+            history_entry,
+            {
+                "type": "outbound_sent",
+                "preview": content,
+                "message_ids": sent,
+                "created_at": time.time(),
+            },
+        )
         return SendResult(success=True, message_id=sent[0] if sent else None, raw_response={"message_ids": sent})
 
     def _save_business_approval_state(self) -> bool:
@@ -2634,6 +2709,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
                 chat_id,
             )
+            self._record_business_history_event(
+                {
+                    "business_connection_id": business_connection_id,
+                    "customer_chat_id": chat_id,
+                    "direct_messages_topic_id": self._metadata_direct_messages_topic_id(metadata),
+                },
+                {
+                    "type": "approval_failed",
+                    "status": "missing_owner_chat",
+                    "preview": content,
+                    "created_at": time.time(),
+                },
+            )
             return SendResult(
                 success=True,
                 raw_response={"business_approval": "missing_owner_chat"},
@@ -2663,6 +2751,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=True, raw_response={"business_notice_error": str(exc)})
 
         if not await self._ensure_business_reply_allowed(business_connection_id):
+            self._record_business_history_event(
+                {
+                    "business_connection_id": business_connection_id,
+                    "customer_chat_id": chat_id,
+                    "direct_messages_topic_id": self._metadata_direct_messages_topic_id(metadata),
+                },
+                {
+                    "type": "approval_failed",
+                    "status": "business_reply_permission_disabled",
+                    "preview": content,
+                    "created_at": time.time(),
+                },
+            )
             return await _send_owner_notice(
                 "💼 Telegram Business reply suppressed\n\n"
                 f"Customer chat: {chat_id}\n"
@@ -2700,6 +2801,16 @@ class TelegramAdapter(BasePlatformAdapter):
         }
         self._business_approval_state[approval_id] = approval_entry
         self._save_business_approval_state()
+        self._record_business_history_event(
+            approval_entry,
+            {
+                "type": "draft_generated",
+                "approval_id": approval_id,
+                "message_id": inbound_message_id,
+                "preview": content,
+                "created_at": created_at,
+            },
+        )
 
         prompt = self._business_approval_prompt_text(
             chat_id=chat_id,
@@ -2733,6 +2844,16 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = str(getattr(msg, "message_id", "") or "")
             approval_entry["approval_message_id"] = message_id or None
             self._save_business_approval_state()
+            self._record_business_history_event(
+                approval_entry,
+                {
+                    "type": "approval_created",
+                    "approval_id": approval_id,
+                    "message_id": inbound_message_id,
+                    "preview": content,
+                    "created_at": time.time(),
+                },
+            )
             return SendResult(
                 success=True,
                 message_id=message_id,
@@ -2747,6 +2868,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             self._business_approval_state.pop(approval_id, None)
             self._save_business_approval_state()
+            self._record_business_history_event(
+                approval_entry,
+                {
+                    "type": "approval_failed",
+                    "approval_id": approval_id,
+                    "message_id": inbound_message_id,
+                    "status": "owner_prompt_failed",
+                    "preview": content,
+                    "created_at": time.time(),
+                },
+            )
             logger.error("[%s] Failed to send Telegram Business approval prompt: %s", self.name, exc, exc_info=True)
             # Treat as delivered from the base pipeline's perspective so it
             # never falls back to sending the business draft directly.
@@ -4144,10 +4276,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             if len(parts) == 4 and parts[1] == "m":
                 _prefix, _action, token, mode = parts
+                _prior_key, prior_entry = self._business_chat_store().find_by_token(token)
+                prior_mode = TelegramBusinessChatRegistry.normalize_mode((prior_entry or {}).get("mode"))
                 entry = self._business_chat_store().set_mode_by_token(token, mode)
                 if not entry:
                     await query.answer(text="Business chat not found.")
                     return
+                current_mode = TelegramBusinessChatRegistry.normalize_mode(entry.get("mode"))
+                if prior_mode != current_mode:
+                    self._record_business_history_event(
+                        entry,
+                        {
+                            "type": "mode_changed",
+                            "mode": entry.get("mode"),
+                            "actor_user_id": caller_id,
+                            "created_at": time.time(),
+                        },
+                    )
                 self._maybe_enqueue_business_mode_event(entry, mode)
                 await query.answer(text=f"Mode: {self._business_mode_label(str(entry.get('mode')))}")
                 try:
@@ -4164,6 +4309,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not entry:
                     await query.answer(text="Business chat not found.")
                     return
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "draft_requested",
+                        "source": "draft_once",
+                        "actor_user_id": caller_id,
+                        "created_at": time.time(),
+                    },
+                )
                 await query.answer(text="Draft once armed for the next customer message.")
                 try:
                     await query.edit_message_text(
@@ -4255,6 +4409,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 entry["status"] = "expired"
                 entry["resolved_at"] = time.time()
                 self._save_business_approval_state()
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "approval_failed",
+                        "approval_id": approval_id,
+                        "status": "expired",
+                        "preview": entry.get("draft"),
+                        "created_at": entry["resolved_at"],
+                    },
+                )
                 await query.answer(text="This business draft has expired.")
                 try:
                     await query.edit_message_text(
@@ -4286,6 +4450,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     owner_user_id=caller_id,
                 ):
                     entry["audit_cancelled_written"] = True
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "approval_cancelled",
+                        "approval_id": approval_id,
+                        "actor_user_id": caller_id,
+                        "preview": entry.get("draft"),
+                        "created_at": entry["resolved_at"],
+                    },
+                )
                 self._business_approval_state.pop(approval_id, None)
                 self._save_business_approval_state()
                 await query.answer(text="Cancelled")
@@ -4334,6 +4508,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     entry["status"] = "failed_retryable"
                     entry["last_error"] = "business_reply_permission_disabled"
                     self._save_business_approval_state()
+                    self._record_business_history_event(
+                        entry,
+                        {
+                            "type": "approval_failed",
+                            "approval_id": approval_id,
+                            "status": "business_reply_permission_disabled",
+                            "actor_user_id": caller_id,
+                            "preview": entry.get("draft"),
+                            "created_at": time.time(),
+                        },
+                    )
                     await query.answer(text="Cannot reply: Business permission is disabled.")
                     try:
                         await query.edit_message_text(
@@ -4375,6 +4560,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         sent_message_ids=sent_ids,
                     ):
                         entry["audit_sent_written"] = True
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "approval_sent",
+                        "approval_id": approval_id,
+                        "actor_user_id": caller_id,
+                        "message_ids": sent_ids,
+                        "preview": draft,
+                        "created_at": entry["resolved_at"],
+                    },
+                )
                 self._business_approval_state.pop(approval_id, None)
                 self._save_business_approval_state()
                 await query.answer(text="Sent")
@@ -4395,6 +4591,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     entry["sent_message_ids"] = sent_ids
                     entry["sent_by_user_id"] = caller_id
                     self._save_business_approval_state()
+                    self._record_business_history_event(
+                        entry,
+                        {
+                            "type": "approval_partial",
+                            "approval_id": approval_id,
+                            "actor_user_id": caller_id,
+                            "message_ids": sent_ids,
+                            "status": "partial_manual_review",
+                            "preview": entry.get("draft"),
+                            "created_at": entry["resolved_at"],
+                        },
+                    )
                     await query.answer(text="Partial send; manual review required.")
                     try:
                         await query.edit_message_text(
@@ -4412,6 +4620,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Restore retryable state only when no customer chunk was delivered.
                 entry["status"] = "failed_retryable"
                 self._save_business_approval_state()
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "approval_failed",
+                        "approval_id": approval_id,
+                        "actor_user_id": caller_id,
+                        "status": "failed_retryable",
+                        "preview": entry.get("draft"),
+                        "created_at": time.time(),
+                    },
+                )
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -6415,6 +6634,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     elif mode in {"draft", "auto"}:
                         event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
                         event.text = self._clean_bot_trigger_text(event.text)
+                        self._record_business_history_event(
+                            entry,
+                            {
+                                "type": "draft_requested",
+                                "mode": mode,
+                                "message_id": getattr(message, "message_id", None),
+                                "created_at": time.time(),
+                            },
+                        )
                         self._enqueue_text_event(event)
                     else:
                         await self._send_business_watch_notification(entry, message)

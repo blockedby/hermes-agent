@@ -10,10 +10,8 @@ import pytest
 
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
-from gateway.platforms.telegram_business_dashboard_api import (
-    BusinessDashboardAPI,
-    TelegramBusinessHistoryStore,
-)
+from gateway.platforms.telegram_business_dashboard_api import BusinessDashboardAPI
+from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
 
 
 API_TOKEN = "test-dashboard-token"
@@ -145,6 +143,47 @@ def test_chats_list_is_filterable_sorted_and_hides_internal_ids(registry, approv
     assert "direct_messages_topic_id" not in chat
 
 
+def test_history_store_normalizes_prunes_truncates_and_paginates(tmp_path: Path):
+    store = TelegramBusinessHistoryStore(tmp_path / "business_history.json", max_events_per_chat=3)
+    long_preview = "<b>Hello</b>\n" + ("x" * 700) + "\x00hidden"
+
+    for index in range(5):
+        store.append_event(
+            "bc-1|123|",
+            {
+                "type": "inbound" if index != 4 else "unexpected custom type",
+                "created_at": 100 + index,
+                "preview": long_preview if index == 4 else f"event {index}",
+                "message_id": index,
+                "actor_user_id": "owner" if index == 4 else None,
+            },
+        )
+
+    loaded = TelegramBusinessHistoryStore(tmp_path / "business_history.json", max_events_per_chat=3)
+    first_page, next_cursor = loaded.list_events_page("bc-1|123|", limit=2)
+    second_page, final_cursor = loaded.list_events_page("bc-1|123|", limit=2, cursor=next_cursor)
+
+    assert (loaded.path.stat().st_mode & 0o777) == 0o600
+    assert [event["created_at"] for event in loaded.list_events("bc-1|123|")] == [104.0, 103.0, 102.0]
+    assert first_page[0]["type"] == "event"
+    assert first_page[0]["preview"].startswith("<b>Hello</b> x")
+    assert "\x00" not in first_page[0]["preview"]
+    assert len(first_page[0]["preview"]) <= 500
+    assert next_cursor == "2"
+    assert [event["created_at"] for event in second_page] == [102.0]
+    assert final_cursor is None
+
+
+def test_history_store_corrupt_file_falls_back_safely(tmp_path: Path):
+    path = tmp_path / "business_history.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    store = TelegramBusinessHistoryStore(path)
+
+    assert store.load() == {}
+    assert store.list_events("bc-1|123|") == []
+
+
 def test_chat_detail_joins_approval_and_history_summary(registry, approvals, history):
     entry = _add_chat(registry, connection="bc-1", chat_id="123", text="please reply", mode="watch")
     approvals.save(
@@ -205,6 +244,31 @@ def test_invalid_mode_and_unknown_chat_return_safe_errors(registry, approvals, h
     assert invalid_mode.body["error"]["code"] == "invalid_mode"
     assert unknown.status == 404
     assert unknown.body["error"]["code"] == "chat_not_found"
+
+
+def test_history_endpoint_returns_bounded_pages_with_cursor(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+    for index in range(4):
+        history.append_event("bc-1|123|", {"type": "inbound", "created_at": 10 + index, "preview": f"event {index}"})
+
+    resp = _api(registry, approvals, history).handle_request(
+        "GET",
+        f"/api/business/chats/{entry['token']}/history",
+        headers=_auth(),
+        query={"limit": "2"},
+    )
+    next_resp = _api(registry, approvals, history).handle_request(
+        "GET",
+        f"/api/business/chats/{entry['token']}/history",
+        headers=_auth(),
+        query={"limit": "2", "cursor": resp.body["nextCursor"]},
+    )
+
+    assert resp.status == 200
+    assert [event["preview"] for event in resp.body["history"]] == ["event 3", "event 2"]
+    assert resp.body["nextCursor"] == "2"
+    assert [event["preview"] for event in next_resp.body["history"]] == ["event 1", "event 0"]
+    assert next_resp.body["nextCursor"] is None
 
 
 def test_draft_request_enqueues_latest_message_without_sending_customer_text(registry, approvals, history):

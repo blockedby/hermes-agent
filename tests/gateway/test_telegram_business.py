@@ -15,6 +15,7 @@ from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome,
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
+from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
 from gateway.run import GatewayRunner
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -45,6 +46,9 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._business_ignored_chat_ids = set()
     adapter._business_chat_registry = TelegramBusinessChatRegistry(
         Path(tempfile.mkdtemp(prefix="telegram-business-chats-")) / "business_chats.json"
+    )
+    adapter._business_history_store = TelegramBusinessHistoryStore(
+        Path(tempfile.mkdtemp(prefix="telegram-business-history-")) / "business_history.json"
     )
     adapter._business_pending_rule_tokens = {}
     adapter._pending_text_batches = {}
@@ -290,6 +294,9 @@ async def test_business_mode_callback_immediately_enqueues_latest_message_for_dr
     await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
 
     adapter._enqueue_text_event.assert_called_once()
+    history_events = adapter._business_history_store.list_events("bc-1|12345|")
+    assert [event["type"] for event in history_events[:2]] == ["draft_requested", "mode_changed"]
+    assert history_events[0]["mode"] == "draft"
     event = adapter._enqueue_text_event.call_args.args[0]
     assert event.text == "Потише пж"
     assert event.raw_message is None
@@ -383,6 +390,36 @@ async def test_business_unknown_chat_sends_owner_mode_card_before_agent():
     assert kwargs["chat_id"] == 999
     assert "New Telegram Business chat" in kwargs["text"]
     assert kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_business_update_records_inbound_and_rule_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-watch",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    adapter._business_chat_registry.add_rule_by_token(entry["token"], "vpn плохо", label="vpn")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=889,
+        business_connection=None,
+        business_message=_business_message(text="vpn плохо работает", connection_id="bc-watch"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    events = adapter._business_history_store.list_events("bc-watch|12345|")
+    assert [event["type"] for event in events[:2]] == ["rule_matched", "inbound"]
+    assert events[0]["rule_id"]
+    assert events[1]["message_id"] == "55"
+    assert events[1]["preview"] == "vpn плохо работает"
 
 
 @pytest.mark.asyncio

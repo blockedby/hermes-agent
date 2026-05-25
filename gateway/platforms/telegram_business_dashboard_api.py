@@ -15,10 +15,8 @@ import hmac
 import json
 import logging
 import os
-import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
 try:  # Optional runtime dependency used only by create_app/run_server.
@@ -33,16 +31,13 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import BUSINESS_CHAT_MODES, TelegramBusinessChatRegistry
+from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
 from gateway.session import SessionSource
-from hermes_constants import get_hermes_home
-from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-MAX_HISTORY_EVENTS_PER_CHAT = 50
-MAX_HISTORY_PREVIEW_CHARS = 500
 _DASHBOARD_TOKEN_ENV = "HERMES_DASHBOARD_API_TOKEN"
 
 _PENDING_APPROVAL_STATUSES = {"pending", "sending"}
@@ -56,100 +51,6 @@ class APIResponse:
     body: Dict[str, Any]
     headers: Dict[str, str] | None = None
 
-
-class TelegramBusinessHistoryStore:
-    """Private, bounded JSON history placeholder for dashboard reads/actions."""
-
-    def __init__(self, path: Optional[Path] = None, *, max_events_per_chat: int = MAX_HISTORY_EVENTS_PER_CHAT) -> None:
-        self.path = path or (
-            Path(get_hermes_home())
-            / "gateway"
-            / "platforms"
-            / "telegram"
-            / "business_history.json"
-        )
-        self.max_events_per_chat = max(1, int(max_events_per_chat))
-
-    def load(self) -> Dict[str, list[Dict[str, Any]]]:
-        if not self.path.exists():
-            return {}
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.error("Failed to load Telegram Business history store %s: %s", self.path, exc)
-            return {}
-        events = raw.get("events") if isinstance(raw, dict) else None
-        if not isinstance(events, dict):
-            logger.error("Invalid Telegram Business history store shape in %s", self.path)
-            return {}
-        normalized: Dict[str, list[Dict[str, Any]]] = {}
-        for key, items in events.items():
-            if not isinstance(items, list):
-                continue
-            kept = [self._normalize_event(item) for item in items if isinstance(item, dict)]
-            kept = [item for item in kept if item]
-            normalized[str(key)] = kept[-self.max_events_per_chat :]
-        return normalized
-
-    def save(self, events: Dict[str, list[Dict[str, Any]]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
-        payload = {"version": 1, "updated_at": time.time(), "events": events}
-        fd, tmp_path = tempfile.mkstemp(dir=str(self.path.parent), prefix=".business_history_", suffix=".tmp")
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            atomic_replace(tmp_path, self.path)
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
-    def append_event(self, chat_key: str, event: Dict[str, Any]) -> Dict[str, Any]:
-        normalized = self._normalize_event(event)
-        if not normalized:
-            normalized = {"type": "event", "created_at": time.time(), "preview": ""}
-        events = self.load()
-        bucket = list(events.get(str(chat_key), []))
-        bucket.append(normalized)
-        events[str(chat_key)] = bucket[-self.max_events_per_chat :]
-        self.save(events)
-        return normalized
-
-    def list_events(self, chat_key: str, *, limit: int = MAX_HISTORY_EVENTS_PER_CHAT) -> list[Dict[str, Any]]:
-        items = self.load().get(str(chat_key), [])
-        bounded = max(1, min(int(limit or self.max_events_per_chat), self.max_events_per_chat))
-        return list(items[-bounded:])
-
-    @staticmethod
-    def _normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
-        event_type = str(event.get("type") or "event").strip()[:80]
-        if not event_type:
-            return {}
-        created_at = _coerce_float(event.get("created_at")) or time.time()
-        preview = TelegramBusinessChatRegistry.preview(str(event.get("preview") or ""), MAX_HISTORY_PREVIEW_CHARS)
-        normalized = {
-            "type": event_type,
-            "created_at": created_at,
-            "preview": preview,
-        }
-        for key in ("event_id", "message_id", "approval_id", "mode", "actor_user_id"):
-            value = event.get(key)
-            if value not in (None, ""):
-                normalized[key] = str(value)[:200]
-        return normalized
 
 
 class BusinessDashboardAPI:
@@ -198,7 +99,8 @@ class BusinessDashboardAPI:
             return self.get_chat(path_parts[3])
 
         if len(path_parts) == 5 and path_parts[:3] == ["api", "business", "chats"] and path_parts[4] == "history" and method == "GET":
-            return self.get_history(path_parts[3])
+            params = query or {}
+            return self.get_history(path_parts[3], limit=params.get("limit"), cursor=params.get("cursor"))
 
         if len(path_parts) == 5 and path_parts[:3] == ["api", "business", "chats"] and path_parts[4] == "mode" and method == "POST":
             payload = _coerce_body(body)
@@ -240,11 +142,20 @@ class BusinessDashboardAPI:
             return _error(404, "chat_not_found", "Business chat not found.")
         return APIResponse(200, {"chat": self._chat_detail_view_model(key, entry), "history": self.history_store.list_events(key)})
 
-    def get_history(self, token: str) -> APIResponse:
+    def get_history(self, token: str, *, limit: Any = None, cursor: Any = None) -> APIResponse:
         key, entry = self.chat_registry.find_by_token(token)
         if key is None or entry is None:
             return _error(404, "chat_not_found", "Business chat not found.")
-        return APIResponse(200, {"chatToken": str(entry.get("token") or token), "history": self.history_store.list_events(key)})
+        page, next_cursor = self.history_store.list_events_page(key, limit=_coerce_int(limit, default=50), cursor=cursor)
+        return APIResponse(
+            200,
+            {
+                "chatToken": str(entry.get("token") or token),
+                "history": page,
+                "nextCursor": next_cursor,
+                "count": len(page),
+            },
+        )
 
     def list_approvals(self, *, chat_token: Any = None) -> APIResponse:
         approvals = self.approval_store.load()
@@ -529,6 +440,13 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_int(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _can_reply_view(value: Any) -> str:
