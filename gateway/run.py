@@ -7801,9 +7801,15 @@ class GatewayRunner:
                     )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
+                message_text, _transcription_records = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    return_records=True,
+                )
+                self._record_business_voice_transcriptions(
+                    source=source,
+                    event=event,
+                    records=_transcription_records,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -14453,11 +14459,39 @@ class GatewayRunner:
             return prefix
         return user_text
 
+    def _record_business_voice_transcriptions(
+        self,
+        *,
+        source: SessionSource,
+        event: MessageEvent,
+        records: List[Dict[str, Any]],
+    ) -> None:
+        """Best-effort write-back of Telegram Business STT results."""
+        if not records or source.platform != Platform.TELEGRAM:
+            return
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not thread_id.startswith("business:"):
+            return
+        adapter = self.adapters.get(source.platform)
+        recorder = getattr(adapter, "_record_business_voice_transcription", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                source=source,
+                message_id=getattr(event, "message_id", None) or getattr(source, "message_id", None),
+                records=records,
+            )
+        except Exception:
+            logger.debug("Failed to persist Telegram Business voice transcription", exc_info=True)
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> str:
+        *,
+        return_records: bool = False,
+    ) -> str | tuple[str, List[Dict[str, Any]]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
@@ -14469,11 +14503,13 @@ class GatewayRunner:
         Returns:
             The enriched message string with transcriptions prepended.
         """
+        records: List[Dict[str, Any]] = []
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
                 duration_str = await _probe_audio_duration(abs_path)
+                records.append({"path": path, "success": False, "error": "STT is disabled", "status": "disabled"})
                 if duration_str:
                     notes.append(
                         f"[The user sent a voice message: {abs_path} (duration: {duration_str})]"
@@ -14481,14 +14517,16 @@ class GatewayRunner:
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text
+                return (user_text, records) if return_records else user_text
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
-            if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
+                enriched = prefix
+            elif user_text:
+                enriched = f"{prefix}\n\n{user_text}"
+            else:
+                enriched = prefix
+            return (enriched, records) if return_records else enriched
 
         from tools.transcription_tools import transcribe_audio
 
@@ -14499,12 +14537,24 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    records.append({
+                        "path": path,
+                        "success": True,
+                        "transcript": transcript,
+                        "provider": result.get("provider"),
+                    })
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
                     )
                 else:
                     error = result.get("error", "unknown error")
+                    records.append({
+                        "path": path,
+                        "success": False,
+                        "error": error,
+                        "provider": result.get("provider"),
+                    })
                     if (
                         "No STT provider" in error
                         or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
@@ -14530,6 +14580,7 @@ class GatewayRunner:
                         )
             except Exception as e:
                 logger.error("Transcription error: %s", e)
+                records.append({"path": path, "success": False, "error": str(e)})
                 enriched_parts.append(
                     "[The user sent a voice message but something went wrong "
                     "when I tried to listen to it~ Let them know!]"
@@ -14541,11 +14592,13 @@ class GatewayRunner:
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
-            if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                enriched = prefix
+            elif user_text:
+                enriched = f"{prefix}\n\n{user_text}"
+            else:
+                enriched = prefix
+            return (enriched, records) if return_records else enriched
+        return (user_text, records) if return_records else user_text
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.

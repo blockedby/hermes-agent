@@ -6,7 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -66,6 +66,14 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._forum_lock = __import__("asyncio").Lock()
     adapter._forum_command_registered = set()
     adapter._clarify_state = {}
+    adapter._max_doc_bytes = 20 * 1024 * 1024
+    adapter._media_batch_delay_seconds = 0
+    adapter._pending_photo_batches = {}
+    adapter._pending_photo_batch_tasks = {}
+    adapter._media_group_events = {}
+    adapter._media_group_tasks = {}
+    adapter._business_voice_history_tasks = set()
+    adapter._business_voice_history_semaphore = __import__("asyncio").Semaphore(2)
     return adapter
 
 
@@ -93,6 +101,58 @@ def _business_message(
     msg.chat.id = chat_id
     msg.from_user.id = from_user_id
     msg.business_connection_id = connection_id
+    return msg
+
+
+def _make_file_obj(data: bytes, file_path: str):
+    return SimpleNamespace(
+        file_path=file_path,
+        download_as_bytearray=AsyncMock(return_value=bytearray(data)),
+    )
+
+
+def _make_photo(data: bytes = b"photo-bytes", file_path: str = "photos/photo.jpg"):
+    return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
+
+
+def _make_voice(data: bytes = b"voice-bytes", file_path: str = "voice/file.ogg"):
+    return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
+
+
+def _make_document(
+    *,
+    data: bytes = b"image-bytes",
+    file_path: str = "documents/screenshot.png",
+    file_name: str = "screenshot.png",
+    mime_type: str = "image/png",
+    file_size: int = 100,
+):
+    return SimpleNamespace(
+        file_name=file_name,
+        mime_type=mime_type,
+        file_size=file_size,
+        get_file=AsyncMock(return_value=_make_file_obj(data, file_path)),
+    )
+
+
+def _business_media_message(
+    *,
+    text: str = "",
+    caption: str | None = None,
+    connection_id: str = "bc-1",
+    photo=None,
+    voice=None,
+    document=None,
+):
+    msg = _business_message(text=text, connection_id=connection_id)
+    msg.caption = caption
+    msg.photo = photo
+    msg.voice = voice
+    msg.document = document
+    msg.audio = None
+    msg.video = None
+    msg.sticker = None
+    msg.media_group_id = None
     return msg
 
 
@@ -450,6 +510,262 @@ async def test_business_watch_chat_notifies_owner_without_agent():
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert "Telegram Business watch" in kwargs["text"]
     assert "business_connection_id" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_business_draft_photo_caption_enqueues_media_event_and_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-photo",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        caption="please review this",
+        connection_id="bc-photo",
+        photo=[_make_photo()],
+    )
+    update = SimpleNamespace(
+        update_id=890,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_image_from_bytes", return_value="/tmp/business-photo.jpg"):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.message_type == MessageType.PHOTO
+    assert event.text == "please review this"
+    assert event.media_urls == ["/tmp/business-photo.jpg"]
+    assert event.media_types == ["image/jpg"]
+    assert event.source.thread_id == "business:bc-photo"
+    history = adapter._business_history_store.list_events("bc-photo|12345|")
+    assert any(item["type"] == "media_received" and item["media_type"] == "photo" for item in history)
+
+
+@pytest.mark.asyncio
+async def test_business_draft_image_document_enqueues_photo_event():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-doc-img",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        connection_id="bc-doc-img",
+        document=_make_document(),
+    )
+    update = SimpleNamespace(
+        update_id=891,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_image_from_bytes", return_value="/tmp/business-doc.png"):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.message_type == MessageType.PHOTO
+    assert event.media_urls == ["/tmp/business-doc.png"]
+    assert event.media_types == ["image/png"]
+
+
+@pytest.mark.asyncio
+async def test_business_draft_voice_enqueues_media_event_and_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-voice",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        connection_id="bc-voice",
+        voice=_make_voice(),
+    )
+    update = SimpleNamespace(
+        update_id=892,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/business-voice.ogg"):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.message_type == MessageType.VOICE
+    assert event.media_urls == ["/tmp/business-voice.ogg"]
+    assert event.media_types == ["audio/ogg"]
+    history = adapter._business_history_store.list_events("bc-voice|12345|")
+    assert any(item["type"] == "media_received" and item["media_type"] == "voice" for item in history)
+    assert any(item["type"] == "inbound" and item["preview"] == "[voice]" for item in history)
+
+
+@pytest.mark.asyncio
+async def test_business_watch_voice_records_media_and_transcription_without_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-watch-voice",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        connection_id="bc-watch-voice",
+        voice=_make_voice(),
+    )
+    update = SimpleNamespace(
+        update_id=894,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/watch-voice.ogg"), patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "watch voice text", "provider": "whisper"},
+    ):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+        tasks = list(getattr(adapter, "_business_voice_history_tasks", set()))
+        if tasks:
+            await __import__("asyncio").gather(*tasks)
+
+    adapter._enqueue_text_event.assert_not_called()
+    history = adapter._business_history_store.list_events("bc-watch-voice|12345|")
+    assert any(item["type"] == "media_received" and item["media_urls"] == ["/tmp/watch-voice.ogg"] for item in history)
+    assert any(
+        item["type"] == "voice_transcribed" and item["transcript"] == "watch voice text"
+        for item in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_business_new_draft_voice_records_background_transcription_without_agent_enqueue():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_chat_registry = TelegramBusinessChatRegistry(
+        Path(tempfile.mkdtemp(prefix="telegram-business-chats-draft-")) / "business_chats.json",
+        default_mode="draft",
+    )
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        connection_id="bc-new-draft-voice",
+        voice=_make_voice(),
+    )
+    update = SimpleNamespace(
+        update_id=895,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/new-draft-voice.ogg"), patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "new draft voice text", "provider": "whisper"},
+    ):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+        tasks = list(getattr(adapter, "_business_voice_history_tasks", set()))
+        if tasks:
+            await __import__("asyncio").gather(*tasks)
+
+    adapter._enqueue_text_event.assert_not_called()
+    assert adapter._bot.send_message.await_count == 1
+    history = adapter._business_history_store.list_events("bc-new-draft-voice|12345|")
+    assert any(item["type"] == "media_received" and item["media_urls"] == ["/tmp/new-draft-voice.ogg"] for item in history)
+    assert any(
+        item["type"] == "voice_transcribed" and item["transcript"] == "new draft voice text"
+        for item in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_business_empty_non_media_message_is_ignored():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(text="", caption="", connection_id="bc-empty")
+    update = SimpleNamespace(
+        update_id=893,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    assert adapter._bot.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_business_voice_history_tasks():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._app = None
+    adapter._release_platform_lock = MagicMock()
+    adapter._mark_disconnected = MagicMock()
+    task = __import__("asyncio").create_task(__import__("asyncio").sleep(60))
+    adapter._business_voice_history_tasks.add(task)
+
+    await adapter.disconnect()
+
+    assert task.cancelled()
+    assert adapter._business_voice_history_tasks == set()
+    adapter._mark_disconnected.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_business_voice_transcription_recorder_persists_structured_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="business:bc-voice:topic:338575",
+    )
+
+    adapter._record_business_voice_transcription(
+        source=source,
+        message_id="55",
+        records=[{
+            "path": "/tmp/business-voice.ogg",
+            "success": True,
+            "transcript": "hello from customer",
+            "provider": "whisper",
+        }],
+    )
+
+    history = adapter._business_history_store.list_events("bc-voice|12345|338575")
+    assert history[0]["type"] == "voice_transcribed"
+    assert history[0]["message_id"] == "55"
+    assert history[0]["transcript"] == "hello from customer"
+    assert history[0]["transcription_status"] == "success"
+    assert history[0]["transcription_provider"] == "whisper"
+    assert history[0]["media_urls"] == ["/tmp/business-voice.ogg"]
 
 
 @pytest.mark.asyncio

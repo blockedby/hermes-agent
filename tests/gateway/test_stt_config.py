@@ -100,6 +100,64 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
 
 
 @pytest.mark.asyncio
+async def test_prepare_inbound_message_text_persists_business_voice_transcription():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    captured = {}
+
+    class FakeTelegramAdapter:
+        def _record_business_voice_transcription(self, **kwargs):
+            captured.update(kwargs)
+
+    runner.adapters = {Platform.TELEGRAM: FakeTelegramAdapter()}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        thread_id="business:bc-1",
+        message_id="55",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="55",
+        media_urls=["/tmp/business-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "business voice transcript",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert "business voice transcript" in result
+    assert captured["source"] is source
+    assert captured["message_id"] == "55"
+    assert captured["records"] == [{
+        "path": "/tmp/business-voice.ogg",
+        "success": True,
+        "transcript": "business voice transcript",
+        "provider": "local_command",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     from gateway.run import GatewayRunner
 

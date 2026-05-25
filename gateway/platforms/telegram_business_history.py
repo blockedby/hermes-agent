@@ -32,6 +32,8 @@ BUSINESS_HISTORY_EVENT_TYPES = {
     "outbound_sent",
     "mode_changed",
     "rule_matched",
+    "media_received",
+    "voice_transcribed",
     "event",
 }
 
@@ -54,9 +56,17 @@ _STRING_FIELDS = (
     "rule_label",
     "status",
     "source",
+    "media_type",
+    "transcription_status",
+    "transcription_provider",
 )
 
-_LIST_STRING_FIELDS = {"message_ids"}
+_TEXT_FIELDS = {
+    "transcript": 4000,
+    "error": 1000,
+}
+
+_LIST_STRING_FIELDS = {"message_ids", "media_urls", "media_types"}
 
 
 class TelegramBusinessHistoryStore:
@@ -205,10 +215,14 @@ class TelegramBusinessHistoryStore:
             value = event.get(key)
             if value not in (None, ""):
                 normalized[key] = str(value)[:200]
+        for key, limit in _TEXT_FIELDS.items():
+            value = event.get(key)
+            if value not in (None, ""):
+                normalized[key] = cls.preview(str(value), limit)
         for key in _LIST_STRING_FIELDS:
             value = event.get(key)
             if isinstance(value, (list, tuple)):
-                normalized[key] = [str(item)[:200] for item in value if item not in (None, "")][:20]
+                normalized[key] = [str(item)[:500] for item in value if item not in (None, "")][:20]
         normalized.setdefault("event_id", cls._event_id(normalized))
         return normalized
 

@@ -2,6 +2,13 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Runtime Location
+
+Hermes is not currently running on this local computer. The live Hermes instance
+for this setup runs on `EverydayWiteVPS`. Do not assume local processes, local
+gateway status, or local logs reflect the production/live Telegram Business
+runtime unless explicitly synchronized from that VPS.
+
 ## Development Environment
 
 ```bash

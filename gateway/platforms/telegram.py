@@ -507,6 +507,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
         self._business_history_store = TelegramBusinessHistoryStore()
+        self._business_voice_history_tasks: set[asyncio.Task] = set()
+        self._business_voice_history_semaphore = asyncio.Semaphore(
+            int(self.config.extra.get("business_voice_history_concurrency", 2) or 2)
+        )
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -830,6 +834,241 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Failed to append Telegram Business history event", self.name, exc_info=True)
 
+    @staticmethod
+    def _telegram_message_has_media(message: Message) -> bool:
+        return any(
+            bool(getattr(message, attr, None))
+            for attr in ("photo", "document", "voice", "audio", "video", "sticker")
+        )
+
+    @staticmethod
+    def _telegram_media_preview(message: Message) -> str:
+        if getattr(message, "photo", None):
+            return "[photo]"
+        if getattr(message, "voice", None):
+            return "[voice]"
+        if getattr(message, "audio", None):
+            return "[audio]"
+        if getattr(message, "video", None):
+            return "[video]"
+        if getattr(message, "sticker", None):
+            return "[sticker]"
+        document = getattr(message, "document", None)
+        if document:
+            filename = getattr(document, "file_name", None)
+            return f"[document: {filename}]" if filename else "[document]"
+        return ""
+
+    def _business_message_preview(self, message: Message) -> str:
+        return (
+            str(getattr(message, "text", None) or "").strip()
+            or str(getattr(message, "caption", None) or "").strip()
+            or self._telegram_media_preview(message)
+        )
+
+    @staticmethod
+    def _business_message_rule_text(message: Message) -> str:
+        return (
+            str(getattr(message, "text", None) or "").strip()
+            or str(getattr(message, "caption", None) or "").strip()
+        )
+
+    def _record_business_media_history_event(self, entry: Dict[str, Any], event: MessageEvent) -> None:
+        """Persist safe structured metadata for inbound Business media."""
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        media_types = list(getattr(event, "media_types", None) or [])
+        media_type = getattr(getattr(event, "message_type", None), "value", None) or str(getattr(event, "message_type", "") or "")
+        if not media_urls and media_type not in {"photo", "voice", "audio", "video", "document", "sticker"}:
+            return
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "media_received",
+                "preview": getattr(event, "text", None) or f"[{media_type or 'media'}]",
+                "message_id": getattr(event, "message_id", None),
+                "media_type": media_type,
+                "media_urls": media_urls,
+                "media_types": media_types,
+                "created_at": time.time(),
+            },
+        )
+
+    def _schedule_business_voice_history_from_message(
+        self,
+        entry: Dict[str, Any],
+        message: Message,
+        update_id: Optional[int],
+    ) -> None:
+        """Schedule watch/new-chat Business voice media+STT persistence without delaying notifications."""
+        tasks = getattr(self, "_business_voice_history_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._business_voice_history_tasks = tasks
+        task = asyncio.create_task(
+            self._record_business_voice_history_from_message(dict(entry), message, update_id)
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _schedule_business_voice_transcription_from_event(
+        self,
+        entry: Dict[str, Any],
+        event: MessageEvent,
+    ) -> None:
+        if getattr(event, "message_type", None) != MessageType.VOICE:
+            return
+        tasks = getattr(self, "_business_voice_history_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._business_voice_history_tasks = tasks
+        task = asyncio.create_task(
+            self._record_business_voice_transcription_from_prepared_event(dict(entry), event)
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _record_business_voice_transcription_from_prepared_event(
+        self,
+        entry: Dict[str, Any],
+        event: MessageEvent,
+    ) -> None:
+        try:
+            semaphore = getattr(self, "_business_voice_history_semaphore", None)
+            if semaphore is None:
+                await self._record_business_voice_transcription_from_event(entry, event)
+                return
+            async with semaphore:
+                await self._record_business_voice_transcription_from_event(entry, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[%s] Failed to persist Telegram Business prepared voice transcription", self.name, exc_info=True)
+
+    async def _record_business_voice_history_from_message(
+        self,
+        entry: Dict[str, Any],
+        message: Message,
+        update_id: Optional[int],
+    ) -> None:
+        try:
+            semaphore = getattr(self, "_business_voice_history_semaphore", None)
+            if semaphore is None:
+                event = await self._prepare_telegram_media_event(
+                    message,
+                    update_id=update_id,
+                    allow_photo_batching=False,
+                )
+                if event is None:
+                    return
+                self._record_business_media_history_event(entry, event)
+                await self._record_business_voice_transcription_from_event(entry, event)
+                return
+            async with semaphore:
+                event = await self._prepare_telegram_media_event(
+                    message,
+                    update_id=update_id,
+                    allow_photo_batching=False,
+                )
+                if event is None:
+                    return
+                self._record_business_media_history_event(entry, event)
+                await self._record_business_voice_transcription_from_event(entry, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[%s] Failed to persist Telegram Business voice history", self.name, exc_info=True)
+
+    async def _record_business_voice_transcription_from_event(
+        self,
+        entry: Dict[str, Any],
+        event: MessageEvent,
+    ) -> None:
+        """Best-effort STT persistence for Business voice that does not enter the agent path."""
+        if getattr(event, "message_type", None) != MessageType.VOICE:
+            return
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        if not media_urls:
+            return
+        try:
+            from tools.transcription_tools import transcribe_audio
+        except Exception as exc:
+            self._record_business_history_event(
+                entry,
+                {
+                    "type": "voice_transcribed",
+                    "preview": str(exc),
+                    "message_id": getattr(event, "message_id", None),
+                    "media_type": "voice",
+                    "transcription_status": "failed",
+                    "error": str(exc),
+                    "created_at": time.time(),
+                },
+            )
+            return
+        records: list[Dict[str, Any]] = []
+        for path in media_urls:
+            try:
+                result = await asyncio.to_thread(transcribe_audio, path)
+                if result.get("success"):
+                    records.append({
+                        "path": path,
+                        "success": True,
+                        "transcript": result.get("transcript", ""),
+                        "provider": result.get("provider"),
+                    })
+                else:
+                    records.append({
+                        "path": path,
+                        "success": False,
+                        "error": result.get("error", "unknown error"),
+                        "provider": result.get("provider"),
+                    })
+            except Exception as exc:
+                records.append({"path": path, "success": False, "error": str(exc)})
+        self._record_business_voice_transcription(
+            source=event.source,
+            message_id=getattr(event, "message_id", None),
+            records=records,
+        )
+
+    def _record_business_voice_transcription(
+        self,
+        *,
+        source: Any,
+        message_id: Optional[str],
+        records: list[Dict[str, Any]],
+    ) -> None:
+        """Persist structured STT results for a Telegram Business voice turn."""
+        thread_id = getattr(source, "thread_id", None)
+        business_connection_id = self._business_connection_id_from_thread(thread_id)
+        chat_id = getattr(source, "chat_id", None)
+        if not business_connection_id or not chat_id:
+            return
+        entry = {
+            "business_connection_id": business_connection_id,
+            "customer_chat_id": str(chat_id),
+            "direct_messages_topic_id": self._business_direct_topic_id_from_thread(thread_id),
+        }
+        for record in records or []:
+            status = "success" if record.get("success") else "failed"
+            transcript = str(record.get("transcript") or "").strip()
+            preview = transcript or str(record.get("error") or status)
+            self._record_business_history_event(
+                entry,
+                {
+                    "type": "voice_transcribed",
+                    "preview": preview,
+                    "message_id": message_id,
+                    "media_type": "voice",
+                    "media_urls": [record.get("path")] if record.get("path") else [],
+                    "transcript": transcript,
+                    "transcription_status": status,
+                    "transcription_provider": record.get("provider"),
+                    "error": record.get("error"),
+                    "created_at": time.time(),
+                },
+            )
+
     def _business_record_from_message(
         self,
         message: Message,
@@ -852,11 +1091,12 @@ class TelegramAdapter(BasePlatformAdapter):
             display_name=str(display_name or ""),
             is_bot=getattr(user, "is_bot", False),
         )
+        preview = self._business_message_preview(message)
         entry, is_new = self._business_chat_store().upsert_from_message(
             business_connection_id=business_connection_id,
             customer_chat_id=chat_id,
             direct_messages_topic_id=topic_id,
-            text=getattr(message, "text", "") or "",
+            text=preview,
             message_id=getattr(message, "message_id", None),
             display_name=str(display_name or ""),
             username=str(username or ""),
@@ -868,8 +1108,9 @@ class TelegramAdapter(BasePlatformAdapter):
             entry,
             {
                 "type": "inbound",
-                "preview": getattr(message, "text", "") or "",
+                "preview": preview,
                 "message_id": getattr(message, "message_id", None),
+                "media_type": self._telegram_media_preview(message).strip("[]") if self._telegram_message_has_media(message) else None,
                 "created_at": time.time(),
             },
         )
@@ -1025,7 +1266,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, raw_response={"business_mode_notice_error": str(exc)})
 
     async def _send_business_watch_notification(self, entry: Dict[str, Any], message: Message) -> SendResult:
-        matches = self._business_chat_store().matching_rules(entry, getattr(message, "text", "") or "")
+        rule_text = self._business_message_rule_text(message)
+        preview = self._business_message_preview(message)
+        matches = self._business_chat_store().matching_rules(entry, rule_text)
         title = "Telegram Business watch"
         if matches:
             title = "Telegram Business watch rule matched"
@@ -1036,7 +1279,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "type": "rule_matched",
                         "rule_id": rule.get("id"),
                         "rule_label": rule.get("label") or rule.get("condition"),
-                        "preview": getattr(message, "text", "") or "",
+                        "preview": preview,
                         "message_id": getattr(message, "message_id", None),
                         "created_at": time.time(),
                     },
@@ -2559,6 +2802,14 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.gather(*pending_media_group_tasks, return_exceptions=True)
         self._media_group_tasks.clear()
         self._media_group_events.clear()
+
+        pending_voice_history_tasks = list(getattr(self, "_business_voice_history_tasks", set()) or [])
+        for task in pending_voice_history_tasks:
+            task.cancel()
+        if pending_voice_history_tasks:
+            await asyncio.gather(*pending_voice_history_tasks, return_exceptions=True)
+        if hasattr(self, "_business_voice_history_tasks"):
+            self._business_voice_history_tasks.clear()
 
         if self._app:
             try:
@@ -6638,46 +6889,67 @@ class TelegramAdapter(BasePlatformAdapter):
                         self.name,
                         connection_id,
                     )
-                elif not getattr(message, "text", None):
-                    logger.info("[%s] Ignoring non-text Telegram Business message for connection %s", self.name, connection_id)
-                elif str(message.text).lstrip().startswith("/"):
-                    logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                 else:
-                    self._business_can_reply.setdefault(connection_id, None)
-                    entry, is_new_chat = self._business_record_from_message(message, connection_id)
-                    mode = str(entry.get("mode") or "watch")
-                    if entry.pop("draft_once", False):
-                        self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
-                        mode = "draft"
-                    if is_new_chat and mode != "ignored":
-                        await self._send_business_owner_card(
-                            entry,
-                            title="New Telegram Business chat",
-                            watch_actions=False,
-                        )
-                    elif mode == "ignored":
-                        logger.info(
-                            "[%s] Ignoring Telegram Business message from chat %s due to per-chat mode",
-                            self.name,
-                            self._telegram_message_chat_id(message),
-                        )
-                    elif mode == "watch":
-                        await self._send_business_watch_notification(entry, message)
-                    elif mode in {"draft", "auto"}:
-                        event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
-                        event.text = self._clean_bot_trigger_text(event.text)
-                        self._record_business_history_event(
-                            entry,
-                            {
-                                "type": "draft_requested",
-                                "mode": mode,
-                                "message_id": getattr(message, "message_id", None),
-                                "created_at": time.time(),
-                            },
-                        )
-                        self._enqueue_text_event(event)
+                    message_text = str(getattr(message, "text", None) or "").strip()
+                    message_caption = str(getattr(message, "caption", None) or "").strip()
+                    has_media = self._telegram_message_has_media(message)
+                    if not message_text and not message_caption and not has_media:
+                        logger.info("[%s] Ignoring empty Telegram Business message for connection %s", self.name, connection_id)
+                    elif message_text.lstrip().startswith("/"):
+                        logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                     else:
-                        await self._send_business_watch_notification(entry, message)
+                        self._business_can_reply.setdefault(connection_id, None)
+                        entry, is_new_chat = self._business_record_from_message(message, connection_id)
+                        mode = str(entry.get("mode") or "watch")
+                        if entry.pop("draft_once", False):
+                            self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
+                            mode = "draft"
+                        media_event = None
+                        if has_media and mode in {"draft", "auto"}:
+                            media_event = await self._prepare_telegram_media_event(
+                                message,
+                                update_id=update.update_id,
+                                allow_photo_batching=False,
+                            )
+                            if media_event is not None:
+                                self._record_business_media_history_event(entry, media_event)
+                        elif has_media and mode != "ignored" and getattr(message, "voice", None):
+                            self._schedule_business_voice_history_from_message(entry, message, update.update_id)
+                        if is_new_chat and mode != "ignored":
+                            if media_event is not None:
+                                self._schedule_business_voice_transcription_from_event(entry, media_event)
+                            await self._send_business_owner_card(
+                                entry,
+                                title="New Telegram Business chat",
+                                watch_actions=False,
+                            )
+                        elif mode == "ignored":
+                            logger.info(
+                                "[%s] Ignoring Telegram Business message from chat %s due to per-chat mode",
+                                self.name,
+                                self._telegram_message_chat_id(message),
+                            )
+                        elif mode == "watch":
+                            await self._send_business_watch_notification(entry, message)
+                        elif mode in {"draft", "auto"}:
+                            if media_event is not None:
+                                event = media_event
+                            else:
+                                event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
+                                event.text = self._clean_bot_trigger_text(event.text)
+                            self._record_business_history_event(
+                                entry,
+                                {
+                                    "type": "draft_requested",
+                                    "mode": mode,
+                                    "message_id": getattr(message, "message_id", None),
+                                    "created_at": time.time(),
+                                },
+                            )
+                            if event is not None:
+                                self._enqueue_text_event(event)
+                        else:
+                            await self._send_business_watch_notification(entry, message)
 
         if getattr(update, "edited_business_message", None) is not None:
             handled = True
@@ -6942,8 +7214,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(_m, _observe_type, update_id=update.update_id)
             return
 
-        msg = update.message
-        
+        event = await self._prepare_telegram_media_event(
+            update.message,
+            update_id=update.update_id,
+            allow_photo_batching=True,
+        )
+        if event is not None:
+            await self.handle_message(event)
+
+    async def _prepare_telegram_media_event(
+        self,
+        msg: Message,
+        *,
+        update_id: Optional[int] = None,
+        allow_photo_batching: bool = True,
+    ) -> Optional[MessageEvent]:
+        """Build and cache a Telegram media ``MessageEvent``.
+
+        Normal Telegram media updates and Telegram Business updates share the
+        same download/cache rules.  When ``allow_photo_batching`` is true,
+        photo/image-document events may be queued internally and ``None`` is
+        returned to indicate that dispatch is already scheduled.  Business
+        callers pass ``False`` so they can enqueue through their mode-aware
+        path after media has been cached.
+        """
         # Determine media type
         if msg.sticker:
             msg_type = MessageType.STICKER
@@ -6959,19 +7253,18 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         else:
             msg_type = MessageType.DOCUMENT
-        
-        event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        
+
+        event = self._build_message_event(msg, msg_type, update_id=update_id)
+
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
-        
+
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
-            await self.handle_message(event)
-            return
+            return event
 
         # Apply observe attribution after caption is set; sticker is handled above
         # because _handle_sticker overwrites event.text with its vision description.
@@ -6998,13 +7291,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
-                media_group_id = getattr(msg, "media_group_id", None)
-                if media_group_id:
-                    await self._queue_media_group_event(str(media_group_id), event)
-                else:
-                    batch_key = self._photo_batch_key(event, msg)
-                    self._enqueue_photo_event(batch_key, event)
-                return
+                if allow_photo_batching:
+                    media_group_id = getattr(msg, "media_group_id", None)
+                    if media_group_id:
+                        await self._queue_media_group_event(str(media_group_id), event)
+                    else:
+                        batch_key = self._photo_batch_key(event, msg)
+                        self._enqueue_photo_event(batch_key, event)
+                    return None
+                return event
 
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
@@ -7079,8 +7374,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
-                    await self.handle_message(event)
-                    return
+                    return event
 
                 # Telegram may deliver screenshots/photos as documents. If the
                 # payload is actually an image, route it through the image cache
@@ -7097,21 +7391,22 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
-                        await self.handle_message(event)
-                        return
+                        return event
 
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
-                    media_group_id = getattr(msg, "media_group_id", None)
-                    if media_group_id:
-                        await self._queue_media_group_event(str(media_group_id), event)
-                    else:
-                        batch_key = self._photo_batch_key(event, msg)
-                        self._enqueue_photo_event(batch_key, event)
-                    return
+                    if allow_photo_batching:
+                        media_group_id = getattr(msg, "media_group_id", None)
+                        if media_group_id:
+                            await self._queue_media_group_event(str(media_group_id), event)
+                        else:
+                            batch_key = self._photo_batch_key(event, msg)
+                            self._enqueue_photo_event(batch_key, event)
+                        return None
+                    return event
 
                 if not ext and doc.mime_type:
                     video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
@@ -7133,8 +7428,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
-                    return
+                    return event
 
                 # NOTE: image-document handling is performed earlier in this
                 # function (ext in _TELEGRAM_IMAGE_EXTENSIONS or image/* mime),
@@ -7150,8 +7444,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    await self.handle_message(event)
-                    return
+                    return event
 
                 # Download and cache
                 file_obj = await doc.get_file()
@@ -7185,11 +7478,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
 
         media_group_id = getattr(msg, "media_group_id", None)
-        if media_group_id:
+        if allow_photo_batching and media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
-            return
+            return None
 
-        await self.handle_message(event)
+        return event
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
