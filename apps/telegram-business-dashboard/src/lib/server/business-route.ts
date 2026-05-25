@@ -58,7 +58,16 @@ export function isNextResponse(value: unknown): value is NextResponse {
 }
 
 function upstreamErrorCode(body: Record<string, unknown> | null): string {
-  return typeof body?.error === "string" ? body.error : "dashboard_error";
+  if (typeof body?.error === "string") {
+    return body.error;
+  }
+  if (body?.error && typeof body.error === "object" && !Array.isArray(body.error)) {
+    const nestedError = body.error as Record<string, unknown>;
+    if (typeof nestedError.code === "string") {
+      return nestedError.code;
+    }
+  }
+  return "dashboard_error";
 }
 
 function publicClientError(code: string): string {

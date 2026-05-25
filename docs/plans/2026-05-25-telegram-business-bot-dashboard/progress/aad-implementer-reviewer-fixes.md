@@ -1,0 +1,7 @@
+# Progress — reviewer fixes
+
+- 2026-05-25: Started required final reviewer fixes. Read AGENTS/task package/reviewer scope and inspected backend API, Next BFF route tests, Telegram callback behavior, docs, and root `progress.md` artifact. Existing untracked files are task-package browser artifacts plus root progress artifact from prior smoke.
+- 2026-05-25: Plan: add failing backend tests for required `X-Telegram-User-Id`, no false queued/no callback, draft callback, and mode draft/auto enqueue status; add failing BFF tests for nested Python error shape; then implement minimal API/BFF/docs changes and move root progress artifact into task package.
+- 2026-05-25: RED tests added. Focused backend failed as expected: missing user header not enforced, no `modeChange`, standalone draft falsely 202 queued, callback signature lacked reason. Focused BFF failed as expected: nested Python `{error:{code,message}}` mapped to `dashboard_error` instead of `invalid_mode`.
+- 2026-05-25: GREEN implementation added: Python API requires actor header, returns `503/not_connected` for standalone draft, calls injected latest-message callback for draft/mode, records explicit mode enqueue status; BFF parses nested error codes; docs updated; root `progress.md` moved to task package progress. Focused backend file and BFF route tests pass.
+- 2026-05-25: Broader focused checks passed: backend dashboard+telegram tests (83 passed), dashboard Vitest suite (30 passed), compileall, `git diff --check`, frontend lint/typecheck/build. Preparing implementation commit.

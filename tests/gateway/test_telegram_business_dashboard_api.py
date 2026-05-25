@@ -86,6 +86,20 @@ def test_auth_rejects_missing_and_unknown_token(registry, approvals, history):
     assert wrong.body["error"]["code"] == "invalid_bearer_token"
 
 
+def test_auth_requires_valid_telegram_user_header(registry, approvals, history):
+    api = _api(registry, approvals, history)
+    bearer_only = {"Authorization": f"Bearer {API_TOKEN}"}
+    malformed = {**bearer_only, "X-Telegram-User-Id": "not-a-user"}
+
+    missing = api.handle_request("GET", "/api/business/chats", headers=bearer_only)
+    invalid = api.handle_request("POST", "/api/business/chats/token/mode", headers=malformed, body={"mode": "watch"})
+
+    assert missing.status == 400
+    assert missing.body["error"]["code"] == "missing_telegram_user_id"
+    assert invalid.status == 400
+    assert invalid.body["error"]["code"] == "invalid_telegram_user_id"
+
+
 def test_chats_list_is_filterable_sorted_and_hides_internal_ids(registry, approvals, history):
     older = _add_chat(
         registry,
@@ -213,8 +227,57 @@ def test_chat_detail_joins_approval_and_history_summary(registry, approvals, his
     assert "customer_chat_id" not in resp.body["chat"]
 
 
-def test_mode_change_updates_registry_and_records_actor_metadata(registry, approvals, history):
-    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+def test_mode_change_to_watch_updates_registry_and_records_actor_metadata(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="draft")
+
+    resp = _api(registry, approvals, history).handle_request(
+        "POST",
+        f"/api/business/chats/{entry['token']}/mode",
+        headers=_auth(),
+        body={"mode": "watch"},
+    )
+
+    assert resp.status == 200
+    assert resp.body["chat"]["mode"] == "watch"
+    assert "modeChange" not in resp.body
+    stored = registry.find_by_token(entry["token"])[1]
+    assert stored["mode"] == "watch"
+    assert stored["last_dashboard_actor_user_id"] == "4242"
+    assert history.list_events("bc-1|123|")[0]["type"] == "mode_changed"
+
+
+def test_mode_change_to_draft_invokes_latest_message_enqueue_callback(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="Please draft", mode="watch")
+    calls = []
+
+    def enqueue(event, *, chat_entry, actor_user_id, reason):
+        calls.append((event, chat_entry, actor_user_id, reason))
+        return True
+
+    resp = _api(registry, approvals, history, enqueue=enqueue).handle_request(
+        "POST",
+        f"/api/business/chats/{entry['token']}/mode",
+        headers=_auth(),
+        body={"mode": "draft"},
+    )
+
+    assert resp.status == 200
+    assert resp.body["chat"]["mode"] == "draft"
+    assert resp.body["modeChange"] == {"status": "queued", "enqueuedLatestMessage": True}
+    assert len(calls) == 1
+    event, chat_entry, actor_user_id, reason = calls[0]
+    assert event.text == "Please draft"
+    assert chat_entry["token"] == entry["token"]
+    assert actor_user_id == "4242"
+    assert reason == "mode_change"
+    stored = registry.find_by_token(entry["token"])[1]
+    assert stored["last_dashboard_mode_enqueue_status"] == "queued"
+    assert stored["last_mode_action_fingerprint"] == "draft:55"
+    assert history.list_events("bc-1|123|")[0]["type"] == "draft_requested"
+
+
+def test_mode_change_to_auto_without_enqueue_callback_records_no_enqueue_status(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="Please draft", mode="watch")
 
     resp = _api(registry, approvals, history).handle_request(
         "POST",
@@ -225,10 +288,11 @@ def test_mode_change_updates_registry_and_records_actor_metadata(registry, appro
 
     assert resp.status == 200
     assert resp.body["chat"]["mode"] == "auto"
+    assert resp.body["modeChange"] == {"status": "no_enqueue_callback", "enqueuedLatestMessage": False}
     stored = registry.find_by_token(entry["token"])[1]
-    assert stored["mode"] == "auto"
-    assert stored["last_dashboard_actor_user_id"] == "4242"
-    assert history.list_events("bc-1|123|")[0]["type"] == "mode_changed"
+    assert stored["last_dashboard_mode_enqueue_status"] == "no_enqueue_callback"
+    assert stored.get("last_mode_action_fingerprint") is None
+    assert all(event["type"] != "draft_requested" for event in history.list_events("bc-1|123|"))
 
 
 def test_invalid_mode_and_unknown_chat_return_safe_errors(registry, approvals, history):
@@ -271,12 +335,26 @@ def test_history_endpoint_returns_bounded_pages_with_cursor(registry, approvals,
     assert next_resp.body["nextCursor"] is None
 
 
+def test_draft_request_without_enqueue_callback_returns_not_connected(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="Please draft this", mode="watch")
+
+    resp = _api(registry, approvals, history).handle_request(
+        "POST", f"/api/business/chats/{entry['token']}/draft", headers=_auth(), body={"source": "latest"}
+    )
+
+    assert resp.status == 503
+    assert resp.body["error"]["code"] == "not_connected"
+    stored = registry.find_by_token(entry["token"])[1]
+    assert stored.get("last_dashboard_draft_status") != "queued"
+    assert history.list_events("bc-1|123|") == []
+
+
 def test_draft_request_enqueues_latest_message_without_sending_customer_text(registry, approvals, history):
     entry = _add_chat(registry, connection="bc-1", chat_id="123", text="Please draft this", mode="watch")
     calls = []
 
-    def enqueue(event, *, chat_entry, actor_user_id):
-        calls.append((event, chat_entry, actor_user_id))
+    def enqueue(event, *, chat_entry, actor_user_id, reason):
+        calls.append((event, chat_entry, actor_user_id, reason))
         return True
 
     resp = _api(registry, approvals, history, enqueue=enqueue).handle_request(
@@ -288,10 +366,11 @@ def test_draft_request_enqueues_latest_message_without_sending_customer_text(reg
     assert resp.body["draft"]["sentToCustomer"] is False
     assert "Please draft this" not in json.dumps(resp.body, ensure_ascii=False)
     assert len(calls) == 1
-    event, chat_entry, actor_user_id = calls[0]
+    event, chat_entry, actor_user_id, reason = calls[0]
     assert event.text == "Please draft this"
     assert chat_entry["token"] == entry["token"]
     assert actor_user_id == "4242"
+    assert reason == "draft_request"
     stored = registry.find_by_token(entry["token"])[1]
     assert stored["last_dashboard_draft_status"] == "queued"
 

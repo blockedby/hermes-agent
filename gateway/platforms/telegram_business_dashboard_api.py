@@ -65,12 +65,15 @@ class BusinessDashboardAPI:
         approval_store: Optional[TelegramBusinessApprovalStore] = None,
         history_store: Optional[TelegramBusinessHistoryStore] = None,
         enqueue_draft: Optional[Callable[..., bool]] = None,
+        enqueue_latest_message: Optional[Callable[..., bool]] = None,
     ) -> None:
         self.token = _resolve_token(token=token, config=config)
         self.chat_registry = chat_registry or TelegramBusinessChatRegistry()
         self.approval_store = approval_store or TelegramBusinessApprovalStore()
         self.history_store = history_store or TelegramBusinessHistoryStore()
-        self.enqueue_draft = enqueue_draft
+        # Backward-compatible name for the embedded gateway callback: callers can
+        # inject either enqueue_latest_message or the older enqueue_draft hook.
+        self.enqueue_latest_message = enqueue_latest_message or enqueue_draft
 
     def handle_request(
         self,
@@ -90,7 +93,9 @@ class BusinessDashboardAPI:
         auth = self._authorize(headers or {})
         if auth.status != 200:
             return auth
-        actor_user_id = _get_header(headers or {}, "X-Telegram-User-Id") or None
+        actor_user_id, actor_error = self._actor_user_id(headers or {})
+        if actor_error is not None:
+            return actor_error
 
         if path_parts == ["api", "business", "chats"] and method == "GET":
             return self.list_chats(mode=(query or {}).get("mode"), q=(query or {}).get("q"))
@@ -197,7 +202,18 @@ class BusinessDashboardAPI:
                 "created_at": updates["last_dashboard_mode_at"],
             },
         )
-        return APIResponse(200, {"chat": self._chat_detail_view_model(key, entry)})
+        mode_change = None
+        if normalized in {"draft", "auto"}:
+            mode_change, entry = self._enqueue_latest_message_for_mode(
+                key,
+                entry,
+                mode=normalized,
+                actor_user_id=actor_user_id,
+            )
+        body: Dict[str, Any] = {"chat": self._chat_detail_view_model(key, entry)}
+        if mode_change is not None:
+            body["modeChange"] = mode_change
+        return APIResponse(200, body)
 
     def request_draft(self, token: str, *, source: Any = "latest", actor_user_id: Optional[str] = None) -> APIResponse:
         if str(source or "latest") != "latest":
@@ -209,18 +225,27 @@ class BusinessDashboardAPI:
         if event is None:
             return _error(409, "missing_latest_message", "Business chat has no latest customer message to draft from.")
 
-        queued = False
-        if self.enqueue_draft is not None:
-            queued = bool(self.enqueue_draft(event, chat_entry=dict(entry), actor_user_id=str(actor_user_id or "") or None))
+        if self.enqueue_latest_message is None:
+            return _error(503, "not_connected", "Dashboard API is not embedded with the Telegram enqueue callback.")
+        queued = bool(
+            self.enqueue_latest_message(
+                event,
+                chat_entry=dict(entry),
+                actor_user_id=str(actor_user_id or "") or None,
+                reason="draft_request",
+            )
+        )
         now_ts = time.time()
         fingerprint = f"dashboard:{entry.get('last_message_id')}:{int(now_ts)}"
         updated = self.chat_registry.update_entry_by_token(
             token,
-            last_dashboard_draft_status="queued" if queued or self.enqueue_draft is None else "marked",
+            last_dashboard_draft_status="queued" if queued else "not_queued",
             last_dashboard_draft_requested_at=now_ts,
             last_dashboard_draft_actor_user_id=str(actor_user_id or "") if actor_user_id else None,
             last_dashboard_draft_fingerprint=fingerprint,
         ) or entry
+        if not queued:
+            return _error(503, "not_connected", "Dashboard API did not enqueue the latest Business message.")
         self.history_store.append_event(
             key,
             {
@@ -254,6 +279,71 @@ class BusinessDashboardAPI:
         if not hmac.compare_digest(provided, self.token):
             return _error(403, "invalid_bearer_token", "Bearer token is invalid.")
         return APIResponse(200, {"ok": True})
+
+    def _actor_user_id(self, headers: Mapping[str, Any]) -> tuple[Optional[str], Optional[APIResponse]]:
+        actor_user_id = _get_header(headers, "X-Telegram-User-Id").strip()
+        if not actor_user_id:
+            return None, _error(400, "missing_telegram_user_id", "X-Telegram-User-Id header is required.")
+        if not actor_user_id.isdigit() or int(actor_user_id) <= 0:
+            return None, _error(400, "invalid_telegram_user_id", "X-Telegram-User-Id header is invalid.")
+        return actor_user_id, None
+
+    def _enqueue_latest_message_for_mode(
+        self,
+        key: str,
+        entry: Dict[str, Any],
+        *,
+        mode: str,
+        actor_user_id: Optional[str],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        status = "no_enqueue_callback"
+        queued = False
+        event = _message_event_from_entry(entry)
+        message_id = str(entry.get("last_message_id") or "")
+        fingerprint = f"{mode}:{message_id}" if message_id else ""
+        update_fields: Dict[str, Any] = {
+            "last_dashboard_mode_enqueue_status": status,
+            "last_dashboard_mode_enqueue_at": time.time(),
+        }
+
+        if event is None or not message_id:
+            status = "missing_latest_message"
+        elif str(entry.get("last_mode_action_fingerprint") or "") == fingerprint:
+            status = "already_enqueued"
+        elif self.enqueue_latest_message is None:
+            status = "no_enqueue_callback"
+        else:
+            queued = bool(
+                self.enqueue_latest_message(
+                    event,
+                    chat_entry=dict(entry),
+                    actor_user_id=str(actor_user_id or "") or None,
+                    reason="mode_change",
+                )
+            )
+            status = "queued" if queued else "not_queued"
+
+        update_fields["last_dashboard_mode_enqueue_status"] = status
+        if queued:
+            update_fields.update(
+                {
+                    "last_mode_action_fingerprint": fingerprint,
+                    "last_mode_action_at": update_fields["last_dashboard_mode_enqueue_at"],
+                }
+            )
+        updated = self.chat_registry.update_entry_by_token(str(entry.get("token") or ""), **update_fields) or entry
+        if queued:
+            self.history_store.append_event(
+                key,
+                {
+                    "type": "draft_requested",
+                    "mode": mode,
+                    "message_id": message_id,
+                    "actor_user_id": actor_user_id,
+                    "created_at": update_fields["last_dashboard_mode_enqueue_at"],
+                },
+            )
+        return {"status": status, "enqueuedLatestMessage": queued}, updated
 
     def _approval_counts(self, entry: Dict[str, Any]) -> tuple[int, int]:
         pending = 0
@@ -297,6 +387,7 @@ class BusinessDashboardAPI:
             "hasMessageId": bool(entry.get("last_message_id")),
         }
         view["lastDashboardDraftStatus"] = str(entry.get("last_dashboard_draft_status") or "")
+        view["lastDashboardModeEnqueueStatus"] = str(entry.get("last_dashboard_mode_enqueue_status") or "")
         return view
 
 

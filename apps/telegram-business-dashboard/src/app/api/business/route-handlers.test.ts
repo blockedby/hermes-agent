@@ -280,7 +280,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
   });
 
   it("maps Hermes auth failures to UI-safe BFF errors", async () => {
-    mockFetch(403, { error: "invalid_bearer_token", message: "Bearer token is invalid." });
+    mockFetch(403, { error: { code: "invalid_bearer_token", message: "Bearer token is invalid." } });
 
     const response = await getChats(
       request("http://localhost/api/business/chats", { headers: authHeaders() }),
@@ -288,6 +288,40 @@ describe("Telegram Business dashboard BFF route handlers", () => {
 
     await expect(jsonOf(response)).resolves.toEqual({ ok: false, error: "dashboard_auth_failed" });
     expect(response.status).toBe(502);
+  });
+
+  it("maps nested Python API validation errors to public client errors", async () => {
+    const fetchMock = mockFetch(400, {
+      error: { code: "invalid_mode", message: "Invalid Business chat mode." },
+    });
+
+    const invalidMode = await postMode(
+      request("http://localhost/api/business/chats/chat-token-1/mode", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ mode: "manual-send" }),
+      }),
+      tokenCtx(),
+    );
+    await expect(jsonOf(invalidMode)).resolves.toEqual({ ok: false, error: "invalid_mode" });
+    expect(invalidMode.status).toBe(400);
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: { code: "missing_latest_message", message: "No latest message." } }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const missingLatestMessage = await postDraft(
+      request("http://localhost/api/business/chats/chat-token-1/draft", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ source: "latest" }),
+      }),
+      tokenCtx(),
+    );
+    await expect(jsonOf(missingLatestMessage)).resolves.toEqual({ ok: false, error: "missing_latest_message" });
+    expect(missingLatestMessage.status).toBe(409);
   });
 
   it("maps Hermes not found and server failures to UI-safe responses", async () => {

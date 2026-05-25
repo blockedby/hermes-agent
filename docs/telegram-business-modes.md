@@ -111,10 +111,19 @@ HERMES_BUSINESS_DASHBOARD_API_PORT=8765
 
 The API serializes view models for the dashboard and does not expose raw
 Business connection IDs, customer chat IDs, or direct topic IDs in normal chat
-list/detail responses. Draft requests are safety-first: they enqueue through an
-injected gateway callback when embedded, or mark the registry request state when
-run as a separate service. The API never sends customer-facing Telegram text
-itself.
+list/detail responses. Mutating and read dashboard endpoints require both the
+bearer token and `X-Telegram-User-Id`; missing or malformed actor headers are
+rejected before any store mutation.
+
+Draft requests are safety-first: they enqueue only through an injected gateway
+callback when the API is embedded with the live Telegram gateway. A standalone
+API process has no in-memory gateway queue, so `POST /draft` returns
+`503 {"error":{"code":"not_connected",...}}` instead of claiming the request
+was queued. Dashboard mode changes to `draft` or `auto` also try the same latest
+message enqueue callback when embedded; when no callback is available the mode is
+changed but `modeChange.status`/`lastDashboardModeEnqueueStatus` records
+`no_enqueue_callback` so the dashboard never reports a false queued state. The
+API never sends customer-facing Telegram text itself.
 
 The module has a standalone entrypoint, so the API can run as a separate user
 service:
