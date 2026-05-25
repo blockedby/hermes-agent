@@ -8,3 +8,4 @@
 - 2026-05-25: Starting touched regression checks: focused dashboard API tests plus existing Telegram Business gateway tests via `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh ...`.
 - 2026-05-25: Final targeted checks before implementation commit passed: `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business.py -- -q --tb=short` (73 passed) and `venv/bin/python -m compileall -q gateway/platforms/telegram_business_dashboard_api.py tests/gateway/test_telegram_business_dashboard_api.py` (passed). `git diff --check` passed.
 - 2026-05-25: Preparing implementation commit with API module, tests, runtime docs, and progress notes.
+- 2026-05-25: Implementation commit created: `3228303c2 feat: add telegram business dashboard API`. Wrote final implementation report at `reports/task-3-vps-api.md`.
