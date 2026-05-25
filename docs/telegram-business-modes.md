@@ -56,3 +56,63 @@ The file and parent directory are written with private permissions. Entries are
 keyed by Business connection + customer chat + optional direct-message topic;
 display names are metadata only and are not used for routing. The registry keeps
 short message previews for owner cards and watch notifications.
+
+## Dashboard VPS API runtime
+
+The Telegram Business dashboard backend lives in
+`gateway/platforms/telegram_business_dashboard_api.py`. It exposes a tiny JSON
+API over the existing Business chat and approval stores:
+
+- `GET /api/business/chats?mode=all|watch|draft|auto|ignored&q=...`
+- `GET /api/business/chats/{token}`
+- `GET /api/business/chats/{token}/history`
+- `GET /api/business/approvals?chatToken=...`
+- `POST /api/business/chats/{token}/mode` with `{ "mode": "watch" }`
+- `POST /api/business/chats/{token}/draft` with `{ "source": "latest" }`
+
+All dashboard API requests except `/health` require:
+
+```http
+Authorization: Bearer <HERMES_DASHBOARD_API_TOKEN>
+X-Telegram-User-Id: <verified owner Telegram user id>
+```
+
+Set the service token as an environment variable, not in committed config:
+
+```text
+HERMES_DASHBOARD_API_TOKEN=replace-with-secret-service-token
+HERMES_BUSINESS_DASHBOARD_API_HOST=127.0.0.1
+HERMES_BUSINESS_DASHBOARD_API_PORT=8765
+```
+
+The API serializes view models for the dashboard and does not expose raw
+Business connection IDs, customer chat IDs, or direct topic IDs in normal chat
+list/detail responses. Draft requests are safety-first: they enqueue through an
+injected gateway callback when embedded, or mark the registry request state when
+run as a separate service. The API never sends customer-facing Telegram text
+itself.
+
+Example user systemd unit for a standalone localhost service behind Caddy/nginx:
+
+```ini
+[Unit]
+Description=Hermes Telegram Business Dashboard API
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kcnc/code/hermes/hermes-agent
+Environment=HERMES_DASHBOARD_API_TOKEN=replace-with-secret-service-token
+Environment=HERMES_BUSINESS_DASHBOARD_API_HOST=127.0.0.1
+Environment=HERMES_BUSINESS_DASHBOARD_API_PORT=8765
+ExecStart=/home/kcnc/code/hermes/hermes-agent/venv/bin/python -m gateway.platforms.telegram_business_dashboard_api
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Expose it only over HTTPS from the VPS reverse proxy to the Vercel server-side
+BFF, and keep browser CORS closed unless a later deployment explicitly needs an
+allowlisted origin. Do not log or commit the bearer token.

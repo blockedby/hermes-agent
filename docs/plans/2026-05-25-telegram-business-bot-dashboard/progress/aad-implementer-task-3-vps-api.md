@@ -1,0 +1,10 @@
+# Progress: Task 3 VPS Business Dashboard API
+
+- 2026-05-25: Started implementation. Read AGENTS, task plan, AAD task/report skills, backend/API and devops readiness checklists. Workspace status was clean on `epic/telegram-business-dashboard` before edits.
+- 2026-05-25: Confirmed target verification from owner prompt: focused Python tests under `tests/gateway/`; use `scripts/run_tests.sh` per repo guidance. Broader provided backend command in plan references existing Telegram business/thread tests and is optional/final-slice oriented; this task will run focused dashboard API tests and touched-regression tests.
+- 2026-05-25: Added focused dashboard API tests first. RED evidence: `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py -- -q --tb=short` failed with `ModuleNotFoundError: No module named 'gateway.platforms.telegram_business_dashboard_api'` as expected. Note: default `.venv` lacks pytest, so repo wrapper is run with `HERMES_TEST_VENV=$PWD/venv`.
+- 2026-05-25: Implemented `BusinessDashboardAPI`, private bounded history placeholder store, optional aiohttp app/server entrypoint, bearer auth, view-model serialization, list/detail/history/approvals/mode/draft handler functions. GREEN evidence: focused dashboard API tests passed (8 tests).
+- 2026-05-25: Documented VPS env/systemd/reverse-proxy wiring and draft safety behavior in `docs/telegram-business-modes.md`.
+- 2026-05-25: Starting touched regression checks: focused dashboard API tests plus existing Telegram Business gateway tests via `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh ...`.
+- 2026-05-25: Final targeted checks before implementation commit passed: `HERMES_TEST_VENV=$PWD/venv scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business.py -- -q --tb=short` (73 passed) and `venv/bin/python -m compileall -q gateway/platforms/telegram_business_dashboard_api.py tests/gateway/test_telegram_business_dashboard_api.py` (passed). `git diff --check` passed.
+- 2026-05-25: Preparing implementation commit with API module, tests, runtime docs, and progress notes.

@@ -1,0 +1,262 @@
+"""Tests for the Telegram Business Dashboard VPS API service layer."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
+from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
+from gateway.platforms.telegram_business_dashboard_api import (
+    BusinessDashboardAPI,
+    TelegramBusinessHistoryStore,
+)
+
+
+API_TOKEN = "test-dashboard-token"
+
+
+def _auth(token: str = API_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "X-Telegram-User-Id": "4242"}
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> TelegramBusinessChatRegistry:
+    return TelegramBusinessChatRegistry(tmp_path / "business_chats.json")
+
+
+@pytest.fixture
+def approvals(tmp_path: Path) -> TelegramBusinessApprovalStore:
+    return TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+
+
+@pytest.fixture
+def history(tmp_path: Path) -> TelegramBusinessHistoryStore:
+    return TelegramBusinessHistoryStore(tmp_path / "business_history.json")
+
+
+def _add_chat(
+    registry: TelegramBusinessChatRegistry,
+    *,
+    connection: str,
+    chat_id: str,
+    text: str,
+    mode: str = "watch",
+    display_name: str = "Customer",
+    username: str = "customer",
+    message_id: str | None = "55",
+    now: float = 100.0,
+    topic_id: str | None = None,
+):
+    entry, _ = registry.upsert_from_message(
+        business_connection_id=connection,
+        customer_chat_id=chat_id,
+        direct_messages_topic_id=topic_id,
+        text=text,
+        message_id=message_id,
+        display_name=display_name,
+        username=username,
+        now=now,
+    )
+    if mode != entry["mode"]:
+        entry = registry.set_mode_by_token(entry["token"], mode)
+    return entry
+
+
+def _api(registry, approvals, history, *, enqueue=None) -> BusinessDashboardAPI:
+    return BusinessDashboardAPI(
+        token=API_TOKEN,
+        chat_registry=registry,
+        approval_store=approvals,
+        history_store=history,
+        enqueue_draft=enqueue,
+    )
+
+
+def test_auth_rejects_missing_and_unknown_token(registry, approvals, history):
+    api = _api(registry, approvals, history)
+
+    missing = api.handle_request("GET", "/api/business/chats", headers={})
+    wrong = api.handle_request("GET", "/api/business/chats", headers=_auth("wrong"))
+
+    assert missing.status == 401
+    assert missing.body["error"]["code"] == "missing_bearer_token"
+    assert wrong.status == 403
+    assert wrong.body["error"]["code"] == "invalid_bearer_token"
+
+
+def test_chats_list_is_filterable_sorted_and_hides_internal_ids(registry, approvals, history):
+    older = _add_chat(
+        registry,
+        connection="bc-old",
+        chat_id="100",
+        text="old question",
+        mode="watch",
+        display_name="Alice Old",
+        now=10,
+    )
+    newer = _add_chat(
+        registry,
+        connection="bc-new",
+        chat_id="200",
+        text="new draft question",
+        mode="draft",
+        display_name="Zoe New",
+        username="zoe",
+        now=20,
+        topic_id="777",
+    )
+    approvals.save(
+        {
+            "pending-1": {
+                "approval_id": "pending-1",
+                "status": "pending",
+                "created_at": time.time(),
+                "customer_chat_id": "200",
+                "business_connection_id": "bc-new",
+                "direct_messages_topic_id": "777",
+                "draft": "Draft body",
+                "owner_chat_id": "999",
+                "approval_message_id": "44",
+            }
+        }
+    )
+
+    all_resp = _api(registry, approvals, history).handle_request(
+        "GET", "/api/business/chats", headers=_auth(), query={"mode": "all"}
+    )
+    filtered_resp = _api(registry, approvals, history).handle_request(
+        "GET", "/api/business/chats", headers=_auth(), query={"mode": "draft", "q": "zoe"}
+    )
+
+    assert all_resp.status == 200
+    assert [chat["token"] for chat in all_resp.body["chats"]] == [newer["token"], older["token"]]
+    assert filtered_resp.status == 200
+    assert [chat["token"] for chat in filtered_resp.body["chats"]] == [newer["token"]]
+    chat = filtered_resp.body["chats"][0]
+    assert chat["displayName"] == "Zoe New"
+    assert chat["pendingDraftCount"] == 1
+    assert chat["hasDirectTopic"] is True
+    assert "customer_chat_id" not in chat
+    assert "business_connection_id" not in chat
+    assert "direct_messages_topic_id" not in chat
+
+
+def test_chat_detail_joins_approval_and_history_summary(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="please reply", mode="watch")
+    approvals.save(
+        {
+            "failed-1": {
+                "approval_id": "failed-1",
+                "status": "failed",
+                "created_at": time.time(),
+                "customer_chat_id": "123",
+                "business_connection_id": "bc-1",
+                "draft": "Draft body",
+                "owner_chat_id": "999",
+                "approval_message_id": "44",
+            }
+        }
+    )
+    history.append_event("bc-1|123|", {"type": "inbound", "preview": "please reply", "created_at": 11})
+
+    resp = _api(registry, approvals, history).handle_request(
+        "GET", f"/api/business/chats/{entry['token']}", headers=_auth()
+    )
+
+    assert resp.status == 200
+    assert resp.body["chat"]["failedDraftCount"] == 1
+    assert resp.body["chat"]["latestMessage"]["preview"] == "please reply"
+    assert resp.body["history"][0]["type"] == "inbound"
+    assert "customer_chat_id" not in resp.body["chat"]
+
+
+def test_mode_change_updates_registry_and_records_actor_metadata(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+
+    resp = _api(registry, approvals, history).handle_request(
+        "POST",
+        f"/api/business/chats/{entry['token']}/mode",
+        headers=_auth(),
+        body={"mode": "auto"},
+    )
+
+    assert resp.status == 200
+    assert resp.body["chat"]["mode"] == "auto"
+    stored = registry.find_by_token(entry["token"])[1]
+    assert stored["mode"] == "auto"
+    assert stored["last_dashboard_actor_user_id"] == "4242"
+    assert history.list_events("bc-1|123|")[0]["type"] == "mode_changed"
+
+
+def test_invalid_mode_and_unknown_chat_return_safe_errors(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+    api = _api(registry, approvals, history)
+
+    invalid_mode = api.handle_request(
+        "POST", f"/api/business/chats/{entry['token']}/mode", headers=_auth(), body={"mode": "manual-send"}
+    )
+    unknown = api.handle_request("GET", "/api/business/chats/not-a-token", headers=_auth())
+
+    assert invalid_mode.status == 400
+    assert invalid_mode.body["error"]["code"] == "invalid_mode"
+    assert unknown.status == 404
+    assert unknown.body["error"]["code"] == "chat_not_found"
+
+
+def test_draft_request_enqueues_latest_message_without_sending_customer_text(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="Please draft this", mode="watch")
+    calls = []
+
+    def enqueue(event, *, chat_entry, actor_user_id):
+        calls.append((event, chat_entry, actor_user_id))
+        return True
+
+    resp = _api(registry, approvals, history, enqueue=enqueue).handle_request(
+        "POST", f"/api/business/chats/{entry['token']}/draft", headers=_auth(), body={"source": "latest"}
+    )
+
+    assert resp.status == 202
+    assert resp.body["draft"]["status"] == "queued"
+    assert resp.body["draft"]["sentToCustomer"] is False
+    assert "Please draft this" not in json.dumps(resp.body, ensure_ascii=False)
+    assert len(calls) == 1
+    event, chat_entry, actor_user_id = calls[0]
+    assert event.text == "Please draft this"
+    assert chat_entry["token"] == entry["token"]
+    assert actor_user_id == "4242"
+    stored = registry.find_by_token(entry["token"])[1]
+    assert stored["last_dashboard_draft_status"] == "queued"
+
+
+def test_draft_request_requires_latest_message_context(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="", mode="watch", message_id=None)
+
+    resp = _api(registry, approvals, history).handle_request(
+        "POST", f"/api/business/chats/{entry['token']}/draft", headers=_auth(), body={"source": "latest"}
+    )
+
+    assert resp.status == 409
+    assert resp.body["error"]["code"] == "missing_latest_message"
+
+
+def test_corrupted_stores_fail_closed_without_breaking_dashboard(tmp_path: Path):
+    registry_path = tmp_path / "business_chats.json"
+    history_path = tmp_path / "business_history.json"
+    registry_path.write_text("{not json", encoding="utf-8")
+    history_path.write_text("{not json", encoding="utf-8")
+    registry = TelegramBusinessChatRegistry(registry_path)
+    approvals = TelegramBusinessApprovalStore(tmp_path / "business_approvals.json")
+    history = TelegramBusinessHistoryStore(history_path)
+
+    resp = _api(registry, approvals, history).handle_request(
+        "GET", "/api/business/chats", headers=_auth()
+    )
+    hist = history.list_events("missing|chat|")
+
+    assert resp.status == 200
+    assert resp.body["chats"] == []
+    assert hist == []
