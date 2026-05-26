@@ -487,3 +487,41 @@ Dependencies:
 Execution ledger:
 - 2026-05-26 owner: plan gate completed for DD-1; dispatching one `aad-implementer` because this is a coherent single-slice implementation with one verification story.
 - 2026-05-26 owner: DD-1 implemented directly due nested subagent depth limit. Verification recorded in `verification/dashboard-draft.md`. Status: done pending parent review/deploy.
+
+---
+
+# Addendum: Telegram Business dashboard auth 24-hour session lease
+
+## Task intake
+
+Goal: keep fresh Telegram WebApp `initData` validation on the existing 5-minute max age, and add a 24-hour server-side dashboard session lease. `POST /api/session` issues an HttpOnly Secure signed cookie; Business BFF routes accept either fresh `initData` or a valid unexpired dashboard session cookie. Fresh `initData` remains authoritative and refreshes the cookie. Service tokens remain server-only.
+
+Out of scope: deployment, push, PR creation, live VPS rollout, and client UI redesign.
+
+## Repo orientation / reuse
+
+- `apps/telegram-business-dashboard/src/lib/server/telegram-auth.ts`: existing `validateTelegramAdminInitData()` and admin allowlist.
+- `apps/telegram-business-dashboard/src/lib/server/business-route.ts`: central Business BFF auth gate.
+- `apps/telegram-business-dashboard/src/app/api/session/route.ts`: session POST.
+- Tests: `src/app/api/session/route.test.ts`, `src/app/api/business/route-handlers.test.ts`, `src/lib/server/telegram-auth.test.ts`.
+
+## Plan tasks and execution ledger
+
+Task 1: signed dashboard session cookie issuance.
+- Acceptance: valid fresh initData returns the existing user JSON and includes HttpOnly Secure 24-hour signed cookie; invalid/stale/non-admin/config-error cases remain rejected.
+- Executor: `aad-implementer`.
+- Status: done in commit `3011c9568`.
+
+Task 2: Business BFF cookie fallback.
+- Acceptance: Business routes proxy with actor user id using cookie-only auth; fresh initData still proxies and refreshes cookie; expired/tampered/malformed cookies reject without calling Hermes; service token remains server-only.
+- Executor: `aad-implementer`.
+- Status: done in commit `3011c9568`.
+
+Final owner verification:
+- `cd apps/telegram-business-dashboard && npm run test:auth -- src/app/api/session/route.test.ts src/app/api/business/route-handlers.test.ts src/lib/server/telegram-auth.test.ts`: passed, 3 files / 27 tests.
+- `cd apps/telegram-business-dashboard && npm run typecheck`: passed.
+- `cd apps/telegram-business-dashboard && npm run lint`: passed.
+
+Reports:
+- Implementer: `reports/aad-implementer-dashboard-session-lease.md`.
+- Owner final: `reports/dashboard-session-lease-owner.md`.
