@@ -4,6 +4,7 @@ import {
   authenticateTelegramAdmin,
   isNextResponse,
   safeHermesResponse,
+  withDashboardSessionCookie,
 } from "@/lib/server/business-route";
 import {
   callHermesDashboard,
@@ -27,10 +28,13 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  return safeHermesResponse(() =>
-    callHermesDashboard<BusinessChatsResponse>("/api/business/chats", {
-      actorUserId: session.telegramUserId,
-      searchParams,
-    }),
+  return withDashboardSessionCookie(
+    await safeHermesResponse(() =>
+      callHermesDashboard<BusinessChatsResponse>("/api/business/chats", {
+        actorUserId: session.telegramUserId,
+        searchParams,
+      }),
+    ),
+    session,
   );
 }

@@ -7,38 +7,77 @@ import {
   type HermesDashboardResponse,
 } from "./hermes-dashboard-api";
 import {
+  DASHBOARD_SESSION_COOKIE_NAME,
   TelegramAdminAuthError,
+  dashboardSessionCookieOptions,
+  issueDashboardSessionCookie,
+  validateDashboardSessionCookie,
   validateTelegramAdminInitData,
   type TelegramAdminSession,
 } from "./telegram-auth";
 
 export type RequestBody = Record<string, unknown>;
 
+export type AuthenticatedTelegramAdminSession = TelegramAdminSession & {
+  dashboardSessionCookie?: string;
+};
+
+function authErrorResponse(error: unknown): NextResponse {
+  if (error instanceof TelegramAdminAuthError) {
+    if (error.code === "forbidden") {
+      return NextResponse.json({ ok: false, error: "forbidden" }, { status: 403 });
+    }
+    if (error.code === "config_error") {
+      return NextResponse.json({ ok: false, error: "auth_not_configured" }, { status: 500 });
+    }
+  }
+  return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+}
+
 export function authenticateTelegramAdmin(
   request: NextRequest,
   body?: RequestBody | null,
-): TelegramAdminSession | NextResponse {
+): AuthenticatedTelegramAdminSession | NextResponse {
   const initDataFromHeader = request.headers.get("x-telegram-init-data");
   const initDataFromBody = typeof body?.initData === "string" ? body.initData : "";
   const initData = initDataFromHeader || initDataFromBody;
 
-  if (!initData) {
+  if (initData) {
+    try {
+      const session = validateTelegramAdminInitData(initData);
+      return {
+        ...session,
+        dashboardSessionCookie: issueDashboardSessionCookie(session),
+      };
+    } catch (error) {
+      return authErrorResponse(error);
+    }
+  }
+
+  const dashboardSessionCookie = request.cookies.get(DASHBOARD_SESSION_COOKIE_NAME)?.value;
+  if (!dashboardSessionCookie) {
     return NextResponse.json({ ok: false, error: "missing_init_data" }, { status: 400 });
   }
 
   try {
-    return validateTelegramAdminInitData(initData);
+    return validateDashboardSessionCookie(dashboardSessionCookie);
   } catch (error) {
-    if (error instanceof TelegramAdminAuthError) {
-      if (error.code === "forbidden") {
-        return NextResponse.json({ ok: false, error: "forbidden" }, { status: 403 });
-      }
-      if (error.code === "config_error") {
-        return NextResponse.json({ ok: false, error: "auth_not_configured" }, { status: 500 });
-      }
-    }
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    return authErrorResponse(error);
   }
+}
+
+export function withDashboardSessionCookie(
+  response: NextResponse,
+  session: AuthenticatedTelegramAdminSession,
+): NextResponse {
+  if (session.dashboardSessionCookie) {
+    response.cookies.set({
+      name: DASHBOARD_SESSION_COOKIE_NAME,
+      value: session.dashboardSessionCookie,
+      ...dashboardSessionCookieOptions(),
+    });
+  }
+  return response;
 }
 
 export async function parseJsonBody(request: NextRequest): Promise<RequestBody | NextResponse> {

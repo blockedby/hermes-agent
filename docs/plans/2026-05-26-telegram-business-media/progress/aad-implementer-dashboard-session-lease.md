@@ -1,0 +1,8 @@
+# AAD implementer progress: dashboard session lease
+
+- 2026-05-26: Started implementation. Read root/dashboard AGENTS guidance, plan, current auth/session/business route code, and targeted tests. `git status --short` showed related dirty task-package files only (`plan.md`, `progress/`). Confirmed target commands from plan: `npm run test:auth -- src/app/api/session/route.test.ts src/app/api/business/route-handlers.test.ts src/lib/server/telegram-auth.test.ts`, then `npm run typecheck`, `npm run lint` if feasible.
+- 2026-05-26: RED complete. Added targeted tests for session Set-Cookie, Business cookie-only auth, tampered cookie rejection, expired cookie rejection, and fresh Business cookie refresh. Targeted auth tests fail as expected because cookie helpers/Set-Cookie behavior are not implemented yet (`issueDashboardSessionCookie is not a function`, missing `set-cookie`).
+- 2026-05-26: GREEN targeted auth tests pass after implementing HMAC-signed 24-hour cookie helpers, POST `/api/session` Set-Cookie, and Business BFF cookie fallback/refresh wiring. Next: typecheck/lint.
+- 2026-05-26: Typecheck initially failed on optional payload narrowing in `telegram-auth.ts`; fixed with explicit local number guards. `npm run typecheck` now passes.
+- 2026-05-26: Added malformed-cookie negative coverage and extracted shared cookie options helper to reduce duplication before final checks.
+- 2026-05-26: Final implementation checks passed: targeted auth tests (`27 passed`), `npm run typecheck`, and `npm run lint`. Preparing local implementation commit without staging pre-existing owner dirty task-package files.

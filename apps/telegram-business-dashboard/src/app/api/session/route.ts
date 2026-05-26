@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
+  DASHBOARD_SESSION_COOKIE_NAME,
   TelegramAdminAuthError,
+  dashboardSessionCookieOptions,
+  issueDashboardSessionCookie,
   validateTelegramAdminInitData,
 } from "@/lib/server/telegram-auth";
 
@@ -24,7 +27,13 @@ export async function POST(request: NextRequest) {
 
   try {
     const user = validateTelegramAdminInitData(body.initData);
-    return NextResponse.json({ ok: true, user });
+    const response = NextResponse.json({ ok: true, user });
+    response.cookies.set({
+      name: DASHBOARD_SESSION_COOKIE_NAME,
+      value: issueDashboardSessionCookie(user),
+      ...dashboardSessionCookieOptions(),
+    });
+    return response;
   } catch (error) {
     if (error instanceof TelegramAdminAuthError) {
       if (error.code === "forbidden") {

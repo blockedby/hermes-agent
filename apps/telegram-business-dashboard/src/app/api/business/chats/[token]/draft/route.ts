@@ -6,6 +6,7 @@ import {
   parseJsonBody,
   postBodyWithoutInitData,
   safeHermesResponse,
+  withDashboardSessionCookie,
 } from "@/lib/server/business-route";
 import {
   callHermesDashboard,
@@ -31,14 +32,17 @@ export async function POST(request: NextRequest, { params }: ChatTokenContext) {
   }
 
   const { token } = await params;
-  return safeHermesResponse(() =>
-    callHermesDashboard<BusinessDraftResponse>(
-      `/api/business/chats/${encodeURIComponent(token)}/draft`,
-      {
-        method: "POST",
-        actorUserId: session.telegramUserId,
-        body: postBodyWithoutInitData(body, ["source", "prompt"]),
-      },
+  return withDashboardSessionCookie(
+    await safeHermesResponse(() =>
+      callHermesDashboard<BusinessDraftResponse>(
+        `/api/business/chats/${encodeURIComponent(token)}/draft`,
+        {
+          method: "POST",
+          actorUserId: session.telegramUserId,
+          body: postBodyWithoutInitData(body, ["source", "prompt"]),
+        },
+      ),
     ),
+    session,
   );
 }

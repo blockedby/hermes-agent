@@ -4,6 +4,7 @@ import {
   authenticateTelegramAdmin,
   isNextResponse,
   safeHermesResponse,
+  withDashboardSessionCookie,
 } from "@/lib/server/business-route";
 import {
   callHermesDashboard,
@@ -24,9 +25,12 @@ export async function GET(request: NextRequest, { params }: ChatTokenContext) {
   }
 
   const { token } = await params;
-  return safeHermesResponse(() =>
-    callHermesDashboard<BusinessChatResponse>(`/api/business/chats/${encodeURIComponent(token)}`, {
-      actorUserId: session.telegramUserId,
-    }),
+  return withDashboardSessionCookie(
+    await safeHermesResponse(() =>
+      callHermesDashboard<BusinessChatResponse>(`/api/business/chats/${encodeURIComponent(token)}`, {
+        actorUserId: session.telegramUserId,
+      }),
+    ),
+    session,
   );
 }

@@ -5,6 +5,7 @@ import { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { POST } from "./route";
+import { DASHBOARD_SESSION_COOKIE_NAME } from "@/lib/server/telegram-auth";
 import {
   signedInitDataFor,
   tamperInitDataHash,
@@ -59,6 +60,14 @@ describe("POST /api/session", () => {
       },
     });
     expect(response.status).toBe(200);
+    const setCookie = response.headers.get("set-cookie");
+    expect(setCookie).toContain(`${DASHBOARD_SESSION_COOKIE_NAME}=`);
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain("Path=/");
+    expect(setCookie).toMatch(/SameSite=none/i);
+    expect(setCookie).toContain("Max-Age=86400");
+    expect(setCookie).toMatch(/Expires=/);
   });
 
   it("returns 403 for valid Telegram initData from a non-admin user", async () => {

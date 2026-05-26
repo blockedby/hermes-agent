@@ -10,6 +10,10 @@ import { POST as postMode } from "./chats/[token]/mode/route";
 import { POST as postDraft } from "./chats/[token]/draft/route";
 import { GET as getHistory } from "./chats/[token]/history/route";
 import {
+  DASHBOARD_SESSION_COOKIE_NAME,
+  issueDashboardSessionCookie,
+} from "@/lib/server/telegram-auth";
+import {
   signedInitDataFor,
   tamperInitDataHash,
   TEST_ADMIN_USER_ID,
@@ -44,6 +48,15 @@ function authHeaders(initData = signedInitDataFor(TEST_ADMIN_USER_ID)) {
   return { "x-telegram-init-data": initData };
 }
 
+function dashboardSessionCookieHeader(telegramUserId = TEST_ADMIN_USER_ID) {
+  const value = issueDashboardSessionCookie({
+    telegramUserId,
+    username: "ada_admin",
+    firstName: "Ada",
+  });
+  return `${DASHBOARD_SESSION_COOKIE_NAME}=${value}`;
+}
+
 type NextRequestInit = ConstructorParameters<typeof NextRequest>[1];
 
 function request(url: string, init?: NextRequestInit) {
@@ -76,6 +89,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("validates Telegram admin initData before proxying GET /api/business/chats", async () => {
@@ -107,6 +121,79 @@ describe("Telegram Business dashboard BFF route handlers", () => {
         }),
       }),
     );
+    const setCookie = response.headers.get("set-cookie");
+    expect(setCookie).toContain(`${DASHBOARD_SESSION_COOKIE_NAME}=`);
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain("Max-Age=86400");
+  });
+
+  it("proxies GET /api/business/chats with a dashboard session cookie and no initData", async () => {
+    const fetchMock = mockFetch(200, { chats: [], count: 0 });
+
+    const response = await getChats(
+      request("http://localhost/api/business/chats", {
+        headers: { cookie: dashboardSessionCookieHeader() },
+      }),
+    );
+
+    await expect(jsonOf(response)).resolves.toEqual({ chats: [], count: 0 });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://hermes.example.test/dashboard/api/business/chats",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          authorization: `Bearer ${API_TOKEN}`,
+          "x-telegram-user-id": String(TEST_ADMIN_USER_ID),
+        }),
+      }),
+    );
+  });
+
+  it("rejects tampered dashboard session cookies without calling Hermes", async () => {
+    const fetchMock = mockFetch(200, { chats: [] });
+    const cookie = dashboardSessionCookieHeader().replace(/.$/, "x");
+
+    const response = await getChats(
+      request("http://localhost/api/business/chats", { headers: { cookie } }),
+    );
+
+    await expect(jsonOf(response)).resolves.toEqual({ ok: false, error: "unauthorized" });
+    expect(response.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects expired dashboard session cookies without calling Hermes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-26T00:00:00Z"));
+    const cookie = dashboardSessionCookieHeader();
+    vi.setSystemTime(new Date("2026-05-27T00:00:01Z"));
+    const fetchMock = mockFetch(200, { chats: [] });
+
+    const response = await getChats(
+      request("http://localhost/api/business/chats", { headers: { cookie } }),
+    );
+
+    await expect(jsonOf(response)).resolves.toEqual({ ok: false, error: "unauthorized" });
+    expect(response.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed dashboard session cookies without calling Hermes", async () => {
+    const fetchMock = mockFetch(200, { chats: [] });
+
+    const response = await getChats(
+      request("http://localhost/api/business/chats", {
+        headers: { cookie: `${DASHBOARD_SESSION_COOKIE_NAME}=not-a-session` },
+      }),
+    );
+
+    await expect(jsonOf(response)).resolves.toEqual({ ok: false, error: "unauthorized" });
+    expect(response.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects non-admin Telegram users without calling Hermes", async () => {
