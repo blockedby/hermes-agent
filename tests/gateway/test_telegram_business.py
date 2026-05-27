@@ -1968,7 +1968,15 @@ async def test_normal_telegram_send_does_not_include_business_connection_id():
 async def test_private_bot_dm_topic_send_uses_message_thread_id():
     adapter = _make_adapter()
 
-    result = await adapter.send("227049836", "Topic reply", metadata={"thread_id": "338575"})
+    result = await adapter.send(
+        "227049836",
+        "Topic reply",
+        metadata={
+            "thread_id": "338575",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
 
     assert result.success is True
     call_kwargs = adapter._bot.send_message.call_args.kwargs
@@ -1999,7 +2007,15 @@ async def test_dm_topic_thread_not_found_does_not_retry_unthreaded():
     adapter = _make_adapter()
     adapter._bot.send_message.side_effect = BadRequest("Message thread not found")
 
-    result = await adapter.send("227049836", "Topic reply", metadata={"thread_id": "338575"})
+    result = await adapter.send(
+        "227049836",
+        "Topic reply",
+        metadata={
+            "thread_id": "338575",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
 
     assert result.success is False
     assert adapter._bot.send_message.call_count == 1

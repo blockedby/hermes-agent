@@ -455,7 +455,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        stream_kwargs = dict(api_kwargs)
+        stream_kwargs = {
+            k: v
+            for k, v in dict(api_kwargs).items()
+            if not (k == "tools" and v is None)
+        }
         stream_kwargs["stream"] = True
 
         try:

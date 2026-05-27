@@ -383,6 +383,25 @@ def test_build_api_kwargs_copilot_responses_omits_reasoning_for_non_reasoning_mo
     assert "prompt_cache_key" not in kwargs
 
 
+def test_build_api_kwargs_codex_responses_omits_tools_when_empty(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [])
+    agent = run_agent.AIAgent(
+        model="gpt-5-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+    assert "tools" not in kwargs
+    assert "tool_choice" not in kwargs
+    assert "parallel_tool_calls" not in kwargs
+
+
 def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
     """The event-driven path tolerates streams that end without a terminal frame.
 
@@ -463,6 +482,7 @@ def test_run_codex_stream_parses_create_stream_events(monkeypatch):
     def _fake_create(**kwargs):
         calls["create"] += 1
         assert kwargs.get("stream") is True
+        assert "tools" not in kwargs
         return create_stream
 
     agent.client = SimpleNamespace(
