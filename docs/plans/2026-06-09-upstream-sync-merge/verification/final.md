@@ -31,6 +31,23 @@ All verification/build/test commands below were run in containers only, except h
   - Attempt 2 evidence: Docker build skipped npm install, then `uv pip install -e ".[all,dev]"` failed fetching `tqdm==4.68.1` from PyPI with connection reset.
   - Attempt 3 evidence: retry failed fetching `agent-client-protocol==0.9.0` from PyPI with connection reset.
 
+## Containerized follow-up after initial report
+
+- Built a narrower container-only targeted Python test image after the full `[all,dev]` image kept failing on external registry downloads:
+  - `DOCKER_BUILDKIT=1 docker build -f /tmp/Dockerfile.hermes-targeted -t hermes-agent:test-runner-targeted .`
+  - The temporary Dockerfile installed `.[dev,messaging,web]` inside the image and avoided the flaky `[google]` extra that repeatedly failed fetching `google-api-python-client`.
+  - Result: passed image build; no host Python/npm/uv install was run.
+- First targeted pytest run in that image found a real merge regression:
+  - `tests/gateway/test_telegram_business.py::test_business_customer_bypasses_generic_dm_allowlist`
+  - Failure: `NameError: name 'user_id' is not defined` in `gateway/run.py::_is_user_authorized`.
+  - Fix: restored `user_id = source.user_id`, guarded pairing-store lookup when `user_id` is absent, and returned `False` for no-user sources after chat-scoped allowlist checks.
+- Containerized focused rerun after the fix:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_telegram_business.py -- -q'`
+  - Result: `76 tests passed, 0 failed`.
+- Containerized targeted rerun after the fix:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/run_agent/test_run_agent_codex_responses.py tests/test_codex_responses_adapter.py tests/test_model_tools.py tests/test_toolsets.py tests/tools/test_read_image_tool.py tests/tools/test_transcription_tools.py tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_session_isolation.py tests/gateway/test_telegram_thread_fallback.py tests/gateway/test_send_image_file.py -- -q'`
+  - Result: `11 files, 414 tests passed, 0 failed`.
+
 ## Containerized build attempts
 
-- Full frontend/web/TUI build was not run. The Docker test image could not complete dependency installation due registry/network failures above. No host npm/uv build/install/lock commands were run.
+- Full frontend/web/TUI build was not run. The full Docker test image could not complete dependency installation due registry/network failures above. No host npm/uv build/install/lock commands were run.

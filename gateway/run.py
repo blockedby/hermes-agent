@@ -6218,9 +6218,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
+        user_id = source.user_id
+
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
-        if self.pairing_store.is_approved(platform_name, user_id):
+        if user_id and self.pairing_store.is_approved(platform_name, user_id):
             return True
 
         # Check platform-specific and global allowlists
@@ -6275,6 +6277,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._warned_telegram_group_users_legacy = True
                 if source.chat_id in legacy_chat_ids:
                     return True
+
+        if not user_id:
+            return False
 
         # Check if user is in any allowlist. In group/forum chats,
         # TELEGRAM_GROUP_ALLOWED_USERS is the scoped allowlist and should not

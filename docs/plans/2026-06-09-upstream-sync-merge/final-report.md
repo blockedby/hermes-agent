@@ -92,14 +92,21 @@
 - Auditor-confirmed: AC1, AC2, AC4, AC6 passed; AC3 partial because behavior was preserved by conflict resolution/syntax evidence but not runtime pytest; AC5 passed with limitation because verification attempts were container-only and blockers were recorded.
 - Owner clarification: the initial Docker build-input blocker from removed per-workspace npm lockfiles was addressed by `Dockerfile.test`/`docker-compose.test.yml`; remaining pytest/build blocker is container dependency download/network failure during image construction.
 
+## Follow-up container verification and fix
+- A narrower container-only targeted image (`hermes-agent:test-runner-targeted`, built from a temporary Dockerfile under `/tmp`) avoided the flaky `[google]` extra after full `[all,dev]` image builds repeatedly failed on external registry downloads.
+- First targeted pytest run found a real merge regression in `gateway/run.py::_is_user_authorized`: `user_id` was referenced before assignment for Telegram Business authorization.
+- Fixed by restoring `user_id = source.user_id`, guarding pairing-store lookup for no-user sources, and returning `False` after chat-scoped allowlist checks when no user id is present.
+- Containerized focused rerun: `tests/gateway/test_telegram_business.py` => `76 tests passed, 0 failed`.
+- Containerized targeted rerun: 11 files / `414 tests passed, 0 failed` covering Codex Responses, model tools/toolsets, image/transcription helpers, Telegram Business/dashboard/session/thread/send-image files.
+
 ## Verdict
-- Status: partial success / accepted with limitations.
-- Goal state: upstream merge completed and committed; local changes intentionally preserved; verification is incomplete due container dependency download failures.
-- Final readiness: ready as a git checkpoint, not fully runtime-test-validated.
+- Status: successful targeted verification with limitations.
+- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests now pass in containers after one merge-regression fix.
+- Remaining limitation: full `[all,dev]` Docker image and frontend/web/TUI builds remain unproven because external Debian/PyPI/npm registry downloads failed. No host pytest/npm/uv/build/install commands were run.
 
 ## Next-agent brief
-- Objective: complete verification and fix any regressions found.
+- Objective: complete broader verification when registry/network is stable.
 - Target: same current `main` `HEAD`.
-- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved.
+- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite passes in container after the `gateway/run.py` fix.
 - Boundaries: continue honoring container-only tests/builds/locks.
-- Verification target: rerun targeted Docker pytest command in `verification/final.md`; then run relevant containerized frontend/dashboard/TUI build/tests; classify/fix only current-goal regressions.
+- Verification target: retry full `scripts/run_tests_docker.sh` and containerized frontend/dashboard/TUI build checks when dependency fetching is stable; classify/fix only current-goal regressions.
