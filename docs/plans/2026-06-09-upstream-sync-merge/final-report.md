@@ -87,10 +87,15 @@
 - Why unresolved: external network/registry instability during container build; user forbade host dependency/test/build runs.
 - Needed next: retry `scripts/run_tests_docker.sh ... -q` when container network is stable; then run containerized build checks as needed.
 
+## Acceptance audit
+- `aad-acceptance-auditor` verdict: accepted with limitations.
+- Auditor-confirmed: AC1, AC2, AC4, AC6 passed; AC3 partial because behavior was preserved by conflict resolution/syntax evidence but not runtime pytest; AC5 passed with limitation because verification attempts were container-only and blockers were recorded.
+- Owner clarification: the initial Docker build-input blocker from removed per-workspace npm lockfiles was addressed by `Dockerfile.test`/`docker-compose.test.yml`; remaining pytest/build blocker is container dependency download/network failure during image construction.
+
 ## Verdict
-- Status: partial success.
+- Status: partial success / accepted with limitations.
 - Goal state: upstream merge completed and committed; local changes intentionally preserved; verification is incomplete due container dependency download failures.
-- Final readiness: ready as a git checkpoint, not fully acceptance-verified.
+- Final readiness: ready as a git checkpoint, not fully runtime-test-validated.
 
 ## Next-agent brief
 - Objective: complete verification and fix any regressions found.
