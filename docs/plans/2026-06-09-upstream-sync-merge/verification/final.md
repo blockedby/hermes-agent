@@ -48,6 +48,27 @@ All verification/build/test commands below were run in containers only, except h
   - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/run_agent/test_run_agent_codex_responses.py tests/test_codex_responses_adapter.py tests/test_model_tools.py tests/test_toolsets.py tests/tools/test_read_image_tool.py tests/tools/test_transcription_tools.py tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_session_isolation.py tests/gateway/test_telegram_thread_fallback.py tests/gateway/test_send_image_file.py -- -q'`
   - Result: `11 files, 414 tests passed, 0 failed`.
 
+## Containerized full-suite attempts after targeted pass
+
+- Official full Docker runner:
+  - `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh`
+  - Result: blocked before pytest during Docker image build.
+  - Evidence: `uv pip install -e ".[all,dev]"` failed fetching `https://pypi.org/simple/pydantic-core/` with `connection reset`.
+- Full-cache retry image:
+  - `DOCKER_BUILDKIT=1 docker build -f /tmp/Dockerfile.hermes-full-cache -t hermes-agent:test-runner-full-cache .`
+  - Result: blocked before pytest during Docker image build.
+  - Evidence: Debian apt layer eventually completed after mirror warnings, but `[all,dev]` install failed downloading/extracting `google-api-python-client==2.194.0` due network timeout.
+- Broad fallback suite in the previously-built targeted image:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh -j 4'`
+  - Caveat: image contains `.[dev,messaging,web]`, not full `[all,dev]`; ACP/google/other optional-dependency failures are not authoritative full-suite failures.
+  - Result: `1405 files, 29711 tests passed, 56 failed`.
+  - Expected fallback-image fallout included `ModuleNotFoundError: No module named 'acp'` for ACP tests and timeout/import fallout from missing optional/full-image capabilities.
+  - Useful signal: the broad fallback run exposed real merge-regression coverage gaps in `gateway/run.py` around config-driven adapter access policy and SimpleX display-name allowlists.
+- Focused container rerun after restoring upstream auth-policy behavior into the local `gateway/run.py` override:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_config_driven_access_policy.py tests/gateway/test_unauthorized_dm_behavior.py tests/gateway/test_telegram_business.py -- -q'`
+  - Result: `3 files, 137 tests passed, 0 failed`.
+  - Fixes covered: adapter `enforces_own_access_policy` trust path, `dm_policy` unauthorized-DM behavior, SimpleX `SIMPLEX_ALLOWED_USERS` display-name matching, and Telegram Business authorization bypass.
+
 ## Containerized build attempts
 
 - Full frontend/web/TUI build was not run. The full Docker test image could not complete dependency installation due registry/network failures above. No host npm/uv build/install/lock commands were run.

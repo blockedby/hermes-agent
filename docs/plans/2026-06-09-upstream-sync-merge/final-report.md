@@ -92,21 +92,25 @@
 - Auditor-confirmed: AC1, AC2, AC4, AC6 passed; AC3 partial because behavior was preserved by conflict resolution/syntax evidence but not runtime pytest; AC5 passed with limitation because verification attempts were container-only and blockers were recorded.
 - Owner clarification: the initial Docker build-input blocker from removed per-workspace npm lockfiles was addressed by `Dockerfile.test`/`docker-compose.test.yml`; remaining pytest/build blocker is container dependency download/network failure during image construction.
 
-## Follow-up container verification and fix
+## Follow-up container verification and fixes
 - A narrower container-only targeted image (`hermes-agent:test-runner-targeted`, built from a temporary Dockerfile under `/tmp`) avoided the flaky `[google]` extra after full `[all,dev]` image builds repeatedly failed on external registry downloads.
 - First targeted pytest run found a real merge regression in `gateway/run.py::_is_user_authorized`: `user_id` was referenced before assignment for Telegram Business authorization.
-- Fixed by restoring `user_id = source.user_id`, guarding pairing-store lookup for no-user sources, and returning `False` after chat-scoped allowlist checks when no user id is present.
+- Fixed by restoring `user_id = source.user_id`, guarding pairing-store lookup for no-user sources, and returning `False` for no-user sources after chat-scoped allowlist checks.
 - Containerized focused rerun: `tests/gateway/test_telegram_business.py` => `76 tests passed, 0 failed`.
 - Containerized targeted rerun: 11 files / `414 tests passed, 0 failed` covering Codex Responses, model tools/toolsets, image/transcription helpers, Telegram Business/dashboard/session/thread/send-image files.
+- Full official Docker runner was retried, but still blocked before pytest by external dependency downloads (`pydantic-core`, then `google-api-python-client` on a cache-enabled retry).
+- Broad fallback full-discovery suite in the targeted image ran to completion: `1405 files, 29711 tests passed, 56 failed`. Because the image lacks full `[all,dev]`, ACP and some optional-dependency failures are expected fallback-image fallout, not authoritative full-suite failures.
+- That broad fallback did expose additional real merge-regression gaps in the local `gateway/run.py` auth override. Restored upstream behavior for adapter `enforces_own_access_policy`, config-driven `dm_policy` unauthorized-DM behavior, and SimpleX display-name allowlist matching.
+- Containerized focused rerun after those auth fixes: `tests/gateway/test_config_driven_access_policy.py`, `tests/gateway/test_unauthorized_dm_behavior.py`, `tests/gateway/test_telegram_business.py` => `3 files, 137 tests passed, 0 failed`.
 
 ## Verdict
 - Status: successful targeted verification with limitations.
-- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests now pass in containers after one merge-regression fix.
-- Remaining limitation: full `[all,dev]` Docker image and frontend/web/TUI builds remain unproven because external Debian/PyPI/npm registry downloads failed. No host pytest/npm/uv/build/install commands were run.
+- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests and focused auth-policy regression tests pass in containers after merge-regression fixes.
+- Remaining limitation: official full `[all,dev]` Docker suite and frontend/web/TUI builds remain unproven because external Debian/PyPI/npm registry downloads failed. The broad fallback suite is useful but not authoritative because it used an intentionally narrower dependency image. No host pytest/npm/uv/build/install commands were run.
 
 ## Next-agent brief
-- Objective: complete broader verification when registry/network is stable.
+- Objective: complete official full verification when registry/network is stable.
 - Target: same current `main` `HEAD`.
-- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite passes in container after the `gateway/run.py` fix.
+- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite and auth-policy focused suite pass in containers after the `gateway/run.py` fixes.
 - Boundaries: continue honoring container-only tests/builds/locks.
-- Verification target: retry full `scripts/run_tests_docker.sh` and containerized frontend/dashboard/TUI build checks when dependency fetching is stable; classify/fix only current-goal regressions.
+- Verification target: retry official `scripts/run_tests_docker.sh` and containerized frontend/dashboard/TUI build checks when dependency fetching is stable; classify/fix only current-goal regressions.
