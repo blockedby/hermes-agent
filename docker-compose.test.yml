@@ -21,6 +21,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
+      args:
+        HERMES_DOCKER_INSTALL_NODE_DEPS: "1"
     image: hermes-agent:test-runner
     working_dir: /workspace
     environment:
