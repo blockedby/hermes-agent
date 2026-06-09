@@ -11,7 +11,11 @@ from agent.i18n import t
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
-from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+from tests.gateway.restart_test_helpers import (
+    make_restart_runner,
+    make_restart_source,
+    pretend_not_in_container,
+)
 
 
 @pytest.mark.asyncio
@@ -19,6 +23,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # Ensure INVOCATION_ID is NOT set — systemd sets this in service mode,
     # which changes the restart call signature.
     monkeypatch.delenv("INVOCATION_ID", raising=False)
+    pretend_not_in_container(monkeypatch)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(

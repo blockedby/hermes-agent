@@ -34,6 +34,8 @@ from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import build_session_key
 from hermes_cli.config import cfg_get
+_MODULE_PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
 from utils import (
     atomic_json_write,
     atomic_yaml_write,
@@ -3246,6 +3248,7 @@ class GatewaySlashCommandsMixin:
         files are written so either the current gateway process or the next one
         can notify the user when the update finishes.
         """
+        import gateway.run as gateway_run
         from gateway.run import _hermes_home, _resolve_hermes_bin
         import json
         import shutil
@@ -3269,7 +3272,15 @@ class GatewaySlashCommandsMixin:
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
 
-        project_root = Path(__file__).parent.parent.resolve()
+        # Preserve both pre- and post-extraction project-root contracts: older
+        # tests/embedders patch gateway.run.__file__, while newer extraction
+        # tests patch gateway.slash_commands.__file__. Prefer an explicitly
+        # patched slash_commands module path; otherwise use gateway.run.
+        slash_project_root = Path(__file__).parent.parent.resolve()
+        if slash_project_root != _MODULE_PROJECT_ROOT:
+            project_root = slash_project_root
+        else:
+            project_root = Path(gateway_run.__file__).parent.parent.resolve()
         git_dir = project_root / '.git'
 
         if not git_dir.exists():

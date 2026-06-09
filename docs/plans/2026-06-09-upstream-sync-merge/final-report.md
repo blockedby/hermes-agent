@@ -102,15 +102,18 @@
 - Broad fallback full-discovery suite in the targeted image ran to completion: `1405 files, 29711 tests passed, 56 failed`. Because the image lacks full `[all,dev]`, ACP and some optional-dependency failures are expected fallback-image fallout, not authoritative full-suite failures.
 - That broad fallback did expose additional real merge-regression gaps in the local `gateway/run.py` auth override. Restored upstream behavior for adapter `enforces_own_access_policy`, config-driven `dm_policy` unauthorized-DM behavior, and SimpleX display-name allowlist matching.
 - Containerized focused rerun after those auth fixes: `tests/gateway/test_config_driven_access_policy.py`, `tests/gateway/test_unauthorized_dm_behavior.py`, `tests/gateway/test_telegram_business.py` => `3 files, 137 tests passed, 0 failed`.
+- A later official full Docker runner succeeded in building the full `[all,dev]` image and ran pytest to completion: `42 files with test failures (85 tests failed)`. This replaced the prior registry blocker with real suite signal.
+- Localized official-run failures were fixed for Docker test context and restart/update contracts: include repo docs/CI metadata in the image, create a lightweight `.git` in `Dockerfile.test`, mask Docker markers in restart tests that assert the non-container path, and support both `gateway.run.__file__` and `gateway.slash_commands.__file__` project-root patching in `/update` after slash-command extraction.
+- Containerized focused rerun after those official-run fixes: 8 files / `223 tests passed, 0 failed` covering restart drain/notification, gateway update command/streaming, CLI update/autostash, lint workflow metadata, and Windows README checks.
 
 ## Verdict
-- Status: successful targeted verification with limitations.
-- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests and focused auth-policy regression tests pass in containers after merge-regression fixes.
-- Remaining limitation: official full `[all,dev]` Docker suite and frontend/web/TUI builds remain unproven because external Debian/PyPI/npm registry downloads failed. The broad fallback suite is useful but not authoritative because it used an intentionally narrower dependency image. No host pytest/npm/uv/build/install commands were run.
+- Status: successful targeted/focused verification with limitations.
+- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests, auth-policy focused tests, and focused official-failure regression tests pass in containers after merge-regression/test-image fixes.
+- Remaining limitation: official full `[all,dev]` Docker suite is no longer blocked by image construction, but the latest full run still had `42 files with test failures (85 tests failed)`, many involving 30s timeouts around lazy dependency installs/subprocess waits and container/root environment assumptions. These remaining failures are not yet fully classified as merge regressions. Frontend/web/TUI builds remain unproven. No host pytest/npm/uv/build/install commands were run.
 
 ## Next-agent brief
-- Objective: complete official full verification when registry/network is stable.
+- Objective: complete official full verification and classify remaining full-suite failures.
 - Target: same current `main` `HEAD`.
 - Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite and auth-policy focused suite pass in containers after the `gateway/run.py` fixes.
 - Boundaries: continue honoring container-only tests/builds/locks.
-- Verification target: retry official `scripts/run_tests_docker.sh` and containerized frontend/dashboard/TUI build checks when dependency fetching is stable; classify/fix only current-goal regressions.
+- Verification target: rerun official `scripts/run_tests_docker.sh` after the Docker test-context/update/restart fixes; classify/fix only current-goal regressions; run containerized frontend/dashboard/TUI build checks when practical.

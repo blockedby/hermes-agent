@@ -40,6 +40,13 @@ WORKDIR /workspace
 # of this layer.
 COPY . .
 
+# .git is intentionally excluded from the Docker build context to keep the test
+# image small, but update-path tests expect PROJECT_ROOT to be a git checkout.
+# A lightweight repository is sufficient because tests mock remote operations.
+RUN git init -q . && \
+    git config user.email "test@example.invalid" && \
+    git config user.name "Hermes Test"
+
 # Python test runs do not require Node dependencies, and installing the full npm
 # workspace can make ordinary pytest verification depend on flaky registry
 # downloads.  Set HERMES_DOCKER_INSTALL_NODE_DEPS=1 for containerized asset

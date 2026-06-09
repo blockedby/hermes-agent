@@ -72,6 +72,15 @@ All verification/build/test commands below were run in containers only, except h
   - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner-targeted bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_config_driven_access_policy.py tests/gateway/test_unauthorized_dm_behavior.py tests/gateway/test_telegram_business.py -- -q'`
   - Result: `3 files, 137 tests passed, 0 failed`.
   - Fixes covered: adapter `enforces_own_access_policy` trust path, `dm_policy` unauthorized-DM behavior, SimpleX `SIMPLEX_ALLOWED_USERS` display-name matching, and Telegram Business authorization bypass.
+- Official full Docker runner after registry recovered:
+  - `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh`
+  - Result: Docker image built successfully and pytest ran to completion; `42 files with test failures (85 tests failed)`.
+  - Useful signal: no missing `acp` fallback-image errors remained; the run exposed Docker-test-context issues (`.gitignore`, `.github`, `README.md`, and `.git` absent from image), restart tests that needed to explicitly mask Docker markers when asserting non-container behavior, and gateway update project-root compatibility after slash-command extraction.
+  - Remaining non-localized failures were mostly 30s timeouts around lazy dependency installs / subprocess waits, container/root environment assumptions, and existing broad-suite instability; they are not yet all classified as merge regressions.
+- Focused container rerun after fixing the localized official-run failures:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_restart_drain.py tests/gateway/test_restart_notification.py tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py tests/hermes_cli/test_cmd_update.py tests/hermes_cli/test_update_autostash.py tests/test_lint_config.py tests/tools/test_windows_native_support.py -- -q'`
+  - Result: `8 files, 223 tests passed, 0 failed`.
+  - Fixes covered: Docker test context now includes repo docs/CI metadata and creates a lightweight `.git`; restart non-container assertions mask Docker markers; gateway `/update` supports both `gateway.run.__file__` and `gateway.slash_commands.__file__` project-root patching contracts.
 
 ## Containerized build attempts
 

@@ -1,6 +1,5 @@
 # Git
 .git
-.gitignore
 .gitmodules
 
 # Python
@@ -45,7 +44,6 @@ ui-tui/dist/
 ui-tui/packages/hermes-ink/dist/
 
 # CI/CD
-.github
 
 # Environment files
 .env
@@ -63,7 +61,6 @@ ui-tui/packages/hermes-ink/dist/
 htmlcov/
 
 # Documentation
-*.md
 
 # Runtime data (bind-mounted at /opt/data; must not leak into build context)
 data/

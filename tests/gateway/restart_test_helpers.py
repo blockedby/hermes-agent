@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -45,6 +46,24 @@ def make_restart_source(
         user_id="u1",
         thread_id=thread_id,
     )
+
+
+def pretend_not_in_container(monkeypatch) -> None:
+    """Make restart-command tests exercise the non-container path.
+
+    The official Docker test runner has /.dockerenv, and production code
+    correctly treats that as service-managed restart mode. Tests that assert
+    the detached non-systemd path need to mask only those container marker
+    files while preserving normal path-exists behavior.
+    """
+    original_exists = os.path.exists
+
+    def _exists(path):
+        if path in {"/.dockerenv", "/run/.containerenv"}:
+            return False
+        return original_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", _exists)
 
 
 def make_restart_runner(
