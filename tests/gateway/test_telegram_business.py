@@ -1246,6 +1246,44 @@ async def test_business_update_treats_owner_self_message_as_context_when_flag_di
 
 
 @pytest.mark.asyncio
+async def test_business_update_refreshes_owner_identity_even_when_self_ignore_disabled():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_ignore_self_messages = False
+    adapter._bot.get_business_connection = AsyncMock(
+        return_value=SimpleNamespace(
+            id="bc-9",
+            is_enabled=True,
+            rights=SimpleNamespace(can_reply=True),
+            user=SimpleNamespace(id=227049836),
+        )
+    )
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-9",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=93,
+        business_connection=None,
+        business_message=_business_message(text="manual owner reply", connection_id="bc-9", from_user_id=227049836),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._bot.get_business_connection.assert_awaited_once_with("bc-9")
+    adapter._enqueue_text_event.assert_not_called()
+    events = adapter._business_history_store.list_events("bc-9|12345|")
+    assert events[0]["type"] == "owner_outbound"
+    assert events[0]["classification"] == "owner_manual_outgoing"
+
+
+@pytest.mark.asyncio
 async def test_business_update_ignores_configured_business_chat_id():
     adapter = _make_adapter()
     adapter._business_ignored_chat_ids = {"227049836"}

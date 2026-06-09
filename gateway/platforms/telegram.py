@@ -7465,10 +7465,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     connection_id,
                 )
             else:
-                if (
-                    self._business_ignore_self_messages_enabled()
-                    and connection_id not in getattr(self, "_business_owner_user_ids", {})
-                ):
+                if connection_id not in getattr(self, "_business_owner_user_ids", {}):
                     await self._refresh_business_connection(connection_id)
                 classification = self._classify_business_message(message, connection_id)
                 if classification == "bot_outgoing":

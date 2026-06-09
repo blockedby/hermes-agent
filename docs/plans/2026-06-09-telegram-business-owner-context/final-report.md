@@ -11,6 +11,7 @@
 - Task package: `docs/plans/2026-06-09-telegram-business-owner-context`
 - Reports: `reports/slice-owner.md`, `reports/slice-owner-followup.md`
 - Verification: `verification/local.md`, `verification/followup-local.md`, `verification/root-final.md`
+- Root integration note: after slice follow-up, root tightened owner identity refresh so owner/manual classification still works after gateway restart even when `business_ignore_self_messages` is disabled and no `business_connection` update accompanies the message.
 - Worktree: `/home/kcnc/code/hermes/hermes-agent/.worktrees/t_42400-telegram-business-owner-context`
 - Branch: `pi/t_42400-telegram-business-owner-context`
 
@@ -54,7 +55,7 @@
 
 ## Verification run
 - Local / targeted checks:
-  - `HERMES_TEST_VENV=/home/kcnc/code/hermes/hermes-agent/venv scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_group_gating.py tests/gateway/test_session.py -- -q`: passed, 219 tests.
+  - `HERMES_TEST_VENV=/home/kcnc/code/hermes/hermes-agent/venv scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_group_gating.py tests/gateway/test_session.py -- -q`: passed, 220 tests.
   - Evidence: `verification/root-final.md`.
 - Local / full checks:
   - Not run; targeted gateway suites directly cover the changed Telegram Business/session/dashboard paths.
