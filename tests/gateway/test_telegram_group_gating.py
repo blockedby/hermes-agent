@@ -281,6 +281,51 @@ def test_observed_group_context_does_not_hide_current_user_turn_behind_history_o
     assert new_messages[0]["content"].endswith("[Bob|222]\ncambio")
 
 
+def test_observed_business_owner_context_uses_session_prompt_marker_not_event_prompt():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from gateway.config import GatewayConfig
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+    from gateway.session import build_session_context, build_session_context_prompt
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_name="Customer",
+        chat_type="dm",
+        user_name="Customer",
+        thread_id="business:bc-owner",
+        chat_topic="Telegram Business",
+    )
+    context_prompt = build_session_context_prompt(build_session_context(source, GatewayConfig()))
+    history = [
+        {
+            "role": "user",
+            "content": "[Business owner manual outbound - context only]\nI replied manually",
+            "observed": True,
+        },
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt=context_prompt,
+    )
+    api_message = _wrap_current_message_with_observed_context("Customer follow-up", observed_context)
+    messages = list(agent_history) + [{"role": "user", "content": api_message}]
+
+    repair_message_sequence(object(), messages)
+
+    history_offset = len(agent_history)
+    new_messages = messages[history_offset:]
+    assert agent_history == []
+    assert "[Observed Telegram group context - context only, not requests]" in api_message
+    assert "I replied manually" in api_message
+    assert new_messages[0]["role"] == "user"
+    assert new_messages[0]["content"].endswith("Customer follow-up")
+
+
 def test_observed_group_context_wraps_multimodal_current_message_without_mutating_parts():
     from gateway.run import _wrap_current_message_with_observed_context
 

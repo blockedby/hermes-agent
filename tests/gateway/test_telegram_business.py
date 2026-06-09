@@ -723,6 +723,128 @@ async def test_business_empty_non_media_message_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_business_classifier_uses_sender_business_bot_for_bot_outgoing():
+    adapter = _make_adapter()
+    msg = _business_message(text="bot echo", from_user_id=67890)
+    msg.sender_business_bot = SimpleNamespace(id=1215244879, username="hermesbot")
+
+    assert adapter._classify_business_message(msg, "bc-1") == "bot_outgoing"
+
+    update = SimpleNamespace(
+        update_id=9001,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    assert adapter._pending_text_batches == {}
+    assert adapter._business_history_store.list_events("bc-1|12345|") == []
+
+
+@pytest.mark.asyncio
+async def test_business_owner_manual_outgoing_records_history_only_and_preserves_latest_customer():
+    adapter = _make_adapter(owner_chat_id="999")
+
+    class FakeSessionStore:
+        def __init__(self):
+            self.messages = []
+            self.sources = []
+
+        def get_or_create_session(self, source):
+            self.sources.append(source)
+            return SimpleNamespace(session_id="session-business")
+
+        def append_to_transcript(self, session_id, entry):
+            self.messages.append((session_id, entry))
+
+    session_store = FakeSessionStore()
+    adapter._session_store = session_store
+
+    customer = _business_message(text="Need help with billing", connection_id="bc-owner", from_user_id=67890)
+    customer_update = SimpleNamespace(
+        update_id=9002,
+        business_connection=None,
+        business_message=customer,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(customer_update, None)
+
+    entry = next(iter(adapter._business_chat_registry.load().values()))
+    token = entry["token"]
+    assert entry["last_message_text"] == "Need help with billing"
+    adapter._pending_text_batches.clear()
+    adapter._bot.send_message.reset_mock()
+
+    owner = _business_message(text="I replied manually", connection_id="bc-owner", from_user_id=999)
+    owner.message_id = 56
+    owner.from_user.full_name = "Business Owner"
+    owner_update = SimpleNamespace(
+        update_id=9003,
+        business_connection=None,
+        business_message=owner,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(owner_update, None)
+
+    assert adapter._pending_text_batches == {}
+    adapter._bot.send_message.assert_not_called()
+    latest = adapter._business_chat_registry.find_by_token(token)[1]
+    assert latest["last_message_text"] == "Need help with billing"
+    assert latest["last_message_id"] == "55"
+    events = adapter._business_history_store.list_events("bc-owner|12345|")
+    assert [event["type"] for event in events][:2] == ["owner_outbound", "inbound"]
+    owner_event = events[0]
+    assert owner_event["preview"] == "I replied manually"
+    assert owner_event["message_id"] == "56"
+    assert owner_event["actor_user_id"] == "999"
+    assert owner_event["actor_user_name"] == "Business Owner"
+    assert owner_event["classification"] == "owner_manual_outgoing"
+    assert owner_event["delivery"] == "manual"
+    assert owner_event["source"] == "telegram_business_update"
+    assert len(session_store.messages) == 1
+    session_id, observed = session_store.messages[0]
+    assert session_id == "session-business"
+    assert observed["observed"] is True
+    assert observed["message_id"] == "56"
+    assert "Business owner manual outbound - context only" in observed["content"]
+    assert "I replied manually" in observed["content"]
+    assert session_store.sources[0].thread_id == "business:bc-owner"
+
+
+def test_business_classifier_has_exact_behavior_classes():
+    adapter = _make_adapter(owner_chat_id="999")
+    customer = _business_message(from_user_id=67890)
+    owner = _business_message(from_user_id=999)
+    bot = _business_message(from_user_id=67890)
+    bot.sender_business_bot = SimpleNamespace(id=1215244879)
+
+    classes = {
+        adapter._classify_business_message(customer, "bc-1"),
+        adapter._classify_business_message(owner, "bc-1"),
+        adapter._classify_business_message(bot, "bc-1"),
+    }
+    assert classes == {"customer_inbound", "owner_manual_outgoing", "bot_outgoing"}
+
+
+def test_business_classifier_owner_identity_ignores_legacy_self_ignore_gate():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_ignore_self_messages = False
+    owner = _business_message(from_user_id=999)
+    bot = _business_message(from_user_id=999)
+    bot.sender_business_bot = SimpleNamespace(id=1215244879)
+
+    assert adapter._classify_business_message(owner, "bc-1") == "owner_manual_outgoing"
+    assert adapter._classify_business_message(bot, "bc-1") == "bot_outgoing"
+
+
+@pytest.mark.asyncio
 async def test_disconnect_cancels_business_voice_history_tasks():
     adapter = _make_adapter(owner_chat_id="999")
     adapter._app = None
@@ -1090,7 +1212,7 @@ async def test_business_update_ignores_owner_self_message_by_default():
 
 
 @pytest.mark.asyncio
-async def test_business_update_can_process_owner_self_message_when_flag_disabled():
+async def test_business_update_treats_owner_self_message_as_context_when_flag_disabled():
     adapter = _make_adapter(owner_chat_id="227049836")
     adapter._business_ignore_self_messages = False
     entry, _ = adapter._business_chat_registry.upsert_from_message(
@@ -1117,7 +1239,48 @@ async def test_business_update_can_process_owner_self_message_when_flag_disabled
     with pytest.raises(ApplicationHandlerStop):
         await adapter._handle_business_update(update, None)
 
-    adapter._enqueue_text_event.assert_called_once()
+    adapter._enqueue_text_event.assert_not_called()
+    events = adapter._business_history_store.list_events("bc-9|12345|")
+    assert events[0]["type"] == "owner_outbound"
+    assert events[0]["classification"] == "owner_manual_outgoing"
+
+
+@pytest.mark.asyncio
+async def test_business_update_refreshes_owner_identity_even_when_self_ignore_disabled():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_ignore_self_messages = False
+    adapter._bot.get_business_connection = AsyncMock(
+        return_value=SimpleNamespace(
+            id="bc-9",
+            is_enabled=True,
+            rights=SimpleNamespace(can_reply=True),
+            user=SimpleNamespace(id=227049836),
+        )
+    )
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-9",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=93,
+        business_connection=None,
+        business_message=_business_message(text="manual owner reply", connection_id="bc-9", from_user_id=227049836),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._bot.get_business_connection.assert_awaited_once_with("bc-9")
+    adapter._enqueue_text_event.assert_not_called()
+    events = adapter._business_history_store.list_events("bc-9|12345|")
+    assert events[0]["type"] == "owner_outbound"
+    assert events[0]["classification"] == "owner_manual_outgoing"
 
 
 @pytest.mark.asyncio
