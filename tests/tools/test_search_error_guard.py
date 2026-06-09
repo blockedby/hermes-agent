@@ -110,6 +110,12 @@ class TestSearchErrorGuard:
 
     def test_files_only_excludes_diagnostics(self, method, partial_error_tree):
         # files_only mode must not list a diagnostic line as a fake file path.
+        # chmod(000) does not make a file unreadable for root in Docker test
+        # images, so this integration-style permission case is only meaningful
+        # for non-root runners; splitter unit tests below still cover shape
+        # separation everywhere.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root can read chmod(000) files")
         res = _search(_ops(partial_error_tree), method, "needle",
                       partial_error_tree, output_mode="files_only")
         assert res.error is None

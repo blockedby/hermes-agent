@@ -81,6 +81,18 @@ All verification/build/test commands below were run in containers only, except h
   - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_restart_drain.py tests/gateway/test_restart_notification.py tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py tests/hermes_cli/test_cmd_update.py tests/hermes_cli/test_update_autostash.py tests/test_lint_config.py tests/tools/test_windows_native_support.py -- -q'`
   - Result: `8 files, 223 tests passed, 0 failed`.
   - Fixes covered: Docker test context now includes repo docs/CI metadata and creates a lightweight `.git`; restart non-container assertions mask Docker markers; gateway `/update` supports both `gateway.run.__file__` and `gateway.slash_commands.__file__` project-root patching contracts.
+- Focused Slack native slash alias rerun after prioritizing documented aliases under Slack's 50-command cap:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/gateway/test_slack.py -- -q -vv -k test_app_mention_registered_on_connect --tb=long'`
+  - Result: `1 test passed, 0 failed`.
+  - Fix covered: `/btw` survives manifest truncation along with `/q` and `/bg`.
+- Focused system/service Docker-shape rerun:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/hermes_cli/test_gateway_wsl.py tests/hermes_cli/test_commands.py tests/hermes_cli/test_gateway_service.py tests/test_live_system_guard_self_test.py -- -q --tb=short'`
+  - Result: `4 files, 342 tests passed, 0 failed`.
+  - Fixes covered: service-management unit tests now assert host/systemd behavior independent of Docker runner shape; the slim image includes a `systemctl` stub for pass-through guard tests.
+- Focused remaining non-service official-run cluster after classifying container/root, zombie, lazy-dependency, and live-metadata issues:
+  - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/test_run_tests_parallel.py tests/tools/test_search_error_guard.py tests/run_agent/test_provider_attribution_headers.py tests/tools/test_mcp_stability.py tests/tools/test_local_interrupt_cleanup.py tests/tools/test_voice_mode.py tests/tools/test_web_providers.py -- -q --tb=short'`
+  - Result: `7 files, 126 tests passed, 0 failed`.
+  - Fixes covered: permission-denied search diagnostics under root Docker, killed-zombie process assertions in container PID namespaces, lazy STT/Firecrawl optional dependency installs in unit tests, and provider-header tests making live Ollama metadata HTTP calls.
 
 ## Containerized build attempts
 

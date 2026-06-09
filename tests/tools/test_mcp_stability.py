@@ -380,11 +380,21 @@ class TestStdioPgroupReaping:
             except ProcessLookupError:
                 pass
 
-        # Grandchild should be gone — SIGTERM via killpg in phase 1 reached it.
+        def _grandchild_alive() -> bool:
+            if not psutil.pid_exists(grandchild_pid):
+                return False
+            try:
+                return psutil.Process(grandchild_pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return False
+
+        # Grandchild should be gone or at least killed. In container PID
+        # namespaces the killed grandchild can remain as a zombie until PID 1
+        # reaps it; that is not a live orphan process.
         deadline = _time.time() + 3
-        while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
+        while _time.time() < deadline and _grandchild_alive():
             _time.sleep(0.05)
-        assert not psutil.pid_exists(grandchild_pid), (
+        assert not _grandchild_alive(), (
             "grandchild survived killpg-based reaping (issue #23799 regression)"
         )
 

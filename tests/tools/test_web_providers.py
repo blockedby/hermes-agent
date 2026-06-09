@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -244,6 +245,11 @@ class TestWebSearchUsesSearchBackend:
 
         monkeypatch.setattr(web_tools, "_get_search_backend", tracking_get_search)
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "firecrawl"})
+        monkeypatch.setattr(
+            web_tools,
+            "Firecrawl",
+            MagicMock(side_effect=RuntimeError("fake firecrawl client failure")),
+        )
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
 
         # The function will fail at Firecrawl client level but we just

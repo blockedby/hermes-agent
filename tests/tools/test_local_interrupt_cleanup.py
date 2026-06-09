@@ -30,7 +30,19 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
 
 
 def _pgid_still_alive(pgid: int) -> bool:
-    """Return True if any process in the given process group is still alive."""
+    """Return True if any non-zombie process in the group is still alive."""
+    try:
+        snapshot = subprocess.run(
+            ["ps", "-o", "stat=", "-g", str(pgid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.splitlines()
+        states = [line.strip() for line in snapshot if line.strip()]
+        if states:
+            return any(not state.startswith("Z") for state in states)
+    except Exception:
+        pass
     try:
         os.killpg(pgid, 0)  # signal 0 = existence check
         return True

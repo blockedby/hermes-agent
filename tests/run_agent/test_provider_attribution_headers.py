@@ -2,7 +2,23 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
+
+
+@pytest.fixture(autouse=True)
+def _no_endpoint_metadata_network(monkeypatch):
+    """Header unit tests should not query live model metadata endpoints."""
+    fake_context_length = lambda *args, **kwargs: 128000
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        fake_context_length,
+    )
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        fake_context_length,
+    )
 
 
 @patch("run_agent.OpenAI")

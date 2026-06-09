@@ -31,6 +31,14 @@ from pathlib import Path
 import pytest
 
 
+def _pid_is_zombie(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return stat.split()[2] == "Z"
+    except Exception:
+        return False
+
+
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
 # so concurrent invocations of the suite don't clobber each other.
@@ -60,7 +68,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    return not _pid_is_zombie(pid)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")

@@ -26,6 +26,16 @@ def _non_wsl_proc_version(real_open):
 # Fixtures
 # ============================================================================
 
+@pytest.fixture(autouse=True)
+def _voice_tests_environment(monkeypatch):
+    """Voice-mode unit tests should not depend on Docker host shape or install deps."""
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+    monkeypatch.setattr(
+        "tools.transcription_tools._try_lazy_install_stt",
+        lambda: False,
+    )
+
+
 @pytest.fixture
 def sample_wav(tmp_path):
     """Create a minimal valid WAV file (1 second of silence at 16kHz)."""
