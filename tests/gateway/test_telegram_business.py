@@ -833,6 +833,17 @@ def test_business_classifier_has_exact_behavior_classes():
     assert classes == {"customer_inbound", "owner_manual_outgoing", "bot_outgoing"}
 
 
+def test_business_classifier_owner_identity_ignores_legacy_self_ignore_gate():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_ignore_self_messages = False
+    owner = _business_message(from_user_id=999)
+    bot = _business_message(from_user_id=999)
+    bot.sender_business_bot = SimpleNamespace(id=1215244879)
+
+    assert adapter._classify_business_message(owner, "bc-1") == "owner_manual_outgoing"
+    assert adapter._classify_business_message(bot, "bc-1") == "bot_outgoing"
+
+
 @pytest.mark.asyncio
 async def test_disconnect_cancels_business_voice_history_tasks():
     adapter = _make_adapter(owner_chat_id="999")
@@ -1201,7 +1212,7 @@ async def test_business_update_ignores_owner_self_message_by_default():
 
 
 @pytest.mark.asyncio
-async def test_business_update_can_process_owner_self_message_when_flag_disabled():
+async def test_business_update_treats_owner_self_message_as_context_when_flag_disabled():
     adapter = _make_adapter(owner_chat_id="227049836")
     adapter._business_ignore_self_messages = False
     entry, _ = adapter._business_chat_registry.upsert_from_message(
@@ -1228,7 +1239,10 @@ async def test_business_update_can_process_owner_self_message_when_flag_disabled
     with pytest.raises(ApplicationHandlerStop):
         await adapter._handle_business_update(update, None)
 
-    adapter._enqueue_text_event.assert_called_once()
+    adapter._enqueue_text_event.assert_not_called()
+    events = adapter._business_history_store.list_events("bc-9|12345|")
+    assert events[0]["type"] == "owner_outbound"
+    assert events[0]["classification"] == "owner_manual_outgoing"
 
 
 @pytest.mark.asyncio

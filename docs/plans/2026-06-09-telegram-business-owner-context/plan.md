@@ -90,7 +90,23 @@ Report: `verification/local.md`.
 - Task 2 status: done. Owner/manual outgoing records `owner_outbound` history with safe metadata and, when `_session_store` exists, appends observed context-only transcript. It does not enqueue, notify, trigger modes, or update registry latest customer fields.
 - Task 3 status: done. Targeted regression suite passed; evidence in `verification/local.md`.
 
+## Follow-up integration fix
+- 2026-06-09 owner: Root integration found two acceptance risks: Business observed owner rows were not withheld when only the generated session context prompt contained the marker, and owner/manual Business classification still depended on the legacy `business_ignore_self_messages` gate.
+- Delegation: attempted `aad-implementer` dispatch for the follow-up, but nested subagent depth remained blocked (`depth=2, max=2`), so the slice owner implemented directly in the delegated worktree.
+- Changed files:
+  - `gateway/run.py`
+  - `gateway/platforms/telegram.py`
+  - `tests/gateway/test_telegram_business.py`
+  - `tests/gateway/test_telegram_group_gating.py`
+  - `docs/plans/2026-06-09-telegram-business-owner-context/verification/followup-local.md`
+  - `docs/plans/2026-06-09-telegram-business-owner-context/reports/slice-owner-followup.md`
+- Fixes:
+  - `_build_gateway_agent_history()` now receives a combined observed-context detection prompt built from both `event.channel_prompt` and generated `context_prompt`, so Telegram Business observed owner rows are withheld even when the marker comes from `build_session_context_prompt()`.
+  - Observed-context marker detection is case-insensitive to match the generated Telegram Business prompt text.
+  - `_is_business_self_message()` no longer short-circuits on `business_ignore_self_messages`; the three-way Business classifier remains unconditional, with `sender_business_bot` checked first and owner identity still producing `owner_manual_outgoing`.
+- Follow-up verification: `HERMES_TEST_VENV=/home/kcnc/code/hermes/hermes-agent/venv scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_group_gating.py tests/gateway/test_session.py -- -q` passed, 204 tests. Evidence: `verification/followup-local.md`.
+
 ## Final done-state
-- Spec compliance: acceptance criteria satisfied by targeted tests.
+- Spec compliance: original acceptance criteria and root follow-up risks are satisfied by targeted tests.
 - Open blockers: none.
 - Follow-up candidates: none identified.

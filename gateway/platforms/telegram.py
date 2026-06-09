@@ -1700,8 +1700,6 @@ class TelegramAdapter(BasePlatformAdapter):
         ``business_message`` updates.  If those are treated as customer input,
         Hermes drafts approvals to itself (customer == bot id) and can recurse.
         """
-        if not self._business_ignore_self_messages_enabled():
-            return False
         sender_id = self._telegram_message_user_id(message)
         if not sender_id:
             return False

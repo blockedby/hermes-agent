@@ -573,11 +573,13 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     and unit-testable.
     """
 
+    prompt = str(channel_prompt or "")
+    prompt_lower = prompt.lower()
     return bool(
-        channel_prompt
+        prompt
         and (
-            _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
-            or _TELEGRAM_BUSINESS_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
+            _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER.lower() in prompt_lower
+            or _TELEGRAM_BUSINESS_OBSERVED_CONTEXT_PROMPT_MARKER.lower() in prompt_lower
         )
     )
 
@@ -14345,9 +14347,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # history and attached to the current addressed message as
             # API-only context, so persisted history stores only the real
             # addressed user turn.
+            _observed_context_prompt = "\n\n".join(
+                part for part in (channel_prompt, context_prompt) if part
+            )
             agent_history, observed_group_context = _build_gateway_agent_history(
                 history,
-                channel_prompt=channel_prompt,
+                channel_prompt=_observed_context_prompt,
             )
             
             # Collect MEDIA paths already in history so we can exclude them
