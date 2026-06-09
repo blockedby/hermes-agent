@@ -98,7 +98,7 @@
 - Fixed by restoring `user_id = source.user_id`, guarding pairing-store lookup for no-user sources, and returning `False` for no-user sources after chat-scoped allowlist checks.
 - Containerized focused rerun: `tests/gateway/test_telegram_business.py` => `76 tests passed, 0 failed`.
 - Containerized targeted rerun: 11 files / `414 tests passed, 0 failed` covering Codex Responses, model tools/toolsets, image/transcription helpers, Telegram Business/dashboard/session/thread/send-image files.
-- Full official Docker runner was retried, but still blocked before pytest by external dependency downloads (`pydantic-core`, then `google-api-python-client` on a cache-enabled retry).
+- Full official Docker runner was retried again after the auth-policy fix, but still blocked before pytest by external dependency downloads (`pydantic-core`, then repeated `google-api-python-client` failures, including `peer closed connection without sending TLS close_notify`).
 - Broad fallback full-discovery suite in the targeted image ran to completion: `1405 files, 29711 tests passed, 56 failed`. Because the image lacks full `[all,dev]`, ACP and some optional-dependency failures are expected fallback-image fallout, not authoritative full-suite failures.
 - That broad fallback did expose additional real merge-regression gaps in the local `gateway/run.py` auth override. Restored upstream behavior for adapter `enforces_own_access_policy`, config-driven `dm_policy` unauthorized-DM behavior, and SimpleX display-name allowlist matching.
 - Containerized focused rerun after those auth fixes: `tests/gateway/test_config_driven_access_policy.py`, `tests/gateway/test_unauthorized_dm_behavior.py`, `tests/gateway/test_telegram_business.py` => `3 files, 137 tests passed, 0 failed`.

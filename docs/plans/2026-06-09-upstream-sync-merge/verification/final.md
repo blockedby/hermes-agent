@@ -54,6 +54,10 @@ All verification/build/test commands below were run in containers only, except h
   - `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh`
   - Result: blocked before pytest during Docker image build.
   - Evidence: `uv pip install -e ".[all,dev]"` failed fetching `https://pypi.org/simple/pydantic-core/` with `connection reset`.
+- Official full Docker runner retry after auth-policy fix:
+  - `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh`
+  - Result: still blocked before pytest during Docker image build.
+  - Evidence: `uv pip install -e ".[all,dev]"` failed fetching `https://pypi.org/simple/google-api-python-client/` with `peer closed connection without sending TLS close_notify`.
 - Full-cache retry image:
   - `DOCKER_BUILDKIT=1 docker build -f /tmp/Dockerfile.hermes-full-cache -t hermes-agent:test-runner-full-cache .`
   - Result: blocked before pytest during Docker image build.
