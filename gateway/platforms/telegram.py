@@ -856,6 +856,73 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Failed to append Telegram Business history event", self.name, exc_info=True)
 
+    def _classify_business_message(self, message: Message, business_connection_id: str) -> str:
+        """Classify Telegram Business message behavior.
+
+        Return exactly one of:
+        - ``bot_outgoing``: Telegram says this message was sent by the bot on
+          behalf of the Business account (authoritative ``sender_business_bot``).
+        - ``owner_manual_outgoing``: outgoing/self message from the Business
+          owner outside Hermes; record context/history only.
+        - ``customer_inbound``: ordinary customer message to process by mode.
+        """
+        if getattr(message, "sender_business_bot", None) is not None:
+            return "bot_outgoing"
+        if self._is_business_self_message(message, business_connection_id):
+            return "owner_manual_outgoing"
+        return "customer_inbound"
+
+    def _business_entry_from_message_identity(self, message: Message, business_connection_id: str) -> Dict[str, Any]:
+        chat_id = self._telegram_message_chat_id(message) or ""
+        return {
+            "business_connection_id": str(business_connection_id),
+            "customer_chat_id": str(chat_id),
+            "direct_messages_topic_id": self._direct_messages_topic_id_from_message(message),
+        }
+
+    def _observe_business_owner_outbound_message(
+        self,
+        entry: Dict[str, Any],
+        message: Message,
+        business_connection_id: str,
+        update_id: Optional[int] = None,
+    ) -> None:
+        """Persist owner/manual outbound as observed context without dispatching."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        preview = self._business_message_preview(message)
+        if not preview:
+            return
+        try:
+            from gateway.session import build_session_key  # noqa: F401 - validates session module availability
+
+            topic_id = entry.get("direct_messages_topic_id")
+            source = self.build_source(
+                chat_id=str(entry.get("customer_chat_id") or ""),
+                chat_name=str(entry.get("customer_chat_id") or "Telegram Business"),
+                chat_type="dm",
+                user_id=str(self._telegram_message_user_id(message) or entry.get("customer_chat_id") or ""),
+                user_name="Business owner",
+                thread_id=self._business_thread_id(business_connection_id, str(topic_id) if topic_id else None),
+                chat_topic="Telegram Business",
+            )
+            session_entry = store.get_or_create_session(source)
+            user = getattr(message, "from_user", None)
+            actor = str(getattr(user, "full_name", None) or getattr(user, "first_name", None) or "Business owner")
+            transcript = {
+                "role": "user",
+                "content": f"[Business owner manual outbound - context only] {actor}: {preview}",
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            message_id = getattr(message, "message_id", None)
+            if message_id is not None:
+                transcript["message_id"] = str(message_id)
+            store.append_to_transcript(session_entry.session_id, transcript)
+        except Exception:
+            logger.debug("[%s] Failed to observe Telegram Business owner outbound message", self.name, exc_info=True)
+
     @staticmethod
     def _telegram_message_has_media(message: Message) -> bool:
         return any(
@@ -7405,12 +7472,38 @@ class TelegramAdapter(BasePlatformAdapter):
                     and connection_id not in getattr(self, "_business_owner_user_ids", {})
                 ):
                     await self._refresh_business_connection(connection_id)
-                if self._is_business_self_message(message, connection_id):
+                classification = self._classify_business_message(message, connection_id)
+                if classification == "bot_outgoing":
                     logger.info(
-                        "[%s] Ignoring outgoing/self Telegram Business message for connection %s",
+                        "[%s] Ignoring bot-outgoing Telegram Business message for connection %s",
                         self.name,
                         connection_id,
                     )
+                elif classification == "owner_manual_outgoing":
+                    message_text = str(getattr(message, "text", None) or "").strip()
+                    message_caption = str(getattr(message, "caption", None) or "").strip()
+                    has_media = self._telegram_message_has_media(message)
+                    if not message_text and not message_caption and not has_media:
+                        logger.info("[%s] Ignoring empty owner-outgoing Telegram Business message for connection %s", self.name, connection_id)
+                    else:
+                        entry = self._business_entry_from_message_identity(message, connection_id)
+                        user = getattr(message, "from_user", None)
+                        self._record_business_history_event(
+                            entry,
+                            {
+                                "type": "owner_outbound",
+                                "preview": self._business_message_preview(message),
+                                "message_id": getattr(message, "message_id", None),
+                                "actor_user_id": self._telegram_message_user_id(message),
+                                "actor_user_name": str(getattr(user, "full_name", None) or getattr(user, "first_name", None) or ""),
+                                "classification": classification,
+                                "delivery": "manual",
+                                "source": "telegram_business_update",
+                                "media_type": self._telegram_media_preview(message).strip("[]") if has_media else None,
+                                "created_at": time.time(),
+                            },
+                        )
+                        self._observe_business_owner_outbound_message(entry, message, connection_id, update.update_id)
                 else:
                     message_text = str(getattr(message, "text", None) or "").strip()
                     message_caption = str(getattr(message, "caption", None) or "").strip()

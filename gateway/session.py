@@ -332,7 +332,8 @@ def build_session_context_prompt(
             "as appropriate. Do not speak as Hermes, an assistant, or an agent; do not "
             "address the owner; and do not include meta commentary such as “draft”, "
             "“I would reply”, or explanations unless the customer asked for them. "
-            "Keep it natural for Telegram."
+            "Keep it natural for Telegram. Observed Telegram Business owner context, "
+            "when present, is context only and not a current customer request."
         )
     elif context.source.platform == Platform.SLACK:
         lines.append("")

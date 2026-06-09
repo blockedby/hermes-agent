@@ -22,6 +22,7 @@ MAX_HISTORY_PREVIEW_CHARS = 500
 
 BUSINESS_HISTORY_EVENT_TYPES = {
     "inbound",
+    "owner_outbound",
     "draft_requested",
     "draft_generated",
     "approval_created",
@@ -52,6 +53,9 @@ _STRING_FIELDS = (
     "approval_id",
     "mode",
     "actor_user_id",
+    "actor_user_name",
+    "classification",
+    "delivery",
     "rule_id",
     "rule_label",
     "status",
