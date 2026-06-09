@@ -93,7 +93,18 @@ All verification/build/test commands below were run in containers only, except h
   - `docker run --rm -v "$PWD:/host:ro" ... hermes-agent:test-runner bash -lc 'rm -rf /tmp/workspace && cp -a /host /tmp/workspace && cd /tmp/workspace && scripts/run_tests.sh tests/test_run_tests_parallel.py tests/tools/test_search_error_guard.py tests/run_agent/test_provider_attribution_headers.py tests/tools/test_mcp_stability.py tests/tools/test_local_interrupt_cleanup.py tests/tools/test_voice_mode.py tests/tools/test_web_providers.py -- -q --tb=short'`
   - Result: `7 files, 126 tests passed, 0 failed`.
   - Fixes covered: permission-denied search diagnostics under root Docker, killed-zombie process assertions in container PID namespaces, lazy STT/Firecrawl optional dependency installs in unit tests, and provider-header tests making live Ollama metadata HTTP calls.
+- Official full Docker runner after the focused fixes:
+  - `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh`
+  - Result: `1405 files, 29840 tests passed, 0 failed` in `399.3s` pytest runner wall time; process completed successfully in `9m 21s` including image build.
+  - Evidence: Docker `[all,dev]` image built successfully, then pytest reached `100% complete` with zero failures.
 
 ## Containerized build attempts
 
-- Full frontend/web/TUI build was not run. The full Docker test image could not complete dependency installation due registry/network failures above. No host npm/uv build/install/lock commands were run.
+- Initial frontend/web/TUI build check attempt:
+  - `docker compose -f docker-compose.test.yml run --rm build-assets`
+  - Result: failed immediately because Compose reused the Python pytest image without Node workspace dependencies and the login shell bypassed the test venv for `python -m build`.
+  - Follow-up fix: `build-assets` now has a separate image tag, documents `--build`, uses `set -euo pipefail`, and activates `$HERMES_TEST_VENV` before running build commands.
+- Full frontend/web/TUI build check after the Compose fix:
+  - `docker compose -f docker-compose.test.yml run --rm --build build-assets`
+  - Result: passed; process completed successfully in `6m 13s`.
+  - Scope: container-only `npm run build --prefix web`, `npm run build --prefix ui-tui`, and `python -m build`. Output included successful Python artifacts: `hermes_agent-0.16.0.tar.gz` and `hermes_agent-0.16.0-py3-none-any.whl`. No host npm/uv build/install/lock commands were run.

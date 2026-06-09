@@ -3,7 +3,7 @@
 # Examples:
 #   docker compose -f docker-compose.test.yml run --rm test
 #   docker compose -f docker-compose.test.yml run --rm test scripts/run_tests.sh tests/hermes_cli/test_gateway.py -q
-#   docker compose -f docker-compose.test.yml run --rm build-assets
+#   docker compose -f docker-compose.test.yml run --rm --build build-assets
 #
 services:
   test:
@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile.test
       args:
         HERMES_DOCKER_INSTALL_NODE_DEPS: "1"
-    image: hermes-agent:test-runner
+    image: hermes-agent:test-runner-assets
     working_dir: /workspace
     environment:
       HERMES_TEST_VENV: /opt/hermes-test-venv
@@ -31,6 +31,8 @@ services:
       - bash
       - -lc
       - |
+        set -euo pipefail
+        source "$$HERMES_TEST_VENV/bin/activate"
         npm run build --prefix web
         npm run build --prefix ui-tui
         python -m build

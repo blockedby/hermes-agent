@@ -109,15 +109,17 @@
   - Slack native slash command generation now prioritizes `/q`, `/bg`, and `/btw` so documented aliases survive Slack's 50-command manifest cap. Focused rerun: `tests/gateway/test_slack.py -k test_app_mention_registered_on_connect` => `1 test passed, 0 failed`.
   - Service/systemd Docker-shape tests now explicitly model host behavior or mock user-systemd preflight, and `Dockerfile.test` provides a `systemctl` stub for slim non-systemd images. Focused rerun: `tests/hermes_cli/test_gateway_wsl.py`, `tests/hermes_cli/test_commands.py`, `tests/hermes_cli/test_gateway_service.py`, `tests/test_live_system_guard_self_test.py` => `4 files, 342 tests passed, 0 failed`.
   - Remaining non-service Docker failures were test-shape issues rather than product regressions: root-readable chmod(000) files, killed zombies under container PID namespaces, lazy optional STT/Firecrawl installs, and live model-metadata HTTP during header unit tests. Focused rerun: `tests/test_run_tests_parallel.py`, `tests/tools/test_search_error_guard.py`, `tests/run_agent/test_provider_attribution_headers.py`, `tests/tools/test_mcp_stability.py`, `tests/tools/test_local_interrupt_cleanup.py`, `tests/tools/test_voice_mode.py`, `tests/tools/test_web_providers.py` => `7 files, 126 tests passed, 0 failed`.
+- Fresh official full Docker verification after those fixes passed: `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh` => `1405 files, 29840 tests passed, 0 failed`.
+- Containerized asset/package build passed after fixing Compose image/venv wiring: `docker compose -f docker-compose.test.yml run --rm --build build-assets` built web, TUI, and Python sdist/wheel successfully.
 
 ## Verdict
-- Status: successful targeted/focused verification with limitations.
-- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests, auth-policy focused tests, and focused official-failure regression tests pass in containers after merge-regression/test-image/test-shape fixes.
-- Remaining limitation: the last official full `[all,dev]` Docker suite run predates the Slack/service/non-service fixes above and reported `42 files with test failures (85 tests failed)`. The main localized clusters visible from that run now pass focused container reruns, but a fresh official full-suite rerun is still needed. Frontend/web/TUI builds remain unproven. No host pytest/npm/uv/build/install commands were run.
+- Status: successful full container verification.
+- Goal state: upstream merge completed and committed; local changes intentionally preserved; targeted runtime tests, auth-policy focused tests, focused official-failure regression tests, the official full Docker `[all,dev]` suite, and containerized web/TUI/Python package builds pass after merge-regression/test-image/test-shape fixes.
+- Remaining limitation: local `main` is still intentionally ahead of and behind `origin/main` because the sync target was the sibling upstream remote state used for this task; a separate remote-sync decision is needed before pushing. No host pytest/npm/uv/build/install commands were run.
 
 ## Next-agent brief
-- Objective: rerun official full verification and run containerized frontend/dashboard/TUI build checks when practical.
+- Objective: prepare/push branch or make the next remote-sync decision.
 - Target: same current `main` `HEAD`.
-- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite, auth-policy focused suite, official-context/update/restart focused suite, Slack focused suite, service/systemd focused suite, and remaining non-service focused suite pass in containers.
-- Boundaries: continue honoring container-only tests/builds/locks.
-- Verification target: rerun official `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh` after these focused fixes; classify/fix only current-goal regressions; run containerized frontend/dashboard/TUI build checks when practical.
+- Settled: do not reintroduce `b39b67f24`; upstream target is already merged; conflicts are resolved; targeted Python runtime suite, auth-policy focused suite, official-context/update/restart focused suite, Slack focused suite, service/systemd focused suite, remaining non-service focused suite, official full Docker suite, and containerized build-assets suite pass.
+- Boundaries: continue honoring container-only tests/builds/locks unless the user changes that constraint.
+- Verification target if further source changes occur: rerun affected focused Docker tests plus `HERMES_TEST_WORKERS=4 scripts/run_tests_docker.sh` as needed.
