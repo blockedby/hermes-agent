@@ -1205,3 +1205,23 @@ Executor:
   - Settings PATCH body contains exactly allowed settings keys: covered by updated route-handler exact body assertion, passed.
   - Settings PATCH body excludes `actorUserId`, `initData`, and `unknownKey`: covered by updated route-handler negative assertions, passed.
 - Final local done-state for this subtask: ready for PR/deploy pipeline; live Vercel verification was out of scope for this local container-only fix.
+
+## Operator feedback — draft approval visibility and internal chatter (2026-06-10)
+
+Captured from live production smoke after the dashboard settings save fix.
+
+Observed gaps:
+- A generated Business draft can appear in the main Telegram/group approval flow but is not clearly visible in the Business dashboard chat detail UI as the active pending draft/approval.
+- The gateway may send internal/meta status text into chat, e.g. self-improvement/reflection snippets such as "User profile updated" or similar profile/skill update chatter. These internal runtime notes should not be emitted into Telegram Business/customer-facing or owner approval threads.
+- The current approval UX should duplicate the same draft confirmation surface in both places:
+  - the main Telegram owner thread / approval message, and
+  - the Business dashboard admin chat detail.
+
+Follow-up acceptance criteria:
+- When Hermes creates a draft for a Business dialog, the dashboard chat detail shows the pending draft text, status, and approve/deny/send controls or an equivalent confirmation panel without requiring the operator to find the Telegram approval message.
+- The Telegram approval message and dashboard approval panel refer to the same underlying approval/draft id and stay consistent after approve, deny, send, failure, or refresh.
+- Internal agent/runtime chatter (memory/profile updates, self-improvement reflections, skill-created notices, debug/status prose) is suppressed from Telegram Business/customer-facing sends and from owner approval messages unless explicitly requested by the operator.
+- Tests cover dashboard visibility of pending approvals/drafts and suppression of internal meta messages in Business delivery paths.
+
+Priority:
+- Treat as a follow-up UX/runtime correctness slice before declaring the Business dashboard ready for daily use.
