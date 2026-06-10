@@ -31,6 +31,7 @@ BUSINESS_HISTORY_EVENT_TYPES = {
     "approval_failed",
     "approval_partial",
     "outbound_sent",
+    "outbound_failed",
     "mode_changed",
     "settings_changed",
     "rule_matched",

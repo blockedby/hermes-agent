@@ -1071,3 +1071,22 @@ Evidence from delegated slice:
 
 Limitations / side findings:
 - No live Telegram WebApp/browser smoke was run for this slice; component tests cover the compact settings card behavior.
+
+## Execution update — Task 10 mode/direct cleanup (2026-06-10)
+
+Status: implementation done for auto/draft/direct behavior cleanup; awaiting owner acceptance/audit.
+
+Scope completed:
+- Kept dashboard draft requests approval-safe: response remains `sentToCustomer: false`, and the queued draft event has no one-shot auto/direct marker.
+- Preserved `mention_direct` as one-shot direct behavior without persistent mode changes when reply permission allows.
+- Added fail-closed behavior for `can_reply=false` auto/direct paths: no customer-facing direct-send attempt is made, owner is notified when configured, and dashboard history records `outbound_failed` with status `business_reply_permission_disabled`.
+- Added an explicit `outbound_failed` Telegram Business history event type for direct-send failures.
+
+Evidence:
+- Implementer report: `reports/aad-implementer-task-10.md`.
+- Focused RED before implementation: `tests/gateway/test_telegram_business.py -k 'can_reply_false'` failed because mention_direct still enqueued and auto direct failure lacked owner/history visibility.
+- Container targeted verification: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py -- -q` — passed, 2 files / 133 tests.
+- Container quality checks: `python -m py_compile` on touched modules/tests — passed; `python -m ruff check` on touched modules/tests — passed.
+
+Limitations / side findings:
+- No live Telegram API smoke was run; tests use mocked Bot API permission/send contracts as planned.

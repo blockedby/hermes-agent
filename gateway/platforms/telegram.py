@@ -1580,6 +1580,57 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = await self._bot.send_message(**kwargs)
         return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
 
+    async def _notify_business_direct_send_blocked(
+        self,
+        entry: Dict[str, Any],
+        *,
+        source: str,
+        preview: str,
+        status: str = "business_reply_permission_disabled",
+        message_id: Any = None,
+    ) -> None:
+        """Record and owner-notify a blocked Business direct-send attempt."""
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "outbound_failed",
+                "status": status,
+                "source": source,
+                "preview": preview,
+                "message_id": message_id,
+                "created_at": time.time(),
+            },
+        )
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id or not self._bot:
+            return
+        business_connection_id = str(entry.get("business_connection_id") or "").strip()
+        customer_chat_id = str(entry.get("customer_chat_id", entry.get("chat_id")) or "").strip()
+        safe_preview = TelegramBusinessHistoryStore.preview(str(preview or ""), 700)
+        parts = [
+            "💼 Telegram Business direct reply suppressed",
+            "",
+            f"Customer chat: {customer_chat_id or 'unknown'}",
+            f"Business connection: {business_connection_id or 'unknown'}",
+            f"Source: {source}",
+            "",
+            "Telegram reports that this bot cannot currently reply for that Business connection.",
+        ]
+        if safe_preview:
+            parts.extend(["", "Draft/request:", safe_preview])
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": "\n".join(parts),
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
+        try:
+            await self._bot.send_message(**kwargs)
+        except Exception as exc:
+            logger.error("[%s] Failed to send Telegram Business direct-send failure notice: %s", self.name, exc, exc_info=True)
+
     async def _send_business_direct_text(
         self,
         *,
@@ -1588,9 +1639,20 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not await self._ensure_business_reply_allowed(business_connection_id):
-            return SendResult(success=False, error="business_reply_permission_disabled", retryable=False)
         direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
+        history_entry = {
+            "business_connection_id": str(business_connection_id),
+            "customer_chat_id": str(chat_id),
+            "direct_messages_topic_id": direct_topic_id,
+        }
+        if not await self._ensure_business_reply_allowed(business_connection_id):
+            await self._notify_business_direct_send_blocked(
+                history_entry,
+                source=str((metadata or {}).get("business_mode") or "auto"),
+                preview=content,
+                message_id=(metadata or {}).get("inbound_message_id"),
+            )
+            return SendResult(success=False, error="business_reply_permission_disabled", retryable=False)
         profile = self._business_profile_for_send(
             chat_id=chat_id,
             business_connection_id=business_connection_id,
@@ -1611,11 +1673,6 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = str(getattr(msg, "message_id", "") or "")
             if message_id:
                 sent.append(message_id)
-        history_entry = {
-            "business_connection_id": str(business_connection_id),
-            "customer_chat_id": str(chat_id),
-            "direct_messages_topic_id": self._metadata_direct_messages_topic_id(metadata),
-        }
         self._record_business_history_event(
             history_entry,
             {
@@ -7725,6 +7782,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             invocation_mode = None
                         elif invocation_mode:
                             mode = invocation_mode
+                        if mode == "auto" and not await self._ensure_business_reply_allowed(connection_id):
+                            await self._notify_business_direct_send_blocked(
+                                entry,
+                                source="mention_direct" if invocation_mode == "auto" else "auto",
+                                preview=self._business_message_preview(message),
+                                message_id=getattr(message, "message_id", None),
+                            )
+                            raise ApplicationHandlerStop
                         media_event = None
                         if has_media and mode in {"draft", "auto"}:
                             media_event = await self._prepare_telegram_media_event(

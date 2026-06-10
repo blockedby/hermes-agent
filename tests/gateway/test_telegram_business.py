@@ -925,6 +925,43 @@ async def test_business_mention_direct_marks_one_shot_direct_send_without_persis
 
 
 @pytest.mark.asyncio
+async def test_business_mention_direct_can_reply_false_notifies_owner_without_enqueue_or_persisting_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_can_reply["bc-mention-denied"] = False
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-denied",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-denied", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=896,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot please send directly", connection_id="bc-mention-denied"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "business_connection_id" not in kwargs
+    assert "cannot currently reply" in kwargs["text"]
+    assert adapter._business_chat_registry.find_by_token(entry["token"])[1]["mode"] == "watch"
+    history_event = adapter._business_history_store.list_events("bc-mention-denied|12345|")[0]
+    assert history_event["type"] == "outbound_failed"
+    assert history_event["status"] == "business_reply_permission_disabled"
+    assert history_event["source"] == "mention_direct"
+
+
+@pytest.mark.asyncio
 async def test_business_mention_does_not_trigger_without_configured_bot_username():
     adapter = _make_adapter(owner_chat_id="999")
     adapter._bot.username = "configuredbot"
@@ -1731,6 +1768,32 @@ async def test_business_auto_mode_sends_direct_customer_message():
     assert kwargs["chat_id"] == 12345
     assert kwargs["business_connection_id"] == "bc-1"
     assert kwargs["text"] == "🤖 Hermes: Auto reply"
+
+
+@pytest.mark.asyncio
+async def test_business_auto_mode_can_reply_false_notifies_owner_and_records_history_without_customer_send():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_can_reply["bc-1"] = False
+
+    result = await adapter.send(
+        "12345",
+        "Auto reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto", "inbound_message_id": "55"},
+    )
+
+    assert result.success is False
+    assert result.error == "business_reply_permission_disabled"
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "business_connection_id" not in kwargs
+    assert "cannot currently reply" in kwargs["text"]
+    assert "Auto reply" in kwargs["text"]
+    [history_event] = adapter._business_history_store.list_events("bc-1|12345|")
+    assert history_event["type"] == "outbound_failed"
+    assert history_event["status"] == "business_reply_permission_disabled"
+    assert history_event["source"] == "auto"
+    assert history_event["message_id"] == "55"
 
 
 @pytest.mark.asyncio

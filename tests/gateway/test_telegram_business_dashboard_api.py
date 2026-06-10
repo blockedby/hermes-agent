@@ -498,6 +498,8 @@ def test_draft_request_enqueues_latest_message_without_sending_customer_text(reg
     event, chat_entry, actor_user_id, reason = calls[0]
     assert event.text == "Please draft this"
     assert event.metadata["business_dashboard_prompt"] == "focus on warranty"
+    assert event.metadata.get("business_mode") is None
+    assert getattr(event.source, "business_invocation_mode", None) is None
     assert "focus on warranty" in event.channel_context
     assert chat_entry["token"] == entry["token"]
     assert actor_user_id == "4242"
