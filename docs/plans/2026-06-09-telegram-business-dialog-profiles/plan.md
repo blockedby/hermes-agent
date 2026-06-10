@@ -1090,3 +1090,28 @@ Evidence:
 
 Limitations / side findings:
 - No live Telegram API smoke was run; tests use mocked Bot API permission/send contracts as planned.
+
+## Execution update — Task 11 docs/config surface (2026-06-10)
+
+Status: complete for docs scope.
+
+Scope completed:
+- Updated Telegram user guide docs to describe DB-backed Telegram Business dialog profiles.
+- Documented dashboard settings UI, Telegram bot **🧠 Prompt** and **🧹 Clear prompt** buttons, three participant prompt model, command safety, visible prefix, modes, and `invocation_policy`.
+- No runtime code changes were included in this docs slice.
+
+Evidence:
+- Slice report: `reports/slice-docs.md`.
+- Static docs acceptance read found required topics (`DB-backed`, source of truth, Prompt/Clear prompt, `invocation_policy`, customer text/manual outgoing behavior).
+- Container website build attempt: `docker run --rm -v "$PWD":/workspace -w /workspace/website hermes-agent:test-runner-assets npm run build` failed because the available image lacks Docusaurus dependencies (`docusaurus: not found`). No host npm/pytest/uv commands were run.
+
+Limitations / side findings:
+- Full website build remains unverified pending a container image with website dependencies.
+
+## Final targeted verification after Task 10/11 integration (2026-06-10)
+
+Container-only checks:
+- `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business_profiles.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_session.py tests/gateway/test_telegram_business.py -- -q` — passed, 4 files / 225 tests.
+- `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets sh -lc 'npm run test:auth && npm run typecheck && npm run lint'` — passed; dashboard tests 6 files / 46 tests, then typecheck, then lint.
+
+No host pytest/npm/uv commands were run.
