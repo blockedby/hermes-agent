@@ -10,17 +10,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms import telegram as telegram_mod
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
+from gateway.platforms import base as platform_base
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
 from gateway.run import GatewayRunner
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
     SessionSource,
+    build_session_context,
+    build_session_context_prompt,
     build_session_key,
 )
 from telegram.constants import ChatType
@@ -51,6 +55,7 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._business_history_store = TelegramBusinessHistoryStore(
         Path(tempfile.mkdtemp(prefix="telegram-business-history-")) / "business_history.json"
     )
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
     adapter._business_pending_rule_tokens = {}
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -115,6 +120,16 @@ def _make_photo(data: bytes = b"photo-bytes", file_path: str = "photos/photo.jpg
     return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
 
 
+def _inline_button_field(button, field: str):
+    value = getattr(button, field, None)
+    if value is not None:
+        return value
+    to_dict = getattr(button, "to_dict", None)
+    if callable(to_dict):
+        return to_dict().get(field)
+    return None
+
+
 def _make_voice(data: bytes = b"voice-bytes", file_path: str = "voice/file.ogg"):
     return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
 
@@ -164,6 +179,67 @@ def _gateway_runner_for_metadata() -> GatewayRunner:
     return object.__new__(GatewayRunner)
 
 
+def _business_source(*, thread_id: str = "business:bc-1") -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="67890",
+        user_name="Customer User",
+        thread_id=thread_id,
+        chat_topic="Telegram Business",
+    )
+
+
+def _owner_dm_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        chat_type="dm",
+        user_id="999",
+        user_name="Owner",
+    )
+
+
+def _gateway_runner_for_command_dispatch(source: SessionSource):
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())}
+    runner.session_store = MagicMock()
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_key_for_source = MagicMock(return_value=build_session_key(source))
+    runner._update_prompt_pending = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._check_slash_access = MagicMock(return_value=None)
+    runner._is_telegram_topic_root_lobby = MagicMock(return_value=False)
+    runner._handle_status_command = AsyncMock(side_effect=AssertionError("/status must not dispatch"))
+    runner._handle_help_command = AsyncMock(side_effect=AssertionError("/help must not dispatch"))
+    runner._handle_approve_command = AsyncMock(side_effect=AssertionError("/approve must not dispatch"))
+    runner._handle_deny_command = AsyncMock(side_effect=AssertionError("/deny must not dispatch"))
+    runner._handle_restart_command = AsyncMock(side_effect=AssertionError("/restart must not dispatch"))
+    runner._handle_business_command = AsyncMock(return_value="business ok")
+    runner._handle_reset_command = AsyncMock(return_value="reset ok")
+    runner._maybe_confirm_destructive_slash = AsyncMock(
+        side_effect=AssertionError("destructive slash confirm must not dispatch")
+    )
+    runner._interrupt_and_clear_session = AsyncMock(
+        side_effect=AssertionError("/stop must not interrupt Business sessions")
+    )
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(side_effect=AssertionError("command hook must not dispatch")),
+        loaded_hooks=False,
+    )
+    return runner
+
+
+async def _execute_confirmed_slash(**kwargs):
+    return await kwargs["execute"]()
+
+
 def test_business_thread_metadata_does_not_treat_connection_marker_as_dm_topic():
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -193,6 +269,20 @@ def test_business_thread_metadata_extracts_numeric_direct_topic_marker():
     }
 
 
+def test_business_thread_metadata_includes_one_shot_invocation_mode():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="business:bc-1",
+    )
+    source.business_invocation_mode = "auto"
+
+    metadata = _gateway_runner_for_metadata()._thread_metadata_for_source(source, reply_to_message_id="55")
+
+    assert metadata == {"thread_id": "business:bc-1", "business_mode": "auto"}
+
+
 def test_normal_dm_topic_metadata_still_uses_numeric_direct_topic_fallback():
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -210,6 +300,174 @@ def test_normal_dm_topic_metadata_still_uses_numeric_direct_topic_fallback():
         "direct_messages_topic_id": "338575",
         "telegram_reply_to_message_id": "55",
     }
+
+
+def _upsert_business_profile(
+    adapter: TelegramAdapter,
+    *,
+    business_connection_id: str = "bc-1",
+    customer_chat_id: str = "12345",
+    direct_messages_topic_id: str | None = None,
+    assistant_prefix: str | None = None,
+    invocation_policy: str | None = None,
+):
+    updates = {}
+    if assistant_prefix is not None:
+        updates["assistant_prefix"] = assistant_prefix
+    if invocation_policy is not None:
+        updates["invocation_policy"] = invocation_policy
+    return adapter._business_profile_store.upsert_for_chat_entry(
+        {
+            "business_connection_id": business_connection_id,
+            "customer_chat_id": customer_chat_id,
+            "direct_messages_topic_id": direct_messages_topic_id,
+        },
+        updates=updates,
+    )
+
+
+def test_business_runtime_attaches_matching_database_profile_only():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    entry_a, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-a",
+        customer_chat_id="111",
+        direct_messages_topic_id="10",
+        text="hello from A",
+        display_name="Alice A",
+        username="alice_a",
+        user_id="7001",
+        user_name="Alice A",
+    )
+    entry_b, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-b",
+        customer_chat_id="222",
+        direct_messages_topic_id="20",
+        text="hello from B",
+        display_name="Bob B",
+        username="bob_b",
+        user_id="7002",
+        user_name="Bob B",
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_a,
+        updates={
+            "assistant_display_name": "A-Hermes",
+            "assistant_prefix": "A:",
+            "dialog_prompt": "Profile prompt for chat A only.",
+            "dialog_notes": "A private notes.",
+        },
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_b,
+        updates={
+            "assistant_display_name": "B-Hermes",
+            "assistant_prefix": "B:",
+            "dialog_prompt": "Profile prompt for chat B only.",
+            "dialog_notes": "B private notes.",
+        },
+    )
+    runner = _gateway_runner_for_metadata()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    event = MessageEvent(
+        text="Customer asks a question",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_name="Alice A",
+            chat_type="dm",
+            user_id="7001",
+            user_name="Alice A",
+            thread_id="business:bc-a:topic:10",
+            chat_topic="Telegram Business",
+        ),
+    )
+
+    runner._attach_telegram_business_profile_context(event)
+    ctx = build_session_context(
+        event.source,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}),
+    )
+    prompt = build_session_context_prompt(ctx)
+
+    assert event.source.business_context["profile"]["dialog_prompt"] == "Profile prompt for chat A only."
+    assert event.source.business_context["customer"]["username"] == "alice_a"
+    assert "Profile prompt for chat A only." in prompt
+    assert "A private notes." in prompt
+    assert "@alice_a" in prompt
+    assert "Profile prompt for chat B only." not in prompt
+    assert "B private notes." not in prompt
+
+
+def test_business_profile_change_affects_only_matching_dialog_prompt_signature():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    entry_a, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-a",
+        customer_chat_id="111",
+        text="hello from A",
+        display_name="Alice A",
+        username="alice_a",
+        user_id="7001",
+        user_name="Alice A",
+    )
+    entry_b, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-b",
+        customer_chat_id="222",
+        text="hello from B",
+        display_name="Bob B",
+        username="bob_b",
+        user_id="7002",
+        user_name="Bob B",
+    )
+    profile_a = adapter._business_profile_store.upsert_for_chat_entry(
+        entry_a,
+        updates={"dialog_prompt": "Initial chat A prompt."},
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_b,
+        updates={"dialog_prompt": "Stable chat B prompt."},
+    )
+    runner = _gateway_runner_for_metadata()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+
+    def prompt_for(chat_id: str, thread_id: str) -> str:
+        event = MessageEvent(
+            text="Customer turn text that must not enter system prompt",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=chat_id,
+                chat_type="dm",
+                thread_id=thread_id,
+                chat_topic="Telegram Business",
+            ),
+        )
+        runner._attach_telegram_business_profile_context(event)
+        return build_session_context_prompt(build_session_context(event.source, config))
+
+    prompt_a_before = prompt_for("111", "business:bc-a")
+    prompt_b_before = prompt_for("222", "business:bc-b")
+    sig_a_before = GatewayRunner._agent_config_signature("model", {}, [], prompt_a_before)
+    sig_b_before = GatewayRunner._agent_config_signature("model", {}, [], prompt_b_before)
+
+    adapter._business_profile_store.update_by_token(
+        profile_a["token"],
+        {"dialog_prompt": "Updated chat A prompt."},
+    )
+
+    prompt_a_after = prompt_for("111", "business:bc-a")
+    prompt_b_after = prompt_for("222", "business:bc-b")
+    sig_a_after = GatewayRunner._agent_config_signature("model", {}, [], prompt_a_after)
+    sig_b_after = GatewayRunner._agent_config_signature("model", {}, [], prompt_b_after)
+
+    assert "Initial chat A prompt." in prompt_a_before
+    assert "Updated chat A prompt." in prompt_a_after
+    assert sig_a_before != sig_a_after
+    assert prompt_b_before == prompt_b_after
+    assert sig_b_before == sig_b_after
+    assert "Updated chat A prompt." not in prompt_b_after
+    assert "Customer turn text that must not enter system prompt" not in prompt_a_after
 
 
 def _approval_entry(**overrides):
@@ -510,6 +768,282 @@ async def test_business_watch_chat_notifies_owner_without_agent():
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert "Telegram Business watch" in kwargs["text"]
     assert "business_connection_id" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_business_customer_text_slash_command_is_ignored_before_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-command",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=889,
+        business_connection=None,
+        business_message=_business_message(text="  /new@HermesBot please", connection_id="bc-command"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_media_caption_slash_command_is_ignored_before_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-caption-command",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        caption="  /restart@HermesBot please",
+        connection_id="bc-caption-command",
+        photo=[_make_photo()],
+    )
+    update = SimpleNamespace(
+        update_id=890,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=AssertionError("media command should not be prepared")):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_mention_policy_off_preserves_watch_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-off",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-off", invocation_policy="off")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=891,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot please help", connection_id="bc-mention-off"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_awaited_once()
+    assert "Telegram Business watch" in adapter._bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_business_mention_draft_queues_approval_safe_draft_from_watch_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-draft",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-draft", invocation_policy="mention_draft")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=892,
+        business_connection=None,
+        business_message=_business_message(text="hello @HeRmEsBoT,\nplease draft", connection_id="bc-mention-draft"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._bot.send_message.assert_not_called()
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert getattr(event.source, "business_invocation_mode", None) == "draft"
+    assert event.text == "hello please draft"
+    assert adapter._business_chat_registry.find_by_token(entry["token"])[1]["mode"] == "watch"
+
+
+@pytest.mark.asyncio
+async def test_business_mention_direct_marks_one_shot_direct_send_without_persisting_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter, "bc-mention-direct")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-direct",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-direct", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=893,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot: respond directly", connection_id="bc-mention-direct"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert getattr(event.source, "business_invocation_mode", None) == "auto"
+    assert adapter._business_chat_registry.find_by_token(entry["token"])[1]["mode"] == "watch"
+
+    metadata = platform_base._thread_metadata_for_source(event.source, reply_to_message_id=event.message_id)
+    assert metadata == {"thread_id": "business:bc-mention-direct", "business_mode": "auto"}
+    await adapter.send("12345", "Direct reply", metadata=metadata)
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["business_connection_id"] == "bc-mention-direct"
+    assert call_kwargs["text"] == "🤖 Hermes: Direct reply"
+
+
+@pytest.mark.asyncio
+async def test_business_mention_direct_can_reply_false_notifies_owner_without_enqueue_or_persisting_mode():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_can_reply["bc-mention-denied"] = False
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-denied",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-denied", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=896,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot please send directly", connection_id="bc-mention-denied"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "business_connection_id" not in kwargs
+    assert "cannot currently reply" in kwargs["text"]
+    assert adapter._business_chat_registry.find_by_token(entry["token"])[1]["mode"] == "watch"
+    history_event = adapter._business_history_store.list_events("bc-mention-denied|12345|")[0]
+    assert history_event["type"] == "outbound_failed"
+    assert history_event["status"] == "business_reply_permission_disabled"
+    assert history_event["source"] == "mention_direct"
+
+
+@pytest.mark.asyncio
+async def test_business_mention_does_not_trigger_without_configured_bot_username():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._bot.username = "configuredbot"
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-alias",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-alias", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=894,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot please help", connection_id="bc-mention-alias"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_awaited_once()
+    assert "Telegram Business watch" in adapter._bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_business_mention_does_not_trigger_when_bot_username_is_unknown():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._bot.username = ""
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-unknown",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "watch")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-unknown", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=895,
+        business_connection=None,
+        business_message=_business_message(text="@HermesBot please help", connection_id="bc-mention-unknown"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_awaited_once()
+    assert "Telegram Business watch" in adapter._bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_business_slash_command_with_mention_is_blocked_even_when_invocation_enabled():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-mention-slash",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    _upsert_business_profile(adapter, business_connection_id="bc-mention-slash", invocation_policy="mention_direct")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=895,
+        business_connection=None,
+        business_message=_business_message(text="/restart@HermesBot please", connection_id="bc-mention-slash"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -929,6 +1463,171 @@ async def test_business_mode_callback_requires_owner_and_updates_mode():
     denied.edit_message_text.assert_not_called()
 
 
+def test_business_mode_keyboard_contains_prompt_controls(monkeypatch):
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardButton",
+        lambda text, callback_data=None, **kwargs: SimpleNamespace(text=text, callback_data=callback_data, **kwargs),
+    )
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+
+    keyboard = adapter._business_mode_keyboard(entry)
+    watch_keyboard = adapter._business_mode_keyboard(entry, watch_actions=True)
+    buttons = {
+        (_inline_button_field(button, "text"), _inline_button_field(button, "callback_data"))
+        for row in keyboard.inline_keyboard + watch_keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert ("🧠 Prompt", f"bm:p:{token}") in buttons
+    assert ("🧹 Clear prompt", f"bm:pc:{token}") in buttons
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_button_stores_next_owner_text_as_dialog_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_pending_prompt_tokens
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited()
+
+    owner_msg = _telegram_message(text="Answer warmly and mention the warranty.")
+    owner_msg.chat.id = 999
+    owner_msg.from_user.id = 999
+    update = SimpleNamespace(message=owner_msg, update_id=707, business_message=None, effective_message=owner_msg)
+    await adapter._handle_text_message(update, None)
+
+    assert adapter._business_pending_prompt_tokens == {}
+    profile = adapter._business_profile_store.get_by_token(token)
+    assert profile is not None
+    assert profile["dialog_prompt"] == "Answer warmly and mention the warranty."
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    events = adapter._business_history_store.list_events(key)
+    assert any(event["type"] == "settings_changed" and event["actor_user_id"] == "999" and event["fields"] == ["dialog_prompt"] for event in events)
+    assert adapter._pending_text_batches == {}
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_cancel_does_not_save_dialog_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._business_profile_store.upsert_for_chat_entry(entry, updates={"dialog_prompt": "Keep me."})
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    owner_msg = _telegram_message(text="/cancel")
+    owner_msg.chat.id = 999
+    owner_msg.from_user.id = 999
+    update = SimpleNamespace(message=owner_msg, update_id=708, business_message=None, effective_message=owner_msg)
+    await adapter._handle_command(update, None)
+
+    assert adapter._business_pending_prompt_tokens == {}
+    assert adapter._business_profile_store.get_by_token(token)["dialog_prompt"] == "Keep me."
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    assert not any(event["type"] == "settings_changed" for event in adapter._business_history_store.list_events(key))
+
+
+@pytest.mark.asyncio
+async def test_business_clear_prompt_button_writes_empty_prompt_and_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._business_profile_store.upsert_for_chat_entry(entry, updates={"dialog_prompt": "Existing prompt."})
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:pc:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_profile_store.get_by_token(token)["dialog_prompt"] == ""
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    events = adapter._business_history_store.list_events(key)
+    assert any(event["type"] == "settings_changed" and event["actor_user_id"] == "999" and event["fields"] == ["dialog_prompt"] for event in events)
+    query.answer.assert_awaited_with(text="Prompt cleared.")
+    query.edit_message_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_callback_rejects_unauthorized_user_without_pending_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=False)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=111, first_name="Other"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    query.answer.assert_awaited_with(text="⛔ You are not authorized to manage Business chats.")
+    query.edit_message_text.assert_not_called()
+    assert getattr(adapter, "_business_pending_prompt_tokens", {}) == {}
+    assert adapter._business_profile_store.get_by_token(token) is None
+
+
 @pytest.mark.asyncio
 async def test_business_add_rule_button_stores_next_owner_text_as_notify_rule():
     adapter = _make_adapter(owner_chat_id="999")
@@ -1068,7 +1767,102 @@ async def test_business_auto_mode_sends_direct_customer_message():
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert kwargs["chat_id"] == 12345
     assert kwargs["business_connection_id"] == "bc-1"
-    assert kwargs["text"] == "Auto reply"
+    assert kwargs["text"] == "🤖 Hermes: Auto reply"
+
+
+@pytest.mark.asyncio
+async def test_business_auto_mode_can_reply_false_notifies_owner_and_records_history_without_customer_send():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_can_reply["bc-1"] = False
+
+    result = await adapter.send(
+        "12345",
+        "Auto reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto", "inbound_message_id": "55"},
+    )
+
+    assert result.success is False
+    assert result.error == "business_reply_permission_disabled"
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 999
+    assert "business_connection_id" not in kwargs
+    assert "cannot currently reply" in kwargs["text"]
+    assert "Auto reply" in kwargs["text"]
+    [history_event] = adapter._business_history_store.list_events("bc-1|12345|")
+    assert history_event["type"] == "outbound_failed"
+    assert history_event["status"] == "business_reply_permission_disabled"
+    assert history_event["source"] == "auto"
+    assert history_event["message_id"] == "55"
+
+
+@pytest.mark.asyncio
+async def test_business_auto_send_applies_database_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Custom:")
+
+    result = await adapter.send(
+        "12345",
+        "Auto reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "🤖 Custom: Auto reply"
+
+
+@pytest.mark.asyncio
+async def test_business_send_does_not_double_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Custom:")
+
+    result = await adapter.send(
+        "12345",
+        "🤖 Custom: Already labeled",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "🤖 Custom: Already labeled"
+
+
+@pytest.mark.asyncio
+async def test_business_send_empty_database_prefix_disables_visible_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="")
+
+    result = await adapter.send(
+        "12345",
+        "Unmarked reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "Unmarked reply"
+
+
+@pytest.mark.asyncio
+async def test_business_send_preserves_chunk_limit_after_prefixing():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Long:")
+
+    result = await adapter.send(
+        "12345",
+        "x" * adapter.MAX_MESSAGE_LENGTH,
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    first_chunk = adapter._bot.send_message.call_args_list[0].kwargs["text"]
+    assert first_chunk.startswith("🤖 Long: ")
+    assert telegram_mod.utf16_len(first_chunk) <= adapter.MAX_MESSAGE_LENGTH
 
 
 @pytest.mark.asyncio
@@ -1147,6 +1941,35 @@ async def test_business_approval_send_writes_gateway_audit_session(monkeypatch):
     assert payload["audit_session_key"] == TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
     assert payload["origin_session_key"] == "agent:main:telegram:dm:12345:business:bc-1"
     assert payload["sent_message_ids"] == ["101"]
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_applies_database_prefix():
+    adapter = _make_adapter()
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Approved:")
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(draft="Approved text")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=None,
+            message_id=101,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 12345
+    assert call_kwargs["business_connection_id"] == "bc-1"
+    assert call_kwargs["text"] == "🤖 Approved: Approved text"
+    query.answer.assert_awaited_with(text="Sent")
 
 
 def test_business_thread_id_helpers_include_direct_messages_topic_identity():
@@ -1705,7 +2528,7 @@ async def test_business_approval_send_uses_business_connection_id():
     call_kwargs = adapter._bot.send_message.call_args.kwargs
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     query.answer.assert_awaited_with(text="Sent")
 
 
@@ -1737,7 +2560,7 @@ async def test_business_approval_send_ignores_corrupt_non_numeric_direct_topic_i
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
     assert "direct_messages_topic_id" not in call_kwargs
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     query.answer.assert_awaited_with(text="Sent")
 
 
@@ -1783,7 +2606,7 @@ async def test_business_approval_callback_uses_stored_entry_without_current_owne
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
     assert call_kwargs["direct_messages_topic_id"] == 338575
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     assert "approve-1" not in adapter._business_approval_state
     query.answer.assert_awaited_with(text="Sent")
 
@@ -2283,6 +3106,70 @@ async def test_business_slash_confirm_routes_to_owner_not_customer():
     assert "business_connection_id" not in call_kwargs
     assert "Reload MCP?" in call_kwargs["text"]
     assert adapter._slash_confirm_state == {"c1": "agent:main:telegram:dm:12345:business:bc-1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/restart", "/stop", "/status", "/help", "/approve", "/deny"])
+async def test_gateway_blocks_business_customer_slash_commands_before_dispatch(command):
+    source = _business_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    event = MessageEvent(text=command, source=source, message_id="m-command")
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner.hooks.emit_collect.assert_not_called()
+    runner._handle_reset_command.assert_not_called()
+    runner._handle_restart_command.assert_not_called()
+    runner._handle_status_command.assert_not_called()
+    runner._handle_help_command.assert_not_called()
+    runner._handle_approve_command.assert_not_called()
+    runner._handle_deny_command.assert_not_called()
+    runner._interrupt_and_clear_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_business_stop_does_not_interrupt_active_session():
+    source = _business_source(thread_id="business:bc-active")
+    runner = _gateway_runner_for_command_dispatch(source)
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+    runner._running_agents_ts[session_key] = time.time()
+    event = MessageEvent(text="/stop", source=source, message_id="m-stop")
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    running_agent.interrupt.assert_not_called()
+    runner._interrupt_and_clear_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_normal_telegram_dm_new_still_dispatches():
+    source = _owner_dm_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    runner._maybe_confirm_destructive_slash = AsyncMock(side_effect=_execute_confirmed_slash)
+    event = MessageEvent(text="/new", source=source, message_id="m-new")
+
+    result = await runner._handle_message(event)
+
+    assert result == "reset ok"
+    runner._handle_reset_command.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_gateway_owner_business_control_command_still_dispatches():
+    source = _owner_dm_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    event = MessageEvent(text="/business", source=source, message_id="m-business")
+
+    result = await runner._handle_message(event)
+
+    assert result == "business ok"
+    runner._handle_business_command.assert_awaited_once_with(event)
 
 
 def test_business_customer_source_bypasses_gateway_user_pairing_auth():

@@ -66,8 +66,17 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         return None
     metadata = {"thread_id": thread_id}
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
-        metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
+        if tid.startswith("business:"):
+            match = re.search(r":topic:(\d+)\s*$", tid)
+            if match:
+                metadata["direct_messages_topic_id"] = match.group(1)
+            business_mode = str(getattr(source, "business_invocation_mode", "") or "").strip().lower()
+            if business_mode in {"draft", "auto"}:
+                metadata["business_mode"] = business_mode
+            return metadata
+
+        metadata["telegram_dm_topic_reply_fallback"] = True
         if tid and tid not in {"", "1"}:
             metadata["direct_messages_topic_id"] = tid
         anchor = reply_to_message_id or getattr(source, "message_id", None)

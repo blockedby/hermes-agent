@@ -1,0 +1,9 @@
+# AAD implementer progress — Task 5 send prefix
+
+- 2026-06-10: Started in `/tmp/pi-worktree-9b23516e-2` on branch `pi-parallel-9b23516e-2`.
+- 2026-06-10: Read AGENTS/CLAUDE guidance, plan Task 5 scope, profile store, Telegram send/approval paths, and focused test file. `git status --short` showed existing untracked `docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/slice-owner-task5.md`; leaving it untouched.
+- 2026-06-10: Plan: add focused failing tests for DB prefix/default/double-prefix/empty/long prefix limit, then add minimal Telegram send-time prefix helper used by direct auto-send and approval callback send path, then run container-only targeted checks.
+- 2026-06-10: RED tests added/updated in `tests/gateway/test_telegram_business.py`, including in-memory `TelegramBusinessDialogProfileStore` injection. Repo Docker build command failed during dependency download (`google-api-core` connection reset), so used existing `hermes-agent:test-runner` image with bind-mounted worktree and repo `scripts/run_tests.sh` inside the container. RED focused run failed as expected: direct sends lacked `🤖 Hermes:`/custom prefix and long first chunk lacked prefix; approval prefix test was adjusted to include the stored approval message id for callback-context matching.
+- 2026-06-10: Implemented minimal Telegram Business send-time prefix helpers and wired them into direct auto-send and approval callback chunking before Telegram length splitting. Focused GREEN container run passed: 6 selected tests.
+- 2026-06-10: Broader container-only touched file check passed: `tests/gateway/test_telegram_business.py` — 98 passed. Container ruff check passed for `gateway/platforms/telegram.py` and `tests/gateway/test_telegram_business.py`.
+- 2026-06-10: Committed implementation as `6be69d0e0 feat(telegram): prefix business sends`. Wrote final implementation report to `reports/aad-implementer-task5-send-prefix.md`; committing report/progress update next.

@@ -1,9 +1,70 @@
+import type * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@base-ui/react/button", () => ({
+  Button: ({ className, ...props }: React.ComponentProps<"button">) => <button className={className} {...props} />,
+}));
+
+vi.mock("@base-ui/react/merge-props", () => ({
+  mergeProps: (...props: Array<Record<string, unknown>>) => Object.assign({}, ...props),
+}));
+
+vi.mock("@base-ui/react/use-render", () => ({
+  useRender: ({ defaultTagName, props }: { defaultTagName: keyof React.JSX.IntrinsicElements; props: Record<string, unknown> }) => {
+    const Tag = defaultTagName;
+    return <Tag {...props} />;
+  },
+}));
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}));
+
+vi.mock("@/lib/telegram/use-telegram-webapp", () => ({
+  useTelegramWebApp: () => ({ status: "ready", initData: "query_id=test&hash=signed" }),
+}));
+
+vi.mock("@/lib/business/api", () => {
+  class BusinessApiError extends Error {
+    status: number;
+    code: string;
+
+    constructor(status: number, code: string, message = code) {
+      super(message);
+      this.status = status;
+      this.code = code;
+    }
+  }
+
+  return {
+    BusinessApiError,
+    fetchBusinessChatDetail: vi.fn(),
+    fetchBusinessHistory: vi.fn(),
+    fetchBusinessChatSettings: vi.fn(),
+    updateBusinessChatMode: vi.fn(),
+    generateBusinessDraft: vi.fn(),
+    updateBusinessChatSettings: vi.fn(),
+  };
+});
 
 import { ChatDetailView } from "./chat-detail-view";
+import {
+  clearBusinessDialogPromptDraft,
+  fetchChatDetailSnapshot,
+  isBusinessSettingsDirty,
+  resetBusinessSettingsDraft,
+  saveBusinessChatSettingsSnapshot,
+} from "./chat-detail-shell";
 import { DashboardView } from "./dashboard-view";
-import type { BusinessChatDetail, BusinessChatSummary, BusinessHistoryEvent } from "@/lib/business/types";
+import {
+  BusinessApiError,
+  fetchBusinessChatDetail,
+  fetchBusinessChatSettings,
+  fetchBusinessHistory,
+  updateBusinessChatSettings,
+} from "@/lib/business/api";
+import type { BusinessChatDetail, BusinessChatSummary, BusinessDialogSettings, BusinessHistoryEvent } from "@/lib/business/types";
 import { countChatsByMode, filterChats, relativeTimeLabel } from "@/lib/business/view-model";
 
 const chats: BusinessChatSummary[] = [
@@ -60,7 +121,30 @@ const history: BusinessHistoryEvent[] = [
   },
 ];
 
+const settings: BusinessDialogSettings = {
+  assistantDisplayName: "Hermes Concierge",
+  assistantPrefix: "🤖 Hermes:",
+  dialogPrompt: "Be concise and ask one clarifying question when shipping dates are unclear.",
+  dialogNotes: "VIP customer who prefers short answers.",
+  invocationPolicy: "mention_draft",
+  updatedAt: 1_790_000,
+  updatedByUserId: "owner-42",
+};
+
+const changedSettings: BusinessDialogSettings = {
+  ...settings,
+  assistantDisplayName: "Hermes Support",
+  dialogPrompt: "Updated owner prompt.",
+  invocationPolicy: "mention_direct",
+};
+
 describe("Business dashboard UI view models", () => {
+  beforeEach(() => {
+    vi.mocked(fetchBusinessChatDetail).mockReset();
+    vi.mocked(fetchBusinessHistory).mockReset();
+    vi.mocked(fetchBusinessChatSettings).mockReset();
+    vi.mocked(updateBusinessChatSettings).mockReset();
+  });
   it("filters chats and counts visible mode/draft badges", () => {
     expect(filterChats(chats, { mode: "all", query: "ada" })).toHaveLength(1);
     expect(filterChats(chats, { mode: "auto", query: "" })).toHaveLength(1);
@@ -191,5 +275,116 @@ describe("Business dashboard UI view models", () => {
     expect(html).toContain("History");
     expect(html).toContain("draft requested");
     expect(html).toContain("Owner requested a fresh draft.");
+  });
+
+  it("renders dialog settings controls without replacing existing mode and draft controls", () => {
+    const html = renderToStaticMarkup(
+      <ChatDetailView
+        chat={detail}
+        history={history}
+        nowSeconds={1_800_000}
+        status="ready"
+        actionStatus={null}
+        draftPrompt="mention warranty"
+        settings={settings}
+        settingsDraft={changedSettings}
+        settingsStatus="ready"
+        settingsActionStatus={{ kind: "success", message: "Settings saved." }}
+        onBack={vi.fn()}
+        onRefresh={vi.fn()}
+        onModeChange={vi.fn()}
+        onDraftPromptChange={vi.fn()}
+        onGenerateDraft={vi.fn()}
+        onSettingsDraftChange={vi.fn()}
+        onSaveSettings={vi.fn()}
+        onClearPrompt={vi.fn()}
+        onResetSettings={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Dialog settings");
+    expect(html).toContain("Assistant display name");
+    expect(html).toContain("Hermes Support");
+    expect(html).toContain("Assistant prefix");
+    expect(html).toContain("🤖 Hermes:");
+    expect(html).toContain("Dialog prompt");
+    expect(html).toContain("Updated owner prompt.");
+    expect(html).toContain("Private owner notes");
+    expect(html).toContain("VIP customer who prefers short answers.");
+    expect(html).toContain("Invocation policy");
+    expect(html).toContain("Save settings");
+    expect(html).toContain("Clear prompt");
+    expect(html).toContain("Reset changes");
+    expect(html).toContain("Settings saved.");
+    expect(html).toContain("Generate draft now");
+    expect(html).toContain("Optional draft topic");
+  });
+
+  it("renders settings validation errors non-destructively with chat detail controls still visible", () => {
+    const html = renderToStaticMarkup(
+      <ChatDetailView
+        chat={detail}
+        history={history}
+        status="ready"
+        actionStatus={null}
+        settings={settings}
+        settingsDraft={changedSettings}
+        settingsStatus="error"
+        settingsErrorMessage="invalid_invocation_policy"
+        settingsActionStatus={{ kind: "error", message: "invalid_settings" }}
+        onBack={vi.fn()}
+        onRefresh={vi.fn()}
+        onModeChange={vi.fn()}
+        onGenerateDraft={vi.fn()}
+        onSettingsDraftChange={vi.fn()}
+        onSaveSettings={vi.fn()}
+        onClearPrompt={vi.fn()}
+        onResetSettings={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Settings issue");
+    expect(html).toContain("invalid_invocation_policy");
+    expect(html).toContain("Settings update failed");
+    expect(html).toContain("invalid_settings");
+    expect(html).toContain("Mode controls");
+    expect(html).toContain("Generate draft now");
+    expect(html).toContain("Latest preview");
+  });
+
+  it("loads settings for the selected chat while preserving detail when settings fail", async () => {
+    vi.mocked(fetchBusinessChatDetail).mockResolvedValue({ chat: detail });
+    vi.mocked(fetchBusinessHistory).mockResolvedValue({ chatToken: "tok-watch", history, nextCursor: null, count: history.length });
+    vi.mocked(fetchBusinessChatSettings).mockResolvedValue({ settings });
+
+    await expect(fetchChatDetailSnapshot("tok-watch", "init-data")).resolves.toEqual({
+      chat: detail,
+      history,
+      settings,
+    });
+    expect(fetchBusinessChatSettings).toHaveBeenCalledWith("tok-watch", "init-data");
+
+    vi.mocked(fetchBusinessChatSettings).mockRejectedValueOnce(new BusinessApiError(400, "invalid_settings"));
+    await expect(fetchChatDetailSnapshot("tok-watch", "init-data")).resolves.toMatchObject({
+      chat: detail,
+      history,
+      settingsErrorMessage: "invalid_settings",
+    });
+  });
+
+  it("saves settings through the settings route and supports clear/reset local draft helpers", async () => {
+    vi.mocked(updateBusinessChatSettings).mockResolvedValue({ settings: changedSettings });
+
+    await expect(saveBusinessChatSettingsSnapshot("tok-watch", "init-data", changedSettings)).resolves.toEqual(changedSettings);
+    expect(updateBusinessChatSettings).toHaveBeenCalledWith("tok-watch", "init-data", changedSettings);
+
+    expect(clearBusinessDialogPromptDraft(changedSettings)).toEqual({
+      ...changedSettings,
+      dialogPrompt: "",
+    });
+    expect(clearBusinessDialogPromptDraft(changedSettings).dialogNotes).toBe(changedSettings.dialogNotes);
+    expect(resetBusinessSettingsDraft(changedSettings, settings)).toEqual(settings);
+    expect(isBusinessSettingsDirty(settings, changedSettings)).toBe(true);
+    expect(isBusinessSettingsDirty(settings, settings)).toBe(false);
   });
 });

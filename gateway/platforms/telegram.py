@@ -109,6 +109,7 @@ from gateway.platforms.telegram_business_chats import (
     user_looks_like_bot,
 )
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import DEFAULT_ASSISTANT_PREFIX, TelegramBusinessDialogProfileStore
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -524,9 +525,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # updates and lazily refreshed by getBusinessConnection when possible.
         self._business_can_reply: Dict[str, Optional[bool]] = {}
         self._business_pending_rule_tokens: Dict[str, Dict[str, Any]] = {}
+        self._business_pending_prompt_tokens: Dict[str, Dict[str, Any]] = {}
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
         self._business_history_store = TelegramBusinessHistoryStore()
+        self._business_profile_store = TelegramBusinessDialogProfileStore()
         self._business_voice_history_tasks: set[asyncio.Task] = set()
         self._business_voice_history_semaphore = asyncio.Semaphore(
             int(self.config.extra.get("business_voice_history_concurrency", 2) or 2)
@@ -564,6 +567,53 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id=self._telegram_message_chat_id(message),
             thread_id=str(getattr(message, "message_thread_id", "") or ""),
         )
+
+    async def _maybe_handle_business_prompt_text(self, message: Message) -> bool:
+        """Consume next owner text message as a Telegram Business dialog prompt."""
+        pending = getattr(self, "_business_pending_prompt_tokens", None)
+        if not isinstance(pending, dict):
+            self._business_pending_prompt_tokens = pending = {}
+        prompt_key = self._business_rule_prompt_key_for_message(message)
+        state = pending.pop(prompt_key, None)
+        if not state:
+            return False
+        token = str(state.get("token") or "").strip()
+        prompt = str(getattr(message, "text", "") or "").strip()
+        actor_user_id = self._telegram_message_user_id(message) or str(state.get("actor_user_id") or "")
+        chat_id = self._telegram_message_chat_id(message)
+        thread_id = str(getattr(message, "message_thread_id", "") or "")
+        metadata = {"thread_id": thread_id} if thread_id else None
+        if not prompt or prompt.startswith("/"):
+            if chat_id:
+                await self.send(chat_id, "Prompt edit cancelled.", metadata=metadata)
+            return True
+        key, entry = self._business_chat_store().find_by_token(token)
+        if key is None or entry is None:
+            if chat_id:
+                await self.send(chat_id, "Business chat not found; prompt was not saved.", metadata=metadata)
+            return True
+        try:
+            self._business_profile_store_obj().upsert_for_chat_entry(
+                entry,
+                updates={"dialog_prompt": prompt},
+                actor_user_id=actor_user_id,
+            )
+        except ValueError as exc:
+            if chat_id:
+                await self.send(chat_id, f"Prompt was not saved: {exc}", metadata=metadata)
+            return True
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "settings_changed",
+                "actor_user_id": actor_user_id,
+                "created_at": time.time(),
+                "fields": ["dialog_prompt"],
+            },
+        )
+        if chat_id:
+            await self.send(chat_id, "✅ Dialog prompt saved.", metadata=metadata)
+        return True
 
     async def _maybe_handle_business_rule_text(self, message: Message) -> bool:
         """Consume next owner text message as a notify-only Business watch rule."""
@@ -836,6 +886,75 @@ class TelegramAdapter(BasePlatformAdapter):
             self._business_history_store = store
         return store
 
+    def _business_profile_store_obj(self) -> TelegramBusinessDialogProfileStore:
+        store = getattr(self, "_business_profile_store", None)
+        if store is None:
+            store = TelegramBusinessDialogProfileStore()
+            self._business_profile_store = store
+        return store
+
+    def _business_profile_for_send(
+        self,
+        *,
+        chat_id: Any,
+        business_connection_id: Any,
+        direct_messages_topic_id: Any = None,
+    ) -> Dict[str, Any]:
+        entry = {
+            "business_connection_id": str(business_connection_id or ""),
+            "customer_chat_id": str(chat_id or ""),
+            "direct_messages_topic_id": self._normalize_direct_messages_topic_id(direct_messages_topic_id),
+        }
+        try:
+            store = self._business_profile_store_obj()
+            dialog_key = TelegramBusinessChatRegistry.key(
+                entry["business_connection_id"],
+                entry["customer_chat_id"],
+                entry["direct_messages_topic_id"],
+            )
+            return store.get_by_key(dialog_key) or store.default_profile_for_entry(entry)
+        except Exception:
+            logger.debug("[%s] Failed to read Telegram Business dialog profile", self.name, exc_info=True)
+            return {"assistant_prefix": DEFAULT_ASSISTANT_PREFIX}
+
+    def _business_profile_for_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            store = self._business_profile_store_obj()
+            dialog_key = TelegramBusinessChatRegistry.key(
+                entry.get("business_connection_id"),
+                entry.get("customer_chat_id", entry.get("chat_id")),
+                entry.get("direct_messages_topic_id"),
+            )
+            profile = store.get_by_key(dialog_key)
+            if profile is not None:
+                return profile
+            return store.default_profile_for_entry(entry)
+        except Exception:
+            logger.debug("[%s] Failed to read Telegram Business dialog profile", self.name, exc_info=True)
+            return {}
+
+    def _business_invocation_mode_for_message(self, entry: Dict[str, Any], message: Message) -> Optional[str]:
+        """Return one-shot Business mode requested by a configured bot mention."""
+        profile = self._business_profile_for_entry(entry)
+        policy = str(profile.get("invocation_policy") or "off").strip().lower()
+        if policy not in {"mention_draft", "mention_direct"}:
+            return None
+        if not self._message_mentions_bot(message):
+            return None
+        if policy == "mention_draft":
+            return "draft"
+        return "auto"
+
+    @staticmethod
+    def _apply_business_assistant_prefix(content: str, profile: Optional[Dict[str, Any]]) -> str:
+        prefix = DEFAULT_ASSISTANT_PREFIX
+        if profile is not None and "assistant_prefix" in profile:
+            prefix = str(profile.get("assistant_prefix") or "")
+        if not prefix or content.startswith(prefix):
+            return content
+        separator = "" if prefix.endswith((" ", "\n", "\t")) else " "
+        return f"{prefix}{separator}{content}"
+
     def _business_history_key_from_entry(self, entry: Dict[str, Any]) -> Optional[str]:
         try:
             return TelegramBusinessHistoryStore.key(
@@ -961,6 +1080,13 @@ class TelegramAdapter(BasePlatformAdapter):
             str(getattr(message, "text", None) or "").strip()
             or str(getattr(message, "caption", None) or "").strip()
         )
+
+    @staticmethod
+    def _business_message_looks_like_slash_command(message: Message) -> bool:
+        """Return True for customer-authored Business text/captions that look like commands."""
+        text = str(getattr(message, "text", None) or "")
+        caption = str(getattr(message, "caption", None) or "")
+        return text.lstrip().startswith("/") or caption.lstrip().startswith("/")
 
     def _record_business_media_history_event(self, entry: Dict[str, Any], event: MessageEvent) -> None:
         """Persist safe structured metadata for inbound Business media."""
@@ -1300,6 +1426,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("⚡ Auto", callback_data=f"bm:m:{token}:auto"),
                 ],
             ])
+        rows.append([
+            InlineKeyboardButton("🧠 Prompt", callback_data=f"bm:p:{token}"),
+            InlineKeyboardButton("🧹 Clear prompt", callback_data=f"bm:pc:{token}"),
+        ])
         return InlineKeyboardMarkup(rows)
 
     def _business_chat_card_text(
@@ -1450,6 +1580,57 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = await self._bot.send_message(**kwargs)
         return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
 
+    async def _notify_business_direct_send_blocked(
+        self,
+        entry: Dict[str, Any],
+        *,
+        source: str,
+        preview: str,
+        status: str = "business_reply_permission_disabled",
+        message_id: Any = None,
+    ) -> None:
+        """Record and owner-notify a blocked Business direct-send attempt."""
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "outbound_failed",
+                "status": status,
+                "source": source,
+                "preview": preview,
+                "message_id": message_id,
+                "created_at": time.time(),
+            },
+        )
+        owner_chat_id = self._business_owner_chat_id()
+        if not owner_chat_id or not self._bot:
+            return
+        business_connection_id = str(entry.get("business_connection_id") or "").strip()
+        customer_chat_id = str(entry.get("customer_chat_id", entry.get("chat_id")) or "").strip()
+        safe_preview = TelegramBusinessHistoryStore.preview(str(preview or ""), 700)
+        parts = [
+            "💼 Telegram Business direct reply suppressed",
+            "",
+            f"Customer chat: {customer_chat_id or 'unknown'}",
+            f"Business connection: {business_connection_id or 'unknown'}",
+            f"Source: {source}",
+            "",
+            "Telegram reports that this bot cannot currently reply for that Business connection.",
+        ]
+        if safe_preview:
+            parts.extend(["", "Draft/request:", safe_preview])
+        kwargs: Dict[str, Any] = {
+            "chat_id": self._telegram_chat_id(owner_chat_id),
+            "text": "\n".join(parts),
+            **self._link_preview_kwargs(),
+        }
+        owner_thread_id = self._business_owner_thread_id()
+        if owner_thread_id:
+            kwargs.update(self._topic_kwargs_for_send(owner_chat_id, owner_thread_id))
+        try:
+            await self._bot.send_message(**kwargs)
+        except Exception as exc:
+            logger.error("[%s] Failed to send Telegram Business direct-send failure notice: %s", self.name, exc, exc_info=True)
+
     async def _send_business_direct_text(
         self,
         *,
@@ -1458,28 +1639,40 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
+        history_entry = {
+            "business_connection_id": str(business_connection_id),
+            "customer_chat_id": str(chat_id),
+            "direct_messages_topic_id": direct_topic_id,
+        }
         if not await self._ensure_business_reply_allowed(business_connection_id):
+            await self._notify_business_direct_send_blocked(
+                history_entry,
+                source=str((metadata or {}).get("business_mode") or "auto"),
+                preview=content,
+                message_id=(metadata or {}).get("inbound_message_id"),
+            )
             return SendResult(success=False, error="business_reply_permission_disabled", retryable=False)
+        profile = self._business_profile_for_send(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            direct_messages_topic_id=direct_topic_id,
+        )
+        visible_content = self._apply_business_assistant_prefix(content, profile)
         sent: list[str] = []
-        for chunk in self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len):
+        for chunk in self.truncate_message(visible_content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len):
             kwargs = {
                 "chat_id": self._telegram_chat_id(chat_id),
                 "business_connection_id": business_connection_id,
                 "text": chunk,
                 **self._link_preview_kwargs(),
             }
-            direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
             if direct_topic_id:
                 kwargs["direct_messages_topic_id"] = int(direct_topic_id)
             msg = await self._bot.send_message(**kwargs)
             message_id = str(getattr(msg, "message_id", "") or "")
             if message_id:
                 sent.append(message_id)
-        history_entry = {
-            "business_connection_id": str(business_connection_id),
-            "customer_chat_id": str(chat_id),
-            "direct_messages_topic_id": self._metadata_direct_messages_topic_id(metadata),
-        }
         self._record_business_history_event(
             history_entry,
             {
@@ -1607,7 +1800,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(source, "chat_id", None),
                 direct_topic_id,
             )
-            if entry and entry.get("mode"):
+            invocation_mode = str(getattr(source, "business_invocation_mode", "") or "").strip().lower()
+            if invocation_mode in {"draft", "auto"}:
+                metadata["business_mode"] = invocation_mode
+            elif entry and entry.get("mode"):
                 metadata["business_mode"] = str(entry.get("mode"))
         except Exception:
             logger.debug("[%s] Failed to attach Telegram Business mode metadata", self.name, exc_info=True)
@@ -5102,6 +5298,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 return
+            if len(parts) == 3 and parts[1] == "p":
+                token = parts[2]
+                entry = self._business_chat_store().find_by_token(token)[1]
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                prompt_key = self._business_rule_prompt_key(
+                    user_id=caller_id,
+                    chat_id=str(query_chat_id or ""),
+                    thread_id=str(query_thread_id or ""),
+                )
+                pending_prompts = getattr(self, "_business_pending_prompt_tokens", None)
+                if not isinstance(pending_prompts, dict):
+                    self._business_pending_prompt_tokens = pending_prompts = {}
+                pending_prompts[prompt_key] = {
+                    "token": token,
+                    "actor_user_id": caller_id,
+                    "created_at": time.time(),
+                }
+                await query.answer(text="Send the dialog prompt as your next message.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(
+                            entry,
+                            title="Edit dialog prompt",
+                        ) + "\n\nReply here with the owner instructions Hermes should use for this dialog. Send <code>/cancel</code> to cancel.",
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry, watch_actions=True),
+                    )
+                except Exception:
+                    pass
+                return
+            if len(parts) == 3 and parts[1] == "pc":
+                token = parts[2]
+                _key, entry = self._business_chat_store().find_by_token(token)
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                self._business_profile_store_obj().upsert_for_chat_entry(
+                    entry,
+                    updates={"dialog_prompt": ""},
+                    actor_user_id=caller_id,
+                )
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "settings_changed",
+                        "actor_user_id": caller_id,
+                        "created_at": time.time(),
+                        "fields": ["dialog_prompt"],
+                    },
+                )
+                await query.answer(text="Prompt cleared.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(entry, title="Dialog prompt cleared"),
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry),
+                    )
+                except Exception:
+                    pass
+                return
             if len(parts) == 3 and parts[1] == "r":
                 token = parts[2]
                 entry = self._business_chat_store().find_by_token(token)[1]
@@ -5304,16 +5562,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 draft = entry["draft"]
-                chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+                customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
+                direct_topic_id = self._normalize_direct_messages_topic_id(entry.get("direct_messages_topic_id"))
+                profile = self._business_profile_for_send(
+                    chat_id=customer_chat_id,
+                    business_connection_id=entry["business_connection_id"],
+                    direct_messages_topic_id=direct_topic_id,
+                )
+                visible_draft = self._apply_business_assistant_prefix(draft, profile)
+                chunks = self.truncate_message(visible_draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
                 for chunk in chunks:
-                    customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
                     kwargs = {
                         "chat_id": self._telegram_chat_id(customer_chat_id),
                         "business_connection_id": entry["business_connection_id"],
                         "text": chunk,
                         **self._link_preview_kwargs(),
                     }
-                    direct_topic_id = self._normalize_direct_messages_topic_id(entry.get("direct_messages_topic_id"))
                     if direct_topic_id:
                         kwargs["direct_messages_topic_id"] = int(direct_topic_id)
                     msg = await self._bot.send_message(**kwargs)
@@ -7505,15 +7769,27 @@ class TelegramAdapter(BasePlatformAdapter):
                     has_media = self._telegram_message_has_media(message)
                     if not message_text and not message_caption and not has_media:
                         logger.info("[%s] Ignoring empty Telegram Business message for connection %s", self.name, connection_id)
-                    elif message_text.lstrip().startswith("/"):
+                    elif self._business_message_looks_like_slash_command(message):
                         logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                     else:
                         self._business_can_reply.setdefault(connection_id, None)
                         entry, is_new_chat = self._business_record_from_message(message, connection_id)
                         mode = str(entry.get("mode") or "watch")
+                        invocation_mode = self._business_invocation_mode_for_message(entry, message)
                         if entry.pop("draft_once", False):
                             self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
                             mode = "draft"
+                            invocation_mode = None
+                        elif invocation_mode:
+                            mode = invocation_mode
+                        if mode == "auto" and not await self._ensure_business_reply_allowed(connection_id):
+                            await self._notify_business_direct_send_blocked(
+                                entry,
+                                source="mention_direct" if invocation_mode == "auto" else "auto",
+                                preview=self._business_message_preview(message),
+                                message_id=getattr(message, "message_id", None),
+                            )
+                            raise ApplicationHandlerStop
                         media_event = None
                         if has_media and mode in {"draft", "auto"}:
                             media_event = await self._prepare_telegram_media_event(
@@ -7547,6 +7823,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             else:
                                 event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
                                 event.text = self._clean_bot_trigger_text(event.text)
+                            if event is not None and invocation_mode:
+                                setattr(event.source, "business_invocation_mode", invocation_mode)
                             self._record_business_history_event(
                                 entry,
                                 {
@@ -7587,6 +7865,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(msg)
+        if await self._maybe_handle_business_prompt_text(msg):
+            return
         if await self._maybe_handle_business_rule_text(msg):
             return
 
@@ -7603,6 +7883,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+        if await self._maybe_handle_business_prompt_text(msg):
+            return
         command = str(msg.text or "").strip().split()[0].split("@", 1)[0].lower()
         if command == "/business":
             caller_id = self._telegram_message_user_id(msg) or ""

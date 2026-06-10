@@ -1,0 +1,7 @@
+# Slice owner progress — dashboard settings contract
+
+- 2026-06-10: Loaded repo guidance, task plan, dashboard AGENTS.md, and frontend quality checklist.
+- Pre-dispatch gate: backend settings API contract is clear from plan Task 2/8 for frontend contract work: GET/PATCH `/api/business/chats/:token/settings`, auth via existing dashboard BFF/session patterns, upstream PATCH accepts settings fields plus BFF-added `actorUserId`, errors map through existing safe BFF response layer. Scope limited to Task 8 preliminary types/API client/BFF route tests; no backend implementation dependency beyond route forwarding contract.
+- Routing: delegating implementation to `aad-implementer` in current worktree. Visual/UI component work explicitly deferred unless implementer finds it already contract-safe and tiny; primary requested target is types/client/BFF route tests.
+- 2026-06-10: Implementer returned PASS with commits `c60cc687c` and `98715afaa`. Fresh owner container targeted verification passed: `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run test:auth -- src/lib/business/business-api.test.ts src/app/api/business/route-handlers.test.ts` (2 files / 23 tests).
+- 2026-06-10: Side findings from broader container checks are non-blocking for this prelim slice: existing UI component invalid-hook-call failure and cached-image Next/Turbopack build root inference failure. No current-goal blocker.

@@ -1,17 +1,25 @@
 "use client";
 
-import { ArrowLeft, Bot, Clock3, RefreshCw, Send, ShieldAlert, Sparkles } from "lucide-react";
+import { ArrowLeft, Bot, Clock3, Eraser, RefreshCw, RotateCcw, Save, Send, Settings2, ShieldAlert, Sparkles } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { BusinessChatDetail, BusinessChatMode, BusinessHistoryEvent } from "@/lib/business/types";
+import type {
+  BusinessChatDetail,
+  BusinessChatMode,
+  BusinessDialogSettings,
+  BusinessHistoryEvent,
+  BusinessInvocationPolicy,
+  BusinessSettingsPatch,
+} from "@/lib/business/types";
 import { MODE_OPTIONS, canReplyLabel, readableEventType, relativeTimeLabel } from "@/lib/business/view-model";
 import { cn } from "@/lib/utils";
 
 type DetailStatus = "loading" | "ready" | "error" | "unauthorized" | "not-found";
+type SettingsStatus = "idle" | "loading" | "ready" | "error";
 type ActionStatus = { kind: "success" | "error" | "loading"; message: string } | null;
 
 type ChatDetailViewProps = {
@@ -21,12 +29,22 @@ type ChatDetailViewProps = {
   errorMessage?: string;
   actionStatus: ActionStatus;
   draftPrompt?: string;
+  settings?: BusinessDialogSettings;
+  settingsDraft?: BusinessDialogSettings;
+  settingsStatus?: SettingsStatus;
+  settingsErrorMessage?: string;
+  settingsActionStatus?: ActionStatus;
+  settingsDirty?: boolean;
   nowSeconds?: number;
   onBack: () => void;
   onRefresh: () => void;
   onModeChange: (mode: BusinessChatMode) => void;
   onDraftPromptChange?: (prompt: string) => void;
   onGenerateDraft: () => void;
+  onSettingsDraftChange?: (patch: BusinessSettingsPatch) => void;
+  onSaveSettings?: () => void;
+  onClearPrompt?: () => void;
+  onResetSettings?: () => void;
 };
 
 function modeButtonClass(mode: BusinessChatMode, activeMode?: BusinessChatMode) {
@@ -91,6 +109,193 @@ function EmptyOrError({ status, errorMessage, onRefresh }: Pick<ChatDetailViewPr
   );
 }
 
+const INVOCATION_POLICY_OPTIONS: Array<{ value: BusinessInvocationPolicy; label: string; help: string }> = [
+  { value: "off", label: "Off", help: "Hermes follows the selected mode without mention-only invocation." },
+  { value: "mention_draft", label: "Mention creates draft", help: "Mentioning Hermes queues an approval-safe draft." },
+  { value: "mention_direct", label: "Mention may send direct", help: "Mentioning Hermes can use direct-send behavior when the chat mode allows it." },
+];
+
+const inputClassName =
+  "h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50";
+const textareaClassName =
+  "min-h-24 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50";
+
+function ChatSettingsCard({
+  settings,
+  settingsDraft,
+  settingsStatus = "idle",
+  settingsErrorMessage,
+  settingsActionStatus,
+  settingsDirty = false,
+  onSettingsDraftChange,
+  onSaveSettings,
+  onClearPrompt,
+  onResetSettings,
+}: Pick<
+  ChatDetailViewProps,
+  | "settings"
+  | "settingsDraft"
+  | "settingsStatus"
+  | "settingsErrorMessage"
+  | "settingsActionStatus"
+  | "settingsDirty"
+  | "onSettingsDraftChange"
+  | "onSaveSettings"
+  | "onClearPrompt"
+  | "onResetSettings"
+>) {
+  const draft = settingsDraft ?? settings;
+  const settingsLoading = settingsStatus === "loading" || settingsActionStatus?.kind === "loading";
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Settings2 className="size-4" aria-hidden="true" />
+          Dialog settings
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">
+          Tune the assistant identity and owner-only context for this Business dialog. These settings do not replace mode or draft controls.
+        </p>
+
+        {settingsStatus === "loading" && !draft ? (
+          <div className="space-y-3" aria-label="Loading dialog settings">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-24 w-full" />
+            <Skeleton className="h-10 w-40" />
+          </div>
+        ) : null}
+
+        {settingsStatus === "error" ? (
+          <Alert variant={draft ? "default" : "destructive"}>
+            <AlertTitle>Settings issue</AlertTitle>
+            <AlertDescription>{settingsErrorMessage ?? "Could not load dialog settings."}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        {draft ? (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label htmlFor="business-assistant-display-name" className="text-sm font-medium">
+                  Assistant display name
+                </label>
+                <input
+                  id="business-assistant-display-name"
+                  className={inputClassName}
+                  value={draft.assistantDisplayName}
+                  onChange={(event) => onSettingsDraftChange?.({ assistantDisplayName: event.target.value })}
+                  disabled={settingsLoading}
+                  maxLength={80}
+                />
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="business-assistant-prefix" className="text-sm font-medium">
+                  Assistant prefix
+                </label>
+                <input
+                  id="business-assistant-prefix"
+                  className={inputClassName}
+                  value={draft.assistantPrefix}
+                  onChange={(event) => onSettingsDraftChange?.({ assistantPrefix: event.target.value })}
+                  disabled={settingsLoading}
+                  maxLength={80}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="business-dialog-prompt" className="text-sm font-medium">
+                  Dialog prompt
+                </label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onClearPrompt}
+                  disabled={settingsLoading || draft.dialogPrompt.length === 0}
+                >
+                  <Eraser className="size-4" aria-hidden="true" />
+                  Clear prompt
+                </Button>
+              </div>
+              <textarea
+                id="business-dialog-prompt"
+                className={textareaClassName}
+                value={draft.dialogPrompt}
+                onChange={(event) => onSettingsDraftChange?.({ dialogPrompt: event.target.value })}
+                placeholder="Owner-only instructions for this customer dialog"
+                disabled={settingsLoading}
+                maxLength={4000}
+              />
+              <p className="text-xs text-muted-foreground">Clearing this field does not clear the name, prefix, notes, or invocation policy.</p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="business-dialog-notes" className="text-sm font-medium">
+                Private owner notes
+              </label>
+              <textarea
+                id="business-dialog-notes"
+                className={textareaClassName}
+                value={draft.dialogNotes}
+                onChange={(event) => onSettingsDraftChange?.({ dialogNotes: event.target.value })}
+                placeholder="Private context for the business owner; not a customer-facing message"
+                disabled={settingsLoading}
+                maxLength={4000}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="business-invocation-policy" className="text-sm font-medium">
+                Invocation policy
+              </label>
+              <select
+                id="business-invocation-policy"
+                className={inputClassName}
+                value={draft.invocationPolicy}
+                onChange={(event) => onSettingsDraftChange?.({ invocationPolicy: event.target.value as BusinessInvocationPolicy })}
+                disabled={settingsLoading}
+              >
+                {INVOCATION_POLICY_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {INVOCATION_POLICY_OPTIONS.find((option) => option.value === draft.invocationPolicy)?.help}
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Button type="button" className="sm:flex-1" onClick={onSaveSettings} disabled={settingsLoading || !settingsDirty}>
+                <Save className="size-4" aria-hidden="true" />
+                {settingsActionStatus?.kind === "loading" ? "Saving settings..." : "Save settings"}
+              </Button>
+              <Button type="button" variant="outline" className="sm:flex-1" onClick={onResetSettings} disabled={settingsLoading || !settingsDirty}>
+                <RotateCcw className="size-4" aria-hidden="true" />
+                Reset changes
+              </Button>
+            </div>
+
+            {settingsActionStatus ? (
+              <Alert variant={settingsActionStatus.kind === "error" ? "destructive" : "default"}>
+                <Sparkles className="size-4" aria-hidden="true" />
+                <AlertTitle>{settingsActionStatus.kind === "error" ? "Settings update failed" : settingsActionStatus.kind === "loading" ? "Saving settings" : "Settings saved"}</AlertTitle>
+                <AlertDescription>{settingsActionStatus.message}</AlertDescription>
+              </Alert>
+            ) : null}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
 function HistoryTimeline({ history, nowSeconds }: { history: BusinessHistoryEvent[]; nowSeconds?: number }) {
   if (history.length === 0) {
     return <p className="text-sm text-muted-foreground">No history events recorded yet.</p>;
@@ -123,12 +328,22 @@ export function ChatDetailView({
   errorMessage,
   actionStatus,
   draftPrompt = "",
+  settings,
+  settingsDraft,
+  settingsStatus,
+  settingsErrorMessage,
+  settingsActionStatus,
+  settingsDirty,
   nowSeconds,
   onBack,
   onRefresh,
   onModeChange,
   onDraftPromptChange,
   onGenerateDraft,
+  onSettingsDraftChange,
+  onSaveSettings,
+  onClearPrompt,
+  onResetSettings,
 }: ChatDetailViewProps) {
   const isLoading = status === "loading";
   const actionLoading = actionStatus?.kind === "loading";
@@ -255,6 +470,19 @@ export function ChatDetailView({
                 </p>
               </CardContent>
             </Card>
+
+            <ChatSettingsCard
+              settings={settings}
+              settingsDraft={settingsDraft}
+              settingsStatus={settingsStatus}
+              settingsErrorMessage={settingsErrorMessage}
+              settingsActionStatus={settingsActionStatus}
+              settingsDirty={settingsDirty}
+              onSettingsDraftChange={onSettingsDraftChange}
+              onSaveSettings={onSaveSettings}
+              onClearPrompt={onClearPrompt}
+              onResetSettings={onResetSettings}
+            />
 
             <Card>
               <CardHeader>

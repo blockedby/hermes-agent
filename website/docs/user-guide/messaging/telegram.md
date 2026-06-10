@@ -140,7 +140,52 @@ The bot should come online within seconds. Send it a message on Telegram to veri
 
 ## Telegram Business assistant mode
 
-Hermes can receive Telegram Business `business_message` updates as a text-only assistant MVP. Customer chats are isolated from normal Telegram DM sessions by the Business connection ID. Hermes does **not** send drafted replies directly to the customer; instead it posts each draft to the owner/home chat with **Send** and **Cancel** buttons.
+Hermes can receive Telegram Business `business_message` updates and run as a three-participant assistant inside each customer dialog:
+
+- the **business owner/operator**, including manual outgoing messages sent from the connected Telegram Business account,
+- the **customer/contact**, including Telegram names, usernames, nicknames, chat IDs, Business connection, and direct-message topic metadata when Telegram provides them,
+- **Hermes**, the assistant identity that drafts or sends replies.
+
+Customer chats are isolated from normal Telegram DM sessions by the Business connection ID. The per-dialog assistant profile is also isolated per Business dialog, so prompt/settings for one customer are not reused for another customer.
+
+### Dialog profiles and settings
+
+Each Business dialog has a DB-backed profile stored by the gateway in SQLite under the active Hermes profile. The database is the source of truth for dialog-specific settings; the older JSON Business chat registry may still track chat/mode metadata, but dialog prompt settings are read and written through the DB-backed profile store.
+
+A dialog profile contains:
+
+| Setting | Purpose | Default |
+|---|---|---|
+| Assistant display name | Name used in prompt framing for Hermes | `Hermes` |
+| Assistant prefix | Prefix applied to Hermes Business replies before delivery | `🤖 Hermes:` |
+| Dialog prompt | Owner-controlled instructions for this customer dialog | empty |
+| Dialog notes | Owner-only context notes included in the dialog prompt | empty |
+| Invocation policy | Whether customer mentions can trigger Hermes from watch mode | `off` |
+
+You can edit the profile from either surface:
+
+- **Telegram Business dashboard** — open the customer detail view, edit the settings card, then save. The dashboard uses `GET`/`PATCH /api/business/chats/{token}/settings` against the DB-backed store.
+- **Telegram bot controls** — send `/business` from the owner Telegram chat and use the per-chat inline controls. **🧠 Prompt** starts a prompt edit flow; **🧹 Clear prompt** clears only the dialog prompt and leaves the name, prefix, notes, and invocation policy intact.
+
+### Modes, invocation, and command safety
+
+Business modes control what happens to ordinary customer messages:
+
+| Mode | Behavior |
+|---|---|
+| Watch / notify-only | Record and surface customer activity without automatically asking Hermes to answer. |
+| Draft | Ask Hermes to generate an approval-safe draft for the owner/home chat. |
+| Auto / direct | Allow Hermes output to be sent with direct-send behavior when the owner has configured that mode. |
+
+`invocation_policy` controls a separate mention-trigger path for watch-style dialogs:
+
+| Policy | Behavior |
+|---|---|
+| `off` | Customer mentions do not invoke Hermes. |
+| `mention_draft` | A customer mention such as `@HermesBot ...` queues an approval-safe draft. |
+| `mention_direct` | A customer mention can use direct-send behavior when the chat mode allows direct sends. |
+
+Customer text that looks like a Hermes slash command is never treated as an operator command in Business dialogs. For example, customer messages such as `/new`, `/restart`, `/stop`, `/approve`, or `/help` are customer conversation content or are safely ignored; they do not reset sessions, approve drafts, change models, or dispatch gateway control handlers. Owner manual outgoing Business messages are instead treated as authoritative conversation context for Hermes, not as customer requests.
 
 Configure the approval destination with the regular Telegram home channel or an explicit owner chat:
 
@@ -163,9 +208,7 @@ platforms:
 
 `business_owner_chat_id` can also be supplied as `TELEGRAM_BUSINESS_OWNER_CHAT_ID` for deployments that still manage gateway settings through environment variables. Approval cards can be pinned to a specific owner forum/topic with `business_owner_thread_id` or `TELEGRAM_BUSINESS_OWNER_THREAD_ID`; if that explicit topic cannot be used, Hermes fails closed instead of retrying unthreaded. `business_ignore_self_messages` defaults to `true` and can be overridden with `TELEGRAM_BUSINESS_IGNORE_SELF_MESSAGES=false`; `business_ignored_chat_ids` can also be supplied as `TELEGRAM_BUSINESS_IGNORED_CHAT_IDS=987654321,123456789`.
 
-Approval **Send**/**Cancel** outcomes are recorded in the gateway audit session `agent:audit:telegram:business-approvals`, not in the customer, owner, or originating LLM transcript. Pending approval cards are persistent and expire after the configured TTL; stale or malformed persisted approvals fail closed.
-
-Editing a Business draft is intentionally out of scope for the current text-only MVP. Ordinary text posted near an approval card remains normal owner-thread context and does not mutate the pending Business draft. A future edit flow must be explicit and stateful: an **Edit** button tied to `approval_id`, an edit/reply mode for that one approval, then separate **Send edited**/**Cancel** actions.
+Approval **Send**/**Cancel** outcomes are recorded in the gateway audit session `agent:audit:telegram:business-approvals`, not in the customer, owner, or originating LLM transcript. Pending approval cards are persistent and expire after the configured TTL; stale or malformed persisted approvals fail closed. Ordinary owner text posted near an approval card remains owner-thread context; use the explicit dashboard settings form or **🧠 Prompt**/**🧹 Clear prompt** bot controls to change the dialog profile.
 
 ## Sending Generated Files from Docker-backed Terminals
 

@@ -31,7 +31,9 @@ BUSINESS_HISTORY_EVENT_TYPES = {
     "approval_failed",
     "approval_partial",
     "outbound_sent",
+    "outbound_failed",
     "mode_changed",
+    "settings_changed",
     "rule_matched",
     "media_received",
     "voice_transcribed",
@@ -71,7 +73,7 @@ _TEXT_FIELDS = {
     "error": 1000,
 }
 
-_LIST_STRING_FIELDS = {"message_ids", "media_urls", "media_types"}
+_LIST_STRING_FIELDS = {"message_ids", "media_urls", "media_types", "fields"}
 
 
 class TelegramBusinessHistoryStore:

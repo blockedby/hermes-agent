@@ -2499,6 +2499,116 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and str(getattr(source, "thread_id", "") or "").startswith("business:")
         )
 
+    def _is_telegram_business_slash_event(self, event: MessageEvent) -> bool:
+        """Return True when a Business customer event is slash-command shaped."""
+        return self._is_telegram_business_source(event.source) and str(event.text or "").lstrip().startswith("/")
+
+    def _attach_telegram_business_profile_context(self, event: MessageEvent) -> None:
+        """Attach current DB-backed Telegram Business profile context to the event source.
+
+        The attached data is consumed by ``build_session_context_prompt`` and intentionally
+        excludes the current customer-authored message text so user content cannot become
+        system-prompt instructions.
+        """
+        source = getattr(event, "source", None)
+        if source is None or not self._is_telegram_business_source(source):
+            return
+        adapter = getattr(self, "adapters", {}).get(Platform.TELEGRAM)
+        if adapter is None:
+            return
+
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        connection_id = None
+        direct_topic_id = None
+        try:
+            connection_id = adapter._business_connection_id_from_thread(thread_id)
+            direct_topic_id = adapter._business_direct_topic_id_from_thread(thread_id)
+        except Exception:
+            match = re.match(r"^business:([^:]+)(?::topic:(\d+))?$", thread_id)
+            if match:
+                connection_id = match.group(1)
+                direct_topic_id = match.group(2)
+        if not connection_id:
+            return
+
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if not chat_id:
+            return
+
+        entry = None
+        try:
+            entry = adapter._business_chat_store().get(connection_id, chat_id, direct_topic_id)
+        except Exception:
+            logger.debug("Failed to read Telegram Business chat registry for prompt context", exc_info=True)
+        if not entry:
+            entry = {
+                "business_connection_id": str(connection_id),
+                "customer_chat_id": chat_id,
+                "direct_messages_topic_id": str(direct_topic_id) if direct_topic_id else None,
+                "display_name": str(getattr(source, "chat_name", "") or getattr(source, "user_name", "") or ""),
+                "customer_user_id": str(getattr(source, "user_id", "") or "") or None,
+                "customer_user_name": str(getattr(source, "user_name", "") or ""),
+            }
+
+        profile = None
+        try:
+            profile_store = adapter._business_profile_store_obj()
+            from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
+
+            dialog_key = TelegramBusinessChatRegistry.key(
+                entry.get("business_connection_id"),
+                entry.get("customer_chat_id"),
+                entry.get("direct_messages_topic_id"),
+            )
+            profile = profile_store.get_by_key(dialog_key)
+            if profile is None:
+                profile = profile_store.upsert_for_chat_entry(entry)
+        except Exception:
+            logger.debug("Failed to attach Telegram Business dialog profile", exc_info=True)
+            profile = None
+
+        owner_chat_id = ""
+        owner_user_id = ""
+        try:
+            owner_chat_id = str(adapter._business_owner_chat_id() or "")
+        except Exception:
+            owner_chat_id = ""
+        try:
+            owner_user_id = str(getattr(adapter, "_business_owner_user_ids", {}).get(str(connection_id)) or "")
+        except Exception:
+            owner_user_id = ""
+        bot_username = ""
+        try:
+            bot_username = str(getattr(getattr(adapter, "_bot", None), "username", "") or "")
+        except Exception:
+            bot_username = ""
+
+        source.business_context = {
+            "business_connection_id": str(connection_id),
+            "direct_messages_topic_id": str(direct_topic_id) if direct_topic_id else None,
+            "owner": {
+                "display_name": "business owner/operator",
+                "user_id": owner_user_id,
+                "chat_id": owner_chat_id,
+            },
+            "customer": {
+                "display_name": str(
+                    entry.get("display_name")
+                    or entry.get("customer_user_name")
+                    or getattr(source, "user_name", "")
+                    or getattr(source, "chat_name", "")
+                    or ""
+                ),
+                "username": str(entry.get("username") or ""),
+                "user_id": str(entry.get("customer_user_id") or getattr(source, "user_id", "") or ""),
+                "chat_id": str(entry.get("customer_chat_id") or chat_id),
+            },
+            "assistant": {
+                "bot_username": bot_username,
+            },
+            "profile": profile or {},
+        }
+
     def _is_message_dispatch_authorized(self, source: SessionSource) -> bool:
         """Return True when an inbound event may enter the agent pipeline.
 
@@ -6483,6 +6593,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        if not is_internal and self._is_telegram_business_slash_event(event):
+            logger.info(
+                "Ignoring Telegram Business customer slash-like message before gateway command dispatch"
+            )
+            return None
+
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
@@ -8071,6 +8187,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_key": session_key,
             })
         
+        # Attach current DB-backed Telegram Business profile context before
+        # building the prompt/cache-significant session context.
+        self._attach_telegram_business_profile_context(event)
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -11025,6 +11145,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
+            business_invocation_mode=getattr(source, "business_invocation_mode", None),
         )
 
     def _thread_metadata_for_target(
@@ -11036,6 +11157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         adapter: Optional[Any] = None,
+        business_invocation_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
         if thread_id is None:
@@ -11056,6 +11178,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 match = re.search(r":topic:(\d+)\s*$", tid)
                 if match:
                     metadata["direct_messages_topic_id"] = match.group(1)
+                business_mode = str(business_invocation_mode or "").strip().lower()
+                if business_mode in {"draft", "auto"}:
+                    metadata["business_mode"] = business_mode
                 return metadata
 
             metadata["telegram_dm_topic_reply_fallback"] = True

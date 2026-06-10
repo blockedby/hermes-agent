@@ -1,0 +1,28 @@
+PI_RESULT: PASS
+TASK: Telegram Business customer slash-command safety (Task 4)
+
+SUMMARY:
+- Implemented adapter-level suppression for Telegram Business customer text and media captions whose trimmed text starts with `/`, including bot suffix forms like `/new@HermesBot`.
+- Implemented gateway defense-in-depth suppression for Business-shaped `MessageEvent` slash text before pre-gateway/command hooks, command handlers, and active-session interrupt logic.
+- Preserved normal Telegram DM `/new` and owner DM `/business` dispatch behavior.
+
+CHANGED FILES:
+- gateway/platforms/telegram.py
+- gateway/run.py
+- tests/gateway/test_telegram_business.py
+- docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/aad-implementer-task4-command-safety.md
+- docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad-implementer-task4-command-safety.md
+
+VERIFICATION:
+- RED container check failed as expected before implementation: 9 failed, 3 passed, 81 deselected.
+- Focused GREEN container pytest node-id run passed: 12 passed in 1.23s.
+- Full file container runner passed: `93 tests passed, 0 failed` for `tests/gateway/test_telegram_business.py`.
+- Container ruff check passed for touched Python files.
+- `git diff --check` passed.
+
+COMMITS:
+- b6d2898b4 fix(gateway): block business customer slash commands
+
+BLOCKERS/FOLLOW-UPS:
+- Blocking: none.
+- Follow-up: pre-existing untracked owner progress file `docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/slice-owner-task4.md` left uncommitted.
