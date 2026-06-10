@@ -9,4 +9,6 @@
 - 2026-06-10: Focused container fallback passed: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_session.py tests/gateway/test_telegram_business.py -- -q -k 'telegram_business_prompt or business_runtime_attaches_matching_database_profile_only or business_profile_change_affects_only_matching_dialog_prompt_signature'` — 4 passed.
 - 2026-06-10: Broader touched-file container fallback passed after cleanup: same `docker run ... scripts/run_tests.sh tests/gateway/test_session.py tests/gateway/test_telegram_business.py` without `-k` — 175 passed.
 - 2026-06-10: Container compile quality check passed after cleanup: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv hermes-agent:test-runner /opt/hermes-test-venv/bin/python -m py_compile gateway/session.py gateway/run.py gateway/platforms/telegram.py`.
-- 2026-06-10: `git diff --check` passed. Plan ledger and root `progress.md` updated. Preparing implementation commit.
+- 2026-06-10: `git diff --check` passed. Plan ledger and root `progress.md` updated.
+- 2026-06-10: Implementation commit created: `7c6a71812380d05846c6f39de7a913057cd1ac91 feat(telegram-business): add dialog profile prompt context`.
+- 2026-06-10: Final report written to `reports/aad-implementer-task3-prompt-runtime.md`; preparing evidence commit.
