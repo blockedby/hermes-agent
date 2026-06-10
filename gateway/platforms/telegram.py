@@ -109,6 +109,7 @@ from gateway.platforms.telegram_business_chats import (
     user_looks_like_bot,
 )
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -527,6 +528,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
         self._business_history_store = TelegramBusinessHistoryStore()
+        self._business_profile_store = TelegramBusinessDialogProfileStore()
         self._business_voice_history_tasks: set[asyncio.Task] = set()
         self._business_voice_history_semaphore = asyncio.Semaphore(
             int(self.config.extra.get("business_voice_history_concurrency", 2) or 2)
@@ -834,6 +836,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if store is None:
             store = TelegramBusinessHistoryStore()
             self._business_history_store = store
+        return store
+
+    def _business_profile_store_obj(self) -> TelegramBusinessDialogProfileStore:
+        store = getattr(self, "_business_profile_store", None)
+        if store is None:
+            store = TelegramBusinessDialogProfileStore()
+            self._business_profile_store = store
         return store
 
     def _business_history_key_from_entry(self, entry: Dict[str, Any]) -> Optional[str]:

@@ -17,10 +17,13 @@ from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
 from gateway.run import GatewayRunner
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
     SessionSource,
+    build_session_context,
+    build_session_context_prompt,
     build_session_key,
 )
 from telegram.constants import ChatType
@@ -271,6 +274,150 @@ def test_normal_dm_topic_metadata_still_uses_numeric_direct_topic_fallback():
         "direct_messages_topic_id": "338575",
         "telegram_reply_to_message_id": "55",
     }
+
+
+def test_business_runtime_attaches_matching_database_profile_only():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    entry_a, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-a",
+        customer_chat_id="111",
+        direct_messages_topic_id="10",
+        text="hello from A",
+        display_name="Alice A",
+        username="alice_a",
+        user_id="7001",
+        user_name="Alice A",
+    )
+    entry_b, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-b",
+        customer_chat_id="222",
+        direct_messages_topic_id="20",
+        text="hello from B",
+        display_name="Bob B",
+        username="bob_b",
+        user_id="7002",
+        user_name="Bob B",
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_a,
+        updates={
+            "assistant_display_name": "A-Hermes",
+            "assistant_prefix": "A:",
+            "dialog_prompt": "Profile prompt for chat A only.",
+            "dialog_notes": "A private notes.",
+        },
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_b,
+        updates={
+            "assistant_display_name": "B-Hermes",
+            "assistant_prefix": "B:",
+            "dialog_prompt": "Profile prompt for chat B only.",
+            "dialog_notes": "B private notes.",
+        },
+    )
+    runner = _gateway_runner_for_metadata()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    event = MessageEvent(
+        text="Customer asks a question",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_name="Alice A",
+            chat_type="dm",
+            user_id="7001",
+            user_name="Alice A",
+            thread_id="business:bc-a:topic:10",
+            chat_topic="Telegram Business",
+        ),
+    )
+
+    runner._attach_telegram_business_profile_context(event)
+    ctx = build_session_context(
+        event.source,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}),
+    )
+    prompt = build_session_context_prompt(ctx)
+
+    assert event.source.business_context["profile"]["dialog_prompt"] == "Profile prompt for chat A only."
+    assert event.source.business_context["customer"]["username"] == "alice_a"
+    assert "Profile prompt for chat A only." in prompt
+    assert "A private notes." in prompt
+    assert "@alice_a" in prompt
+    assert "Profile prompt for chat B only." not in prompt
+    assert "B private notes." not in prompt
+
+
+def test_business_profile_change_affects_only_matching_dialog_prompt_signature():
+    adapter = _make_adapter(owner_chat_id="999")
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    entry_a, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-a",
+        customer_chat_id="111",
+        text="hello from A",
+        display_name="Alice A",
+        username="alice_a",
+        user_id="7001",
+        user_name="Alice A",
+    )
+    entry_b, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-b",
+        customer_chat_id="222",
+        text="hello from B",
+        display_name="Bob B",
+        username="bob_b",
+        user_id="7002",
+        user_name="Bob B",
+    )
+    profile_a = adapter._business_profile_store.upsert_for_chat_entry(
+        entry_a,
+        updates={"dialog_prompt": "Initial chat A prompt."},
+    )
+    adapter._business_profile_store.upsert_for_chat_entry(
+        entry_b,
+        updates={"dialog_prompt": "Stable chat B prompt."},
+    )
+    runner = _gateway_runner_for_metadata()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+
+    def prompt_for(chat_id: str, thread_id: str) -> str:
+        event = MessageEvent(
+            text="Customer turn text that must not enter system prompt",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=chat_id,
+                chat_type="dm",
+                thread_id=thread_id,
+                chat_topic="Telegram Business",
+            ),
+        )
+        runner._attach_telegram_business_profile_context(event)
+        return build_session_context_prompt(build_session_context(event.source, config))
+
+    prompt_a_before = prompt_for("111", "business:bc-a")
+    prompt_b_before = prompt_for("222", "business:bc-b")
+    sig_a_before = GatewayRunner._agent_config_signature("model", {}, [], prompt_a_before)
+    sig_b_before = GatewayRunner._agent_config_signature("model", {}, [], prompt_b_before)
+
+    adapter._business_profile_store.update_by_token(
+        profile_a["token"],
+        {"dialog_prompt": "Updated chat A prompt."},
+    )
+
+    prompt_a_after = prompt_for("111", "business:bc-a")
+    prompt_b_after = prompt_for("222", "business:bc-b")
+    sig_a_after = GatewayRunner._agent_config_signature("model", {}, [], prompt_a_after)
+    sig_b_after = GatewayRunner._agent_config_signature("model", {}, [], prompt_b_after)
+
+    assert "Initial chat A prompt." in prompt_a_before
+    assert "Updated chat A prompt." in prompt_a_after
+    assert sig_a_before != sig_a_after
+    assert prompt_b_before == prompt_b_after
+    assert sig_b_before == sig_b_after
+    assert "Updated chat A prompt." not in prompt_b_after
+    assert "Customer turn text that must not enter system prompt" not in prompt_a_after
 
 
 def _approval_entry(**overrides):

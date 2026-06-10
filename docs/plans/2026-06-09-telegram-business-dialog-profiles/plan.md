@@ -926,6 +926,29 @@ Limitations / side findings:
 - No dashboard UI component implementation in this preliminary slice.
 - Broader dashboard container test/build issues reported as baseline/non-blocking for this contract slice: `business-dashboard-ui.test.tsx` invalid hook call and cached-image Next/Turbopack build root inference.
 
+## Execution update — Task 3 prompt/runtime foundation (2026-06-10)
+
+Status: implementation done for prompt/session/runtime profile lookup scope; awaiting owner acceptance/audit.
+
+Scope completed:
+- Replaced Telegram Business owner-impersonation prompt framing with explicit owner/contact/Hermes participant framing.
+- Added `SessionSource.business_context` and prompt rendering for DB profile settings: assistant display name, assistant prefix, dialog prompt, and dialog notes.
+- Added customer/contact metadata rendering for display name, username, user id, chat id, Business connection, and direct topic when available.
+- Added prompt safety wording that customer slash commands/control words are not Hermes commands, owner manual outgoing messages are authoritative context (not current customer requests), and customer-authored text is conversation input rather than system instructions.
+- Added Telegram adapter profile-store wiring and GatewayRunner runtime attachment so current DB profile settings are looked up for the matching Business dialog before session prompt/cache-signature construction.
+- Added tests proving chat A prompt excludes chat B settings and a chat A profile change changes only chat A cache-significant prompt signature.
+
+Evidence:
+- Implementer report: `reports/aad-implementer-task3-prompt-runtime.md`.
+- Progress: `progress/aad-implementer-task3-prompt-runtime.md`.
+- Container-only focused fallback: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_session.py tests/gateway/test_telegram_business.py -- -q -k 'telegram_business_prompt or business_runtime_attaches_matching_database_profile_only or business_profile_change_affects_only_matching_dialog_prompt_signature'` — passed, 4 tests.
+- Container-only broader fallback: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_session.py tests/gateway/test_telegram_business.py` — passed, 175 tests.
+- Container-only compile check: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv hermes-agent:test-runner /opt/hermes-test-venv/bin/python -m py_compile gateway/session.py gateway/run.py gateway/platforms/telegram.py` — passed.
+
+Limitations / side findings:
+- Canonical `scripts/run_tests_docker.sh` rebuild attempts failed before pytest due transient PyPI/uv download errors (`rich==14.3.3`, then `aiohttp`). Existing-image container fallback was used; no host pytest/npm/uv commands were run.
+- Dashboard UI, Telegram bot prompt buttons, prefix send behavior, mention invocation, and final end-to-end verification remain separate plan tasks.
+
 ## Execution update — Task 2 backend settings API (2026-06-10)
 
 Status: done for backend settings API scope.
