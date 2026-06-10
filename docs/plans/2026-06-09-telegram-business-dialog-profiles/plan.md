@@ -1008,3 +1008,25 @@ Container-only verification:
 Notes:
 - A first dashboard contract rerun exposed a flaky/ineffective tamper helper (`replace(/.$/, "x")` could leave a valid cookie when the signature already ended in `x`). The test now changes the last character to a different character deterministically.
 - No host pytest/npm/uv commands were run.
+
+## Execution update — Task 7 Telegram bot prompt buttons (2026-06-10)
+
+Status: done for bot-button prompt edit/clear scope.
+
+Scope completed:
+- Added `🧠 Prompt` and `🧹 Clear prompt` controls to Telegram Business owner cards.
+- Added authorized `bm:p:<token>` pending prompt edit flow modeled after the existing Add rule flow.
+- Owner next text is consumed before normal owner handling and saved as `dialog_prompt` through the DB profile store.
+- `/cancel` cancels pending prompt edit without saving.
+- `bm:pc:<token>` clears `dialog_prompt` to an empty string through the DB profile store.
+- Prompt save and clear append `settings_changed` history events; history normalization preserves changed `fields` metadata.
+- Existing Add rule flow remains covered.
+
+Evidence:
+- Implementer report: `reports/aad-implementer-task7-bot-prompt-buttons.md`.
+- Commits: `e4acd6ab3 feat(telegram-business): add bot prompt controls`, `2198f9ae7 docs: report task7 bot prompt controls`.
+- Fresh owner container verification: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business_profiles.py -- -q` — passed, 3 files / 136 tests.
+
+Limitations / side findings:
+- No dashboard UI or mention invocation implementation was included in this Task 7 slice.
+- Root `progress.md` had pre-existing unrelated Task 8 dirty content before Task 7; Task 7 progress was appended as requested but left uncommitted to avoid mixing unrelated progress state.
