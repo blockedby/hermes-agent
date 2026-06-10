@@ -1115,3 +1115,93 @@ Container-only checks:
 - `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets sh -lc 'npm run test:auth && npm run typecheck && npm run lint'` — passed; dashboard tests 6 files / 46 tests, then typecheck, then lint.
 
 No host pytest/npm/uv commands were run.
+
+---
+
+## Production bug subtask: dashboard settings invalid_settings (2026-06-10)
+
+### Intake
+- Goal: Fix PR #25 production bug where Telegram Business dashboard Dialog settings save fails with `invalid_settings` because the dashboard BFF forwards `actorUserId` in the JSON body to the Hermes dashboard API.
+- In scope: Narrowly adjust dashboard server API forwarding so actor identity remains conveyed by `X-Telegram-User-Id` header and settings PATCH JSON contains only allowed settings keys. Update route-handler tests to prove no `actorUserId`, `initData`, or unknown client key is forwarded for settings PATCH.
+- Out of scope: Gateway schema relaxation, broad endpoint contract changes, UI redesign, production/Vercel live deploy, host npm/pytest/uv.
+- Done-state: Code committed on `feat/telegram-business-dialog-profiles`; targeted dashboard route-handler test passes in container-only verification.
+- Blocking unknowns: None; current evidence points to `apps/telegram-business-dashboard/src/lib/server/hermes-dashboard-api.ts` adding `actorUserId` to all body requests while `gateway/platforms/telegram_business_dashboard_api.py` rejects unknown settings fields.
+
+### Repo orientation / reuse
+- Dashboard BFF forwarding helper: `apps/telegram-business-dashboard/src/lib/server/hermes-dashboard-api.ts`.
+- Settings PATCH route sanitizes client keys in `apps/telegram-business-dashboard/src/app/api/business/chats/[token]/settings/route.ts`, then calls `callHermesDashboard`.
+- Route-handler tests: `apps/telegram-business-dashboard/src/app/api/business/route-handlers.test.ts` already assert forwarded bodies for mode, settings, draft.
+- Backend strict validation: `gateway/platforms/telegram_business_dashboard_api.py` returns `invalid_settings` for unknown settings fields.
+- Verification should use the dashboard package test runner inside an existing repo container; do not run host `npm`, `pytest`, or `uv`.
+
+### Missing pieces
+- Stop injecting `actorUserId` into forwarded JSON bodies by default, unless a concrete endpoint truly needs body actor.
+- Update tests that currently expect `actorUserId` in body. Settings test must explicitly prove body has only allowed settings keys and excludes `actorUserId`, `initData`, and `unknownKey`.
+
+### Task DS-1: Remove forwarded body actor from dashboard BFF JSON requests
+Goal:
+- Make Hermes dashboard JSON request bodies preserve only the caller-provided sanitized body while actor remains in `X-Telegram-User-Id` header.
+
+Boundary:
+- System area: dashboard server API forwarding and route-handler tests.
+- Primary verification: containerized Vitest route-handler test for `apps/telegram-business-dashboard/src/app/api/business/route-handlers.test.ts`.
+
+Existing pattern / reuse:
+- Reuse existing `callHermesDashboard` header construction and route-level body sanitization.
+- Reuse existing `mockFetch`/route-handler test style.
+
+Missing change:
+- In `hermes-dashboard-api.ts`, change `init.body` serialization from `{ ...body, actorUserId: ... }` to `body` as provided.
+- Adjust route-handler tests for mode/draft if they currently expect body actor.
+- Strengthen settings PATCH assertion to compare exact allowed-key JSON body and assert no `actorUserId`, `initData`, or `unknownKey`.
+
+Scope / likely files:
+- `apps/telegram-business-dashboard/src/lib/server/hermes-dashboard-api.ts`
+- `apps/telegram-business-dashboard/src/app/api/business/route-handlers.test.ts`
+- `docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad-implementer-ds-1.md`
+- `docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/aad-implementer-ds-1.md`
+
+Acceptance criteria:
+- Settings PATCH forwarded request has `X-Telegram-User-Id` header.
+- Settings PATCH forwarded JSON body contains exactly allowed settings keys supplied by route sanitization.
+- Settings PATCH forwarded JSON body excludes `actorUserId`, `initData`, and unknown client keys.
+- No other dashboard BFF route-handler tests are left expecting implicit body actor unless they deliberately provide it in route body.
+
+Evidence route:
+- Existing automated checks first: `route-handlers.test.ts` covers dashboard BFF forwarding.
+- Add/adjust test assertions in that suite.
+- Bounded acceptance probe: run targeted Vitest test inside container only.
+- Access/runtime needed: repository container with Node dependencies; executor must not run host npm.
+- Outcome boundary: proves BFF forwarding contract locally; does not prove live Vercel deployment until PR/deploy pipeline runs.
+
+Test plan:
+- Positive: settings PATCH request returns upstream response and forwards clean settings body with actor header.
+- Negative: initData/unknownKey are not forwarded; actorUserId is not auto-injected into body.
+- Edge: existing mode/draft route-handler expectations updated to the new forwarding helper contract.
+
+Dependencies:
+- Depends on: none.
+- Blocks: final report.
+- Can run parallel with: none; small single implementation task.
+
+Executor:
+- `aad-implementer`.
+
+### Dependency graph / execution ledger
+- DS-1: delegated to `aad-implementer`; report path `docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad-implementer-ds-1.md`; status: pending.
+- Final owner verification/report: depends on DS-1; status: pending.
+
+### DS-1 owner verification update (2026-06-10)
+- DS-1 status: done.
+- Implementer report: `docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad-implementer-ds-1.md`.
+- Code commit: `ba1273715065150c81afc99088b75c964fe43318 fix(dashboard): stop forwarding actor in settings body`.
+- Report commit: `a3e5ac2aa docs: report dashboard settings body fix`.
+- Owner fresh verification (container-only, no host npm/pytest/uv):
+  - `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run test:auth -- src/app/api/business/route-handlers.test.ts` — passed, 1 file / 19 tests.
+  - `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run typecheck` — passed.
+  - `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run lint` — passed.
+- Acceptance mapping:
+  - Actor identity still reaches Hermes via `X-Telegram-User-Id` header: covered by route-handler settings PATCH assertion, passed.
+  - Settings PATCH body contains exactly allowed settings keys: covered by updated route-handler exact body assertion, passed.
+  - Settings PATCH body excludes `actorUserId`, `initData`, and `unknownKey`: covered by updated route-handler negative assertions, passed.
+- Final local done-state for this subtask: ready for PR/deploy pipeline; live Vercel verification was out of scope for this local container-only fix.
