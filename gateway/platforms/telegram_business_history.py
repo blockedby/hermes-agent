@@ -32,6 +32,7 @@ BUSINESS_HISTORY_EVENT_TYPES = {
     "approval_partial",
     "outbound_sent",
     "mode_changed",
+    "settings_changed",
     "rule_matched",
     "media_received",
     "voice_transcribed",

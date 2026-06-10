@@ -32,6 +32,7 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.telegram_business_approvals import TelegramBusinessApprovalStore
 from gateway.platforms.telegram_business_chats import BUSINESS_CHAT_MODES, TelegramBusinessChatRegistry
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,13 @@ _DASHBOARD_TOKEN_ENV = "HERMES_DASHBOARD_API_TOKEN"
 
 _PENDING_APPROVAL_STATUSES = {"pending", "sending"}
 _FAILED_APPROVAL_STATUSES = {"failed", "failed_retryable"}
+_SETTINGS_API_TO_STORE_FIELDS = {
+    "assistantDisplayName": "assistant_display_name",
+    "assistantPrefix": "assistant_prefix",
+    "dialogPrompt": "dialog_prompt",
+    "dialogNotes": "dialog_notes",
+    "invocationPolicy": "invocation_policy",
+}
 
 @dataclass(frozen=True)
 class APIResponse:
@@ -64,6 +72,7 @@ class BusinessDashboardAPI:
         chat_registry: Optional[TelegramBusinessChatRegistry] = None,
         approval_store: Optional[TelegramBusinessApprovalStore] = None,
         history_store: Optional[TelegramBusinessHistoryStore] = None,
+        profile_store: Optional[TelegramBusinessDialogProfileStore] = None,
         enqueue_draft: Optional[Callable[..., bool]] = None,
         enqueue_latest_message: Optional[Callable[..., bool]] = None,
     ) -> None:
@@ -71,6 +80,7 @@ class BusinessDashboardAPI:
         self.chat_registry = chat_registry or TelegramBusinessChatRegistry()
         self.approval_store = approval_store or TelegramBusinessApprovalStore()
         self.history_store = history_store or TelegramBusinessHistoryStore()
+        self.profile_store = profile_store if profile_store is not None else TelegramBusinessDialogProfileStore()
         # Backward-compatible name for the embedded gateway callback: callers can
         # inject either enqueue_latest_message or the older enqueue_draft hook.
         self.enqueue_latest_message = enqueue_latest_message or enqueue_draft
@@ -102,6 +112,13 @@ class BusinessDashboardAPI:
 
         if len(path_parts) == 4 and path_parts[:3] == ["api", "business", "chats"] and method == "GET":
             return self.get_chat(path_parts[3])
+
+        if len(path_parts) == 5 and path_parts[:3] == ["api", "business", "chats"] and path_parts[4] == "settings":
+            if method == "GET":
+                return self.get_settings(path_parts[3])
+            if method == "PATCH":
+                payload = _coerce_body(body)
+                return self.patch_settings(path_parts[3], payload, actor_user_id=actor_user_id)
 
         if len(path_parts) == 5 and path_parts[:3] == ["api", "business", "chats"] and path_parts[4] == "history" and method == "GET":
             params = query or {}
@@ -151,6 +168,48 @@ class BusinessDashboardAPI:
         if key is None or entry is None:
             return _error(404, "chat_not_found", "Business chat not found.")
         return APIResponse(200, {"chat": self._chat_detail_view_model(key, entry), "history": self.history_store.list_events(key)})
+
+    def get_settings(self, token: str) -> APIResponse:
+        key, entry = self.chat_registry.find_by_token(token)
+        if key is None or entry is None:
+            return _error(404, "chat_not_found", "Business chat not found.")
+        profile = self.profile_store.upsert_for_chat_entry(entry)
+        return APIResponse(200, {"settings": _settings_view_model(profile)})
+
+    def patch_settings(
+        self,
+        token: str,
+        payload: Mapping[str, Any],
+        *,
+        actor_user_id: Optional[str] = None,
+    ) -> APIResponse:
+        key, entry = self.chat_registry.find_by_token(token)
+        if key is None or entry is None:
+            return _error(404, "chat_not_found", "Business chat not found.")
+        self.profile_store.upsert_for_chat_entry(entry)
+        updates, unknown = _settings_updates_from_payload(payload)
+        if unknown:
+            return _error(400, "invalid_settings", f"Unknown settings field: {unknown[0]}")
+        try:
+            profile = self.profile_store.update_by_token(
+                str(entry.get("token") or token),
+                updates,
+                actor_user_id=actor_user_id,
+            )
+        except ValueError as exc:
+            return _error(400, "invalid_settings", str(exc))
+        if profile is None:  # pragma: no cover - profile was upserted above
+            return _error(404, "chat_not_found", "Business chat not found.")
+        self.history_store.append_event(
+            key,
+            {
+                "type": "settings_changed",
+                "actor_user_id": actor_user_id,
+                "created_at": time.time(),
+                "fields": sorted(updates),
+            },
+        )
+        return APIResponse(200, {"settings": _settings_view_model(profile)})
 
     def get_history(self, token: str, *, limit: Any = None, cursor: Any = None) -> APIResponse:
         key, entry = self.chat_registry.find_by_token(token)
@@ -444,6 +503,7 @@ def create_app(api: Optional[BusinessDashboardAPI] = None) -> "web.Application":
     app.router.add_route("*", "/api/business/chats/{token}", handle)
     app.router.add_route("*", "/api/business/chats/{token}/mode", handle)
     app.router.add_route("*", "/api/business/chats/{token}/draft", handle)
+    app.router.add_route("*", "/api/business/chats/{token}/settings", handle)
     app.router.add_route("*", "/api/business/chats/{token}/history", handle)
     app.router.add_route("*", "/api/business/approvals", handle)
     return app
@@ -571,6 +631,30 @@ def _can_reply_view(value: Any) -> str:
     if value is False:
         return "no"
     return "unknown"
+
+
+def _settings_updates_from_payload(payload: Mapping[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    updates: Dict[str, Any] = {}
+    unknown: list[str] = []
+    for api_field, value in payload.items():
+        store_field = _SETTINGS_API_TO_STORE_FIELDS.get(str(api_field))
+        if store_field is None:
+            unknown.append(str(api_field))
+            continue
+        updates[store_field] = value
+    return updates, unknown
+
+
+def _settings_view_model(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "chatToken": str(profile.get("token") or ""),
+        "assistantDisplayName": str(profile.get("assistant_display_name") or ""),
+        "assistantPrefix": str(profile.get("assistant_prefix") or ""),
+        "dialogPrompt": str(profile.get("dialog_prompt") or ""),
+        "dialogNotes": str(profile.get("dialog_notes") or ""),
+        "invocationPolicy": str(profile.get("invocation_policy") or "off"),
+        "updatedByUserId": profile.get("updated_by_user_id"),
+    }
 
 
 def _error(status: int, code: str, message: str) -> APIResponse:

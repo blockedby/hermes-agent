@@ -12,6 +12,7 @@ from gateway.platforms.telegram_business_approvals import TelegramBusinessApprov
 from gateway.platforms.telegram_business_chats import TelegramBusinessChatRegistry
 from gateway.platforms.telegram_business_dashboard_api import BusinessDashboardAPI
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
+from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
 
 
 API_TOKEN = "test-dashboard-token"
@@ -64,12 +65,13 @@ def _add_chat(
     return entry
 
 
-def _api(registry, approvals, history, *, enqueue=None) -> BusinessDashboardAPI:
+def _api(registry, approvals, history, *, enqueue=None, profile_store=None) -> BusinessDashboardAPI:
     return BusinessDashboardAPI(
         token=API_TOKEN,
         chat_registry=registry,
         approval_store=approvals,
         history_store=history,
+        profile_store=profile_store,
         enqueue_draft=enqueue,
     )
 
@@ -225,6 +227,132 @@ def test_chat_detail_joins_approval_and_history_summary(registry, approvals, his
     assert resp.body["chat"]["latestMessage"]["preview"] == "please reply"
     assert resp.body["history"][0]["type"] == "inbound"
     assert "customer_chat_id" not in resp.body["chat"]
+
+
+def test_get_chat_settings_returns_database_defaults(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+    profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+
+    resp = _api(registry, approvals, history, profile_store=profile_store).handle_request(
+        "GET",
+        f"/api/business/chats/{entry['token']}/settings",
+        headers=_auth(),
+    )
+
+    assert resp.status == 200
+    assert resp.body["settings"] == {
+        "chatToken": entry["token"],
+        "assistantDisplayName": "Hermes",
+        "assistantPrefix": "🤖 Hermes:",
+        "dialogPrompt": "",
+        "dialogNotes": "",
+        "invocationPolicy": "off",
+        "updatedByUserId": None,
+    }
+    stored = profile_store.get_by_token(entry["token"])
+    assert stored is not None
+    assert stored["dialog_key"] == "bc-1|123|"
+    assert "settings" not in registry.find_by_token(entry["token"])[1]
+
+
+def test_patch_chat_settings_persists_to_database_and_history(registry, approvals, history):
+    entry = _add_chat(
+        registry,
+        connection="bc-1",
+        chat_id="123",
+        text="hello",
+        mode="draft",
+        display_name="Alice",
+        username="alice",
+        now=10,
+    )
+    profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    before_entry = registry.find_by_token(entry["token"])[1]
+
+    resp = _api(registry, approvals, history, profile_store=profile_store).handle_request(
+        "PATCH",
+        f"/api/business/chats/{entry['token']}/settings",
+        headers=_auth(),
+        body={
+            "assistantDisplayName": "Concierge",
+            "assistantPrefix": "🤖 Concierge:",
+            "dialogPrompt": "",
+            "dialogNotes": "VIP customer ✨",
+            "invocationPolicy": "mention_direct",
+        },
+    )
+
+    assert resp.status == 200
+    assert resp.body["settings"] == {
+        "chatToken": entry["token"],
+        "assistantDisplayName": "Concierge",
+        "assistantPrefix": "🤖 Concierge:",
+        "dialogPrompt": "",
+        "dialogNotes": "VIP customer ✨",
+        "invocationPolicy": "mention_direct",
+        "updatedByUserId": "4242",
+    }
+    stored_profile = profile_store.get_by_token(entry["token"])
+    assert stored_profile is not None
+    assert stored_profile["assistant_display_name"] == "Concierge"
+    assert stored_profile["assistant_prefix"] == "🤖 Concierge:"
+    assert stored_profile["dialog_prompt"] == ""
+    assert stored_profile["dialog_notes"] == "VIP customer ✨"
+    assert stored_profile["invocation_policy"] == "mention_direct"
+    assert stored_profile["updated_by_user_id"] == "4242"
+    after_entry = registry.find_by_token(entry["token"])[1]
+    for field in (
+        "mode",
+        "last_message_text",
+        "last_message_preview",
+        "last_message_id",
+        "display_name",
+        "username",
+        "customer_user_id",
+        "customer_user_name",
+    ):
+        assert after_entry.get(field) == before_entry.get(field)
+    assert "settings" not in after_entry
+    assert "assistant_display_name" not in after_entry
+    assert "assistantPrefix" not in after_entry
+    [event] = history.list_events("bc-1|123|")
+    assert event["type"] == "settings_changed"
+    assert event["actor_user_id"] == "4242"
+
+
+def test_patch_chat_settings_rejects_invalid_invocation_policy(registry, approvals, history):
+    entry = _add_chat(registry, connection="bc-1", chat_id="123", text="hello", mode="watch")
+    profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+
+    resp = _api(registry, approvals, history, profile_store=profile_store).handle_request(
+        "PATCH",
+        f"/api/business/chats/{entry['token']}/settings",
+        headers=_auth(),
+        body={"invocationPolicy": "always"},
+    )
+
+    assert resp.status == 400
+    assert resp.body["error"]["code"] == "invalid_settings"
+    assert profile_store.get_by_token(entry["token"])["invocation_policy"] == "off"
+    assert history.list_events("bc-1|123|") == []
+
+
+def test_chat_settings_unknown_chat_returns_404(registry, approvals, history):
+    profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
+    api = _api(registry, approvals, history, profile_store=profile_store)
+
+    get_resp = api.handle_request("GET", "/api/business/chats/not-a-token/settings", headers=_auth())
+    patch_resp = api.handle_request(
+        "PATCH",
+        "/api/business/chats/not-a-token/settings",
+        headers=_auth(),
+        body={"dialogPrompt": "ignored"},
+    )
+
+    assert get_resp.status == 404
+    assert get_resp.body["error"]["code"] == "chat_not_found"
+    assert patch_resp.status == 404
+    assert patch_resp.body["error"]["code"] == "chat_not_found"
 
 
 def test_mode_change_to_watch_updates_registry_and_records_actor_metadata(registry, approvals, history):
