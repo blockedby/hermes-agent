@@ -5,6 +5,7 @@ REPORT_PATH: docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad
 PROGRESS_PATH: docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/aad-implementer-task3-prompt-runtime.md
 COMMITS:
 - 7c6a71812380d05846c6f39de7a913057cd1ac91: feat(telegram-business): add dialog profile prompt context
+- f9323ff73dfedd14992e2515f5d2756f7bb22ddf: docs: report business prompt runtime implementation
 FILES_CHANGED:
 - gateway/session.py: added `SessionSource.business_context` and Telegram Business prompt block for owner/contact/Hermes participants, DB profile settings, customer metadata, and command/context safety wording.
 - gateway/run.py: attaches current DB-backed Business dialog profile/customer/owner metadata to matching Telegram Business events before prompt/cache-significant context construction.

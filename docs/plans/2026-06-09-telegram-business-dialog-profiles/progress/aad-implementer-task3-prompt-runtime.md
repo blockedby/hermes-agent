@@ -11,4 +11,5 @@
 - 2026-06-10: Container compile quality check passed after cleanup: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv hermes-agent:test-runner /opt/hermes-test-venv/bin/python -m py_compile gateway/session.py gateway/run.py gateway/platforms/telegram.py`.
 - 2026-06-10: `git diff --check` passed. Plan ledger and root `progress.md` updated.
 - 2026-06-10: Implementation commit created: `7c6a71812380d05846c6f39de7a913057cd1ac91 feat(telegram-business): add dialog profile prompt context`.
-- 2026-06-10: Final report written to `reports/aad-implementer-task3-prompt-runtime.md`; preparing evidence commit.
+- 2026-06-10: Final report written and committed: `f9323ff73dfedd14992e2515f5d2756f7bb22ddf docs: report business prompt runtime implementation`.
+- 2026-06-10: Metadata correction prepared to include report commit in the report's commit list.
