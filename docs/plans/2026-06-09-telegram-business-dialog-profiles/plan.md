@@ -1030,3 +1030,44 @@ Evidence:
 Limitations / side findings:
 - No dashboard UI or mention invocation implementation was included in this Task 7 slice.
 - Root `progress.md` had pre-existing unrelated Task 8 dirty content before Task 7; Task 7 progress was appended as requested but left uncommitted to avoid mixing unrelated progress state.
+
+## Execution update — Task 6 mention invocation policy (2026-06-10)
+
+Status: integrated in parent worktree; awaiting owner verification after integration with Task 7 and dashboard UI.
+
+Scope completed:
+- Telegram Business routing reads DB profile `invocation_policy` values `off`, `mention_draft`, and `mention_direct`.
+- Configured bot username mentions are detected case-insensitively with punctuation/newline handling.
+- `mention_draft` queues an approval-safe draft without persisting chat mode.
+- `mention_direct` uses one-shot direct behavior via `business_mode=auto` metadata when reply is allowed, without persisting chat mode.
+- Slash-like customer messages, including `/restart@BotName`, remain blocked before Hermes slash-command dispatch.
+- Normal Business mode behavior remains covered by existing tests.
+
+Evidence from delegated slice:
+- Implementer report: `reports/aad-implementer-task6-invocation-policy.md`.
+- Verification artifact: `verification/task6-invocation-policy.md`.
+- Delegated owner focused container run passed: `tests/gateway/test_telegram_business.py -k 'mention or invocation or slash'`, 17 tests.
+- Delegated owner broader touched-file container run passed: `tests/gateway/test_telegram_business.py`, 107 tests.
+- Delegated compile and ruff checks passed inside container.
+
+Limitations / side findings:
+- Task 10 remains the planned scope for broader can-reply-false visibility/history cleanup.
+
+## Execution update — Task 8 dashboard settings UI (2026-06-10)
+
+Status: integrated in parent worktree; awaiting owner verification after integration with Task 6/7.
+
+Scope completed:
+- Added chat detail settings UI for assistant display name, assistant prefix, dialog prompt, dialog notes, and invocation policy.
+- Added load/save/clear/reset handling in the chat detail shell using existing settings API client/BFF contract.
+- Errors render non-destructively while existing latest preview, mode controls, draft prompt, and generate-draft controls remain available.
+- Dashboard UI slice did not change Python runtime/backend code.
+
+Evidence from delegated slice:
+- Implementer report: `reports/aad-implementer-task8-dashboard-settings-ui.md`.
+- Delegated component test passed: `business-dashboard-ui.test.tsx`, 8 tests.
+- Delegated full dashboard auth Vitest suite passed: 6 files / 46 tests.
+- Delegated dashboard typecheck and lint passed inside container.
+
+Limitations / side findings:
+- No live Telegram WebApp/browser smoke was run for this slice; component tests cover the compact settings card behavior.

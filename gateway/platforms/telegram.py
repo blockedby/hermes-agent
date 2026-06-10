@@ -917,6 +917,34 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to read Telegram Business dialog profile", self.name, exc_info=True)
             return {"assistant_prefix": DEFAULT_ASSISTANT_PREFIX}
 
+    def _business_profile_for_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            store = self._business_profile_store_obj()
+            dialog_key = TelegramBusinessChatRegistry.key(
+                entry.get("business_connection_id"),
+                entry.get("customer_chat_id", entry.get("chat_id")),
+                entry.get("direct_messages_topic_id"),
+            )
+            profile = store.get_by_key(dialog_key)
+            if profile is not None:
+                return profile
+            return store.default_profile_for_entry(entry)
+        except Exception:
+            logger.debug("[%s] Failed to read Telegram Business dialog profile", self.name, exc_info=True)
+            return {}
+
+    def _business_invocation_mode_for_message(self, entry: Dict[str, Any], message: Message) -> Optional[str]:
+        """Return one-shot Business mode requested by a configured bot mention."""
+        profile = self._business_profile_for_entry(entry)
+        policy = str(profile.get("invocation_policy") or "off").strip().lower()
+        if policy not in {"mention_draft", "mention_direct"}:
+            return None
+        if not self._message_mentions_bot(message):
+            return None
+        if policy == "mention_draft":
+            return "draft"
+        return "auto"
+
     @staticmethod
     def _apply_business_assistant_prefix(content: str, profile: Optional[Dict[str, Any]]) -> str:
         prefix = DEFAULT_ASSISTANT_PREFIX
@@ -1715,7 +1743,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(source, "chat_id", None),
                 direct_topic_id,
             )
-            if entry and entry.get("mode"):
+            invocation_mode = str(getattr(source, "business_invocation_mode", "") or "").strip().lower()
+            if invocation_mode in {"draft", "auto"}:
+                metadata["business_mode"] = invocation_mode
+            elif entry and entry.get("mode"):
                 metadata["business_mode"] = str(entry.get("mode"))
         except Exception:
             logger.debug("[%s] Failed to attach Telegram Business mode metadata", self.name, exc_info=True)
@@ -7687,9 +7718,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._business_can_reply.setdefault(connection_id, None)
                         entry, is_new_chat = self._business_record_from_message(message, connection_id)
                         mode = str(entry.get("mode") or "watch")
+                        invocation_mode = self._business_invocation_mode_for_message(entry, message)
                         if entry.pop("draft_once", False):
                             self._business_chat_store().update_entry_by_token(str(entry.get("token") or ""), draft_once=False)
                             mode = "draft"
+                            invocation_mode = None
+                        elif invocation_mode:
+                            mode = invocation_mode
                         media_event = None
                         if has_media and mode in {"draft", "auto"}:
                             media_event = await self._prepare_telegram_media_event(
@@ -7723,6 +7758,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             else:
                                 event = self._build_message_event(message, MessageType.TEXT, update_id=update.update_id)
                                 event.text = self._clean_bot_trigger_text(event.text)
+                            if event is not None and invocation_mode:
+                                setattr(event.source, "business_invocation_mode", invocation_mode)
                             self._record_business_history_event(
                                 entry,
                                 {

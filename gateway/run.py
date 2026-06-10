@@ -11145,6 +11145,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
+            business_invocation_mode=getattr(source, "business_invocation_mode", None),
         )
 
     def _thread_metadata_for_target(
@@ -11156,6 +11157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         adapter: Optional[Any] = None,
+        business_invocation_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
         if thread_id is None:
@@ -11176,6 +11178,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 match = re.search(r":topic:(\d+)\s*$", tid)
                 if match:
                     metadata["direct_messages_topic_id"] = match.group(1)
+                business_mode = str(business_invocation_mode or "").strip().lower()
+                if business_mode in {"draft", "auto"}:
+                    metadata["business_mode"] = business_mode
                 return metadata
 
             metadata["telegram_dm_topic_reply_fallback"] = True
