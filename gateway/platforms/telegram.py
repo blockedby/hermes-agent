@@ -109,7 +109,7 @@ from gateway.platforms.telegram_business_chats import (
     user_looks_like_bot,
 )
 from gateway.platforms.telegram_business_history import TelegramBusinessHistoryStore
-from gateway.platforms.telegram_business_profiles import TelegramBusinessDialogProfileStore
+from gateway.platforms.telegram_business_profiles import DEFAULT_ASSISTANT_PREFIX, TelegramBusinessDialogProfileStore
 from gateway.session import (
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_ID,
     TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY,
@@ -845,6 +845,40 @@ class TelegramAdapter(BasePlatformAdapter):
             self._business_profile_store = store
         return store
 
+    def _business_profile_for_send(
+        self,
+        *,
+        chat_id: Any,
+        business_connection_id: Any,
+        direct_messages_topic_id: Any = None,
+    ) -> Dict[str, Any]:
+        entry = {
+            "business_connection_id": str(business_connection_id or ""),
+            "customer_chat_id": str(chat_id or ""),
+            "direct_messages_topic_id": self._normalize_direct_messages_topic_id(direct_messages_topic_id),
+        }
+        try:
+            store = self._business_profile_store_obj()
+            dialog_key = TelegramBusinessChatRegistry.key(
+                entry["business_connection_id"],
+                entry["customer_chat_id"],
+                entry["direct_messages_topic_id"],
+            )
+            return store.get_by_key(dialog_key) or store.default_profile_for_entry(entry)
+        except Exception:
+            logger.debug("[%s] Failed to read Telegram Business dialog profile", self.name, exc_info=True)
+            return {"assistant_prefix": DEFAULT_ASSISTANT_PREFIX}
+
+    @staticmethod
+    def _apply_business_assistant_prefix(content: str, profile: Optional[Dict[str, Any]]) -> str:
+        prefix = DEFAULT_ASSISTANT_PREFIX
+        if profile is not None and "assistant_prefix" in profile:
+            prefix = str(profile.get("assistant_prefix") or "")
+        if not prefix or content.startswith(prefix):
+            return content
+        separator = "" if prefix.endswith((" ", "\n", "\t")) else " "
+        return f"{prefix}{separator}{content}"
+
     def _business_history_key_from_entry(self, entry: Dict[str, Any]) -> Optional[str]:
         try:
             return TelegramBusinessHistoryStore.key(
@@ -1476,15 +1510,21 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not await self._ensure_business_reply_allowed(business_connection_id):
             return SendResult(success=False, error="business_reply_permission_disabled", retryable=False)
+        direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
+        profile = self._business_profile_for_send(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            direct_messages_topic_id=direct_topic_id,
+        )
+        visible_content = self._apply_business_assistant_prefix(content, profile)
         sent: list[str] = []
-        for chunk in self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len):
+        for chunk in self.truncate_message(visible_content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len):
             kwargs = {
                 "chat_id": self._telegram_chat_id(chat_id),
                 "business_connection_id": business_connection_id,
                 "text": chunk,
                 **self._link_preview_kwargs(),
             }
-            direct_topic_id = self._metadata_direct_messages_topic_id(metadata)
             if direct_topic_id:
                 kwargs["direct_messages_topic_id"] = int(direct_topic_id)
             msg = await self._bot.send_message(**kwargs)
@@ -5320,16 +5360,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 draft = entry["draft"]
-                chunks = self.truncate_message(draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+                customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
+                direct_topic_id = self._normalize_direct_messages_topic_id(entry.get("direct_messages_topic_id"))
+                profile = self._business_profile_for_send(
+                    chat_id=customer_chat_id,
+                    business_connection_id=entry["business_connection_id"],
+                    direct_messages_topic_id=direct_topic_id,
+                )
+                visible_draft = self._apply_business_assistant_prefix(draft, profile)
+                chunks = self.truncate_message(visible_draft, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
                 for chunk in chunks:
-                    customer_chat_id = entry.get("customer_chat_id", entry.get("chat_id"))
                     kwargs = {
                         "chat_id": self._telegram_chat_id(customer_chat_id),
                         "business_connection_id": entry["business_connection_id"],
                         "text": chunk,
                         **self._link_preview_kwargs(),
                     }
-                    direct_topic_id = self._normalize_direct_messages_topic_id(entry.get("direct_messages_topic_id"))
                     if direct_topic_id:
                         kwargs["direct_messages_topic_id"] = int(direct_topic_id)
                     msg = await self._bot.send_message(**kwargs)

@@ -969,3 +969,42 @@ Evidence:
 Limitations / side findings:
 - Frontend/UI, runtime prompt injection, invocation policy routing, and Telegram bot prompt controls remain separate plan tasks.
 - Full Docker image rebuild was not rerun for this owner check; targeted container test used existing `hermes-agent:test-runner` image with the worktree bind-mounted.
+
+## Execution update — Task 5 Business send prefix (2026-06-10)
+
+Status: integrated in parent worktree; awaiting final owner verification after conflict resolution with prompt/runtime changes.
+
+Scope completed:
+- Telegram Business direct/auto send path applies the DB profile `assistant_prefix` at send time.
+- Business approval-send callback path applies the DB profile `assistant_prefix` at send time.
+- Prefix application avoids duplicating an already-present prefix.
+- Explicit empty DB prefix disables visible prefix.
+- Prefix is applied before Telegram length chunking so chunk limits are preserved.
+
+Evidence from delegated slice:
+- Implementer report: `reports/aad-implementer-task5-send-prefix.md`.
+- Slice report: `reports/slice-business-send-prefix.md`.
+- Delegated focused container run passed: selected Task 5 tests, `6 passed`.
+- Delegated broader touched-file container run passed: `tests/gateway/test_telegram_business.py`, `98 passed`.
+- Delegated ruff check passed for `gateway/platforms/telegram.py` and `tests/gateway/test_telegram_business.py`.
+- Owner will rerun integrated container tests after parent integration because this slice overlapped with Task 3 prompt/runtime changes.
+
+Limitations / side findings:
+- No dashboard UI, bot prompt buttons, or mention invocation changes in this slice.
+- Docker image rebuild hit transient PyPI/network reset in the delegated worktree; existing-image container fallback was used for container-only verification.
+
+## Owner integration verification — wave 2 (2026-06-10)
+
+Integrated slices:
+- Task 2 backend settings API.
+- Task 3 prompt/runtime profile lookup.
+- Task 5 send-time assistant prefix.
+- Prior Task 8 dashboard settings BFF/client contract remained included.
+
+Container-only verification:
+- `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business_profiles.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_session.py tests/gateway/test_telegram_business.py -- -q` — passed, 4 files / 211 tests.
+- `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run test:auth -- src/lib/business/business-api.test.ts src/app/api/business/route-handlers.test.ts` — passed after stabilizing tampered-cookie test mutation, 2 files / 23 tests.
+
+Notes:
+- A first dashboard contract rerun exposed a flaky/ineffective tamper helper (`replace(/.$/, "x")` could leave a valid cookie when the signature already ended in `x`). The test now changes the last character to a different character deterministically.
+- No host pytest/npm/uv commands were run.

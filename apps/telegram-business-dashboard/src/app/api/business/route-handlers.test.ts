@@ -156,7 +156,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
 
   it("rejects tampered dashboard session cookies without calling Hermes", async () => {
     const fetchMock = mockFetch(200, { chats: [] });
-    const cookie = dashboardSessionCookieHeader().replace(/.$/, "x");
+    const cookie = dashboardSessionCookieHeader().replace(/.$/, (char) => (char === "x" ? "y" : "x"));
 
     const response = await getChats(
       request("http://localhost/api/business/chats", { headers: { cookie } }),

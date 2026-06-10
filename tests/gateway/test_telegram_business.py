@@ -54,6 +54,7 @@ def _make_adapter(*, owner_chat_id: str = "999", owner_thread_id: str | None = N
     adapter._business_history_store = TelegramBusinessHistoryStore(
         Path(tempfile.mkdtemp(prefix="telegram-business-history-")) / "business_history.json"
     )
+    adapter._business_profile_store = TelegramBusinessDialogProfileStore(db_path=":memory:")
     adapter._business_pending_rule_tokens = {}
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -274,6 +275,25 @@ def test_normal_dm_topic_metadata_still_uses_numeric_direct_topic_fallback():
         "direct_messages_topic_id": "338575",
         "telegram_reply_to_message_id": "55",
     }
+
+
+def _upsert_business_profile(
+    adapter: TelegramAdapter,
+    *,
+    business_connection_id: str = "bc-1",
+    customer_chat_id: str = "12345",
+    direct_messages_topic_id: str | None = None,
+    assistant_prefix: str | None = None,
+):
+    updates = {} if assistant_prefix is None else {"assistant_prefix": assistant_prefix}
+    return adapter._business_profile_store.upsert_for_chat_entry(
+        {
+            "business_connection_id": business_connection_id,
+            "customer_chat_id": customer_chat_id,
+            "direct_messages_topic_id": direct_messages_topic_id,
+        },
+        updates=updates,
+    )
 
 
 def test_business_runtime_attaches_matching_database_profile_only():
@@ -1334,7 +1354,76 @@ async def test_business_auto_mode_sends_direct_customer_message():
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert kwargs["chat_id"] == 12345
     assert kwargs["business_connection_id"] == "bc-1"
-    assert kwargs["text"] == "Auto reply"
+    assert kwargs["text"] == "🤖 Hermes: Auto reply"
+
+
+@pytest.mark.asyncio
+async def test_business_auto_send_applies_database_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Custom:")
+
+    result = await adapter.send(
+        "12345",
+        "Auto reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "🤖 Custom: Auto reply"
+
+
+@pytest.mark.asyncio
+async def test_business_send_does_not_double_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Custom:")
+
+    result = await adapter.send(
+        "12345",
+        "🤖 Custom: Already labeled",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "🤖 Custom: Already labeled"
+
+
+@pytest.mark.asyncio
+async def test_business_send_empty_database_prefix_disables_visible_prefix():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="")
+
+    result = await adapter.send(
+        "12345",
+        "Unmarked reply",
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    assert kwargs["text"] == "Unmarked reply"
+
+
+@pytest.mark.asyncio
+async def test_business_send_preserves_chunk_limit_after_prefixing():
+    adapter = _make_adapter(owner_chat_id="999")
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Long:")
+
+    result = await adapter.send(
+        "12345",
+        "x" * adapter.MAX_MESSAGE_LENGTH,
+        metadata={"thread_id": "business:bc-1", "business_mode": "auto"},
+    )
+
+    assert result.success is True
+    first_chunk = adapter._bot.send_message.call_args_list[0].kwargs["text"]
+    assert first_chunk.startswith("🤖 Long: ")
+    assert telegram_mod.utf16_len(first_chunk) <= adapter.MAX_MESSAGE_LENGTH
 
 
 @pytest.mark.asyncio
@@ -1413,6 +1502,35 @@ async def test_business_approval_send_writes_gateway_audit_session(monkeypatch):
     assert payload["audit_session_key"] == TELEGRAM_BUSINESS_APPROVAL_AUDIT_SESSION_KEY
     assert payload["origin_session_key"] == "agent:main:telegram:dm:12345:business:bc-1"
     assert payload["sent_message_ids"] == ["101"]
+
+
+@pytest.mark.asyncio
+async def test_business_approval_send_applies_database_prefix():
+    adapter = _make_adapter()
+    _allow_business_reply(adapter)
+    _upsert_business_profile(adapter, assistant_prefix="🤖 Approved:")
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    adapter._business_approval_state["approve-1"] = _approval_entry(draft="Approved text")
+    query = SimpleNamespace(
+        data="ba:s:approve-1",
+        from_user=SimpleNamespace(id=111, first_name="Owner"),
+        message=SimpleNamespace(
+            chat_id=999,
+            chat=SimpleNamespace(type=ChatType.PRIVATE),
+            message_thread_id=None,
+            message_id=101,
+        ),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    call_kwargs = adapter._bot.send_message.call_args.kwargs
+    assert call_kwargs["chat_id"] == 12345
+    assert call_kwargs["business_connection_id"] == "bc-1"
+    assert call_kwargs["text"] == "🤖 Approved: Approved text"
+    query.answer.assert_awaited_with(text="Sent")
 
 
 def test_business_thread_id_helpers_include_direct_messages_topic_identity():
@@ -1971,7 +2089,7 @@ async def test_business_approval_send_uses_business_connection_id():
     call_kwargs = adapter._bot.send_message.call_args.kwargs
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     query.answer.assert_awaited_with(text="Sent")
 
 
@@ -2003,7 +2121,7 @@ async def test_business_approval_send_ignores_corrupt_non_numeric_direct_topic_i
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
     assert "direct_messages_topic_id" not in call_kwargs
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     query.answer.assert_awaited_with(text="Sent")
 
 
@@ -2049,7 +2167,7 @@ async def test_business_approval_callback_uses_stored_entry_without_current_owne
     assert call_kwargs["chat_id"] == 12345
     assert call_kwargs["business_connection_id"] == "bc-1"
     assert call_kwargs["direct_messages_topic_id"] == 338575
-    assert call_kwargs["text"] == "Approved text"
+    assert call_kwargs["text"] == "🤖 Hermes: Approved text"
     assert "approve-1" not in adapter._business_approval_state
     query.answer.assert_awaited_with(text="Sent")
 
