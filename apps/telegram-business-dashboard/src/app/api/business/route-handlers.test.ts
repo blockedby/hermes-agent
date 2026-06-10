@@ -257,7 +257,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
     );
   });
 
-  it("POSTs mode changes with actor header and actor body without forwarding initData", async () => {
+  it("POSTs mode changes with actor header and sanitized body without forwarding initData", async () => {
     const fetchMock = mockFetch(200, { chat: { token: CHAT_TOKEN, mode: "auto" } });
 
     const response = await postMode(
@@ -279,10 +279,12 @@ describe("Telegram Business dashboard BFF route handlers", () => {
           "content-type": "application/json",
           "x-telegram-user-id": String(TEST_ADMIN_USER_ID),
         }),
-        body: JSON.stringify({ mode: "auto", actorUserId: String(TEST_ADMIN_USER_ID) }),
+        body: JSON.stringify({ mode: "auto" }),
       }),
     );
     const upstreamBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(upstreamBody).toEqual({ mode: "auto" });
+    expect(upstreamBody).not.toHaveProperty("actorUserId");
     expect(upstreamBody).not.toHaveProperty("initData");
   });
 
@@ -340,7 +342,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
     );
   });
 
-  it("PATCHes chat settings with only allowed settings keys plus actor body", async () => {
+  it("PATCHes chat settings with actor header and exactly allowed settings keys", async () => {
     const fetchMock = mockFetch(200, {
       settings: {
         assistantDisplayName: "Mercury",
@@ -384,11 +386,18 @@ describe("Telegram Business dashboard BFF route handlers", () => {
           dialogPrompt: "Updated prompt",
           dialogNotes: "VIP customer",
           invocationPolicy: "mention_direct",
-          actorUserId: String(TEST_ADMIN_USER_ID),
         }),
       }),
     );
     const upstreamBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(upstreamBody).toEqual({
+      assistantDisplayName: "Mercury",
+      assistantPrefix: "🤖 Mercury:",
+      dialogPrompt: "Updated prompt",
+      dialogNotes: "VIP customer",
+      invocationPolicy: "mention_direct",
+    });
+    expect(upstreamBody).not.toHaveProperty("actorUserId");
     expect(upstreamBody).not.toHaveProperty("initData");
     expect(upstreamBody).not.toHaveProperty("unknownKey");
   });
@@ -416,7 +425,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("POSTs draft requests with source latest and actor body", async () => {
+  it("POSTs draft requests with source latest and sanitized body", async () => {
     const fetchMock = mockFetch(202, {
       draft: { status: "queued", chatToken: CHAT_TOKEN, source: "latest", sentToCustomer: false },
     });
@@ -435,7 +444,7 @@ describe("Telegram Business dashboard BFF route handlers", () => {
       "https://hermes.example.test/dashboard/api/business/chats/chat-token-1/draft",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ source: "latest", prompt: "focus on warranty", actorUserId: String(TEST_ADMIN_USER_ID) }),
+        body: JSON.stringify({ source: "latest", prompt: "focus on warranty" }),
       }),
     );
   });

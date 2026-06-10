@@ -89,7 +89,7 @@ export async function callHermesDashboard<T>(
 
   if (body) {
     headers["content-type"] = "application/json";
-    init.body = JSON.stringify({ ...body, actorUserId: String(actorUserId) });
+    init.body = JSON.stringify(body);
   }
 
   const response = await fetch(dashboardUrl(path, searchParams), init);
