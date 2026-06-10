@@ -925,3 +925,24 @@ Limitations / side findings:
 - No backend Python settings persistence implemented in this slice; BFF depends only on the forwarding contract from Task 2.
 - No dashboard UI component implementation in this preliminary slice.
 - Broader dashboard container test/build issues reported as baseline/non-blocking for this contract slice: `business-dashboard-ui.test.tsx` invalid hook call and cached-image Next/Turbopack build root inference.
+
+## Execution update — Task 2 backend settings API (2026-06-10)
+
+Status: done for backend settings API scope.
+
+Scope completed:
+- Added `profile_store` dependency injection to `BusinessDashboardAPI`.
+- Added `GET`/`PATCH /api/business/chats/{token}/settings` dispatch and aiohttp route registration.
+- Mapped camelCase API settings to DB-store snake_case fields and returns normalized camelCase settings.
+- Successful PATCH appends a `settings_changed` history event with actor id.
+- Tests inject in-memory SQLite profile store and assert settings are not written to `business_chats.json` registry metadata.
+
+Evidence:
+- Implementer report: `reports/aad-implementer-task2-backend-settings-api.md`.
+- Verification artifact: `verification/task2-backend-settings-api.md`.
+- Commits: `49f13ccd1 feat(telegram-business): add dashboard settings API`, `b047a5586 docs: add task2 implementation evidence`.
+- Fresh owner container verification: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business_profiles.py` — passed, 31 tests.
+
+Limitations / side findings:
+- Frontend/UI, runtime prompt injection, invocation policy routing, and Telegram bot prompt controls remain separate plan tasks.
+- Full Docker image rebuild was not rerun for this owner check; targeted container test used existing `hermes-agent:test-runner` image with the worktree bind-mounted.
