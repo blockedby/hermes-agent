@@ -119,6 +119,16 @@ def _make_photo(data: bytes = b"photo-bytes", file_path: str = "photos/photo.jpg
     return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
 
 
+def _inline_button_field(button, field: str):
+    value = getattr(button, field, None)
+    if value is not None:
+        return value
+    to_dict = getattr(button, "to_dict", None)
+    if callable(to_dict):
+        return to_dict().get(field)
+    return None
+
+
 def _make_voice(data: bytes = b"voice-bytes", file_path: str = "voice/file.ogg"):
     return SimpleNamespace(get_file=AsyncMock(return_value=_make_file_obj(data, file_path)))
 
@@ -1213,6 +1223,171 @@ async def test_business_mode_callback_requires_owner_and_updates_mode():
 
     assert adapter._business_chat_registry.find_by_token(token)[1]["mode"] == "ignored"
     denied.edit_message_text.assert_not_called()
+
+
+def test_business_mode_keyboard_contains_prompt_controls(monkeypatch):
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardButton",
+        lambda text, callback_data=None, **kwargs: SimpleNamespace(text=text, callback_data=callback_data, **kwargs),
+    )
+    monkeypatch.setattr(
+        telegram_mod,
+        "InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+
+    keyboard = adapter._business_mode_keyboard(entry)
+    watch_keyboard = adapter._business_mode_keyboard(entry, watch_actions=True)
+    buttons = {
+        (_inline_button_field(button, "text"), _inline_button_field(button, "callback_data"))
+        for row in keyboard.inline_keyboard + watch_keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert ("🧠 Prompt", f"bm:p:{token}") in buttons
+    assert ("🧹 Clear prompt", f"bm:pc:{token}") in buttons
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_button_stores_next_owner_text_as_dialog_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_pending_prompt_tokens
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited()
+
+    owner_msg = _telegram_message(text="Answer warmly and mention the warranty.")
+    owner_msg.chat.id = 999
+    owner_msg.from_user.id = 999
+    update = SimpleNamespace(message=owner_msg, update_id=707, business_message=None, effective_message=owner_msg)
+    await adapter._handle_text_message(update, None)
+
+    assert adapter._business_pending_prompt_tokens == {}
+    profile = adapter._business_profile_store.get_by_token(token)
+    assert profile is not None
+    assert profile["dialog_prompt"] == "Answer warmly and mention the warranty."
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    events = adapter._business_history_store.list_events(key)
+    assert any(event["type"] == "settings_changed" and event["actor_user_id"] == "999" and event["fields"] == ["dialog_prompt"] for event in events)
+    assert adapter._pending_text_batches == {}
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_cancel_does_not_save_dialog_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._business_profile_store.upsert_for_chat_entry(entry, updates={"dialog_prompt": "Keep me."})
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    owner_msg = _telegram_message(text="/cancel")
+    owner_msg.chat.id = 999
+    owner_msg.from_user.id = 999
+    update = SimpleNamespace(message=owner_msg, update_id=708, business_message=None, effective_message=owner_msg)
+    await adapter._handle_command(update, None)
+
+    assert adapter._business_pending_prompt_tokens == {}
+    assert adapter._business_profile_store.get_by_token(token)["dialog_prompt"] == "Keep me."
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    assert not any(event["type"] == "settings_changed" for event in adapter._business_history_store.list_events(key))
+
+
+@pytest.mark.asyncio
+async def test_business_clear_prompt_button_writes_empty_prompt_and_history():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._business_profile_store.upsert_for_chat_entry(entry, updates={"dialog_prompt": "Existing prompt."})
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
+    query = SimpleNamespace(
+        data=f"bm:pc:{token}",
+        from_user=SimpleNamespace(id=999, first_name="Owner"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    assert adapter._business_profile_store.get_by_token(token)["dialog_prompt"] == ""
+    key, _saved = adapter._business_chat_registry.find_by_token(token)
+    events = adapter._business_history_store.list_events(key)
+    assert any(event["type"] == "settings_changed" and event["actor_user_id"] == "999" and event["fields"] == ["dialog_prompt"] for event in events)
+    query.answer.assert_awaited_with(text="Prompt cleared.")
+    query.edit_message_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_business_prompt_callback_rejects_unauthorized_user_without_pending_prompt():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-1",
+        customer_chat_id="12345",
+        text="hello",
+        display_name="Customer",
+    )
+    token = entry["token"]
+    adapter._is_callback_user_authorized = MagicMock(return_value=False)
+    query = SimpleNamespace(
+        data=f"bm:p:{token}",
+        from_user=SimpleNamespace(id=111, first_name="Other"),
+        message=SimpleNamespace(chat_id=999, chat=SimpleNamespace(type=ChatType.PRIVATE), message_thread_id=None, message_id=101),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    query.answer.assert_awaited_with(text="⛔ You are not authorized to manage Business chats.")
+    query.edit_message_text.assert_not_called()
+    assert getattr(adapter, "_business_pending_prompt_tokens", {}) == {}
+    assert adapter._business_profile_store.get_by_token(token) is None
 
 
 @pytest.mark.asyncio

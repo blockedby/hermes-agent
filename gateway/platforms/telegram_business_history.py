@@ -72,7 +72,7 @@ _TEXT_FIELDS = {
     "error": 1000,
 }
 
-_LIST_STRING_FIELDS = {"message_ids", "media_urls", "media_types"}
+_LIST_STRING_FIELDS = {"message_ids", "media_urls", "media_types", "fields"}
 
 
 class TelegramBusinessHistoryStore:

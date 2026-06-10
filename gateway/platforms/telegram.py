@@ -525,6 +525,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # updates and lazily refreshed by getBusinessConnection when possible.
         self._business_can_reply: Dict[str, Optional[bool]] = {}
         self._business_pending_rule_tokens: Dict[str, Dict[str, Any]] = {}
+        self._business_pending_prompt_tokens: Dict[str, Dict[str, Any]] = {}
         self._business_approval_store = TelegramBusinessApprovalStore()
         self._business_approval_state: Dict[str, Dict[str, Any]] = self._business_approval_store.load()
         self._business_history_store = TelegramBusinessHistoryStore()
@@ -566,6 +567,53 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id=self._telegram_message_chat_id(message),
             thread_id=str(getattr(message, "message_thread_id", "") or ""),
         )
+
+    async def _maybe_handle_business_prompt_text(self, message: Message) -> bool:
+        """Consume next owner text message as a Telegram Business dialog prompt."""
+        pending = getattr(self, "_business_pending_prompt_tokens", None)
+        if not isinstance(pending, dict):
+            self._business_pending_prompt_tokens = pending = {}
+        prompt_key = self._business_rule_prompt_key_for_message(message)
+        state = pending.pop(prompt_key, None)
+        if not state:
+            return False
+        token = str(state.get("token") or "").strip()
+        prompt = str(getattr(message, "text", "") or "").strip()
+        actor_user_id = self._telegram_message_user_id(message) or str(state.get("actor_user_id") or "")
+        chat_id = self._telegram_message_chat_id(message)
+        thread_id = str(getattr(message, "message_thread_id", "") or "")
+        metadata = {"thread_id": thread_id} if thread_id else None
+        if not prompt or prompt.startswith("/"):
+            if chat_id:
+                await self.send(chat_id, "Prompt edit cancelled.", metadata=metadata)
+            return True
+        key, entry = self._business_chat_store().find_by_token(token)
+        if key is None or entry is None:
+            if chat_id:
+                await self.send(chat_id, "Business chat not found; prompt was not saved.", metadata=metadata)
+            return True
+        try:
+            self._business_profile_store_obj().upsert_for_chat_entry(
+                entry,
+                updates={"dialog_prompt": prompt},
+                actor_user_id=actor_user_id,
+            )
+        except ValueError as exc:
+            if chat_id:
+                await self.send(chat_id, f"Prompt was not saved: {exc}", metadata=metadata)
+            return True
+        self._record_business_history_event(
+            entry,
+            {
+                "type": "settings_changed",
+                "actor_user_id": actor_user_id,
+                "created_at": time.time(),
+                "fields": ["dialog_prompt"],
+            },
+        )
+        if chat_id:
+            await self.send(chat_id, "✅ Dialog prompt saved.", metadata=metadata)
+        return True
 
     async def _maybe_handle_business_rule_text(self, message: Message) -> bool:
         """Consume next owner text message as a notify-only Business watch rule."""
@@ -1350,6 +1398,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("⚡ Auto", callback_data=f"bm:m:{token}:auto"),
                 ],
             ])
+        rows.append([
+            InlineKeyboardButton("🧠 Prompt", callback_data=f"bm:p:{token}"),
+            InlineKeyboardButton("🧹 Clear prompt", callback_data=f"bm:pc:{token}"),
+        ])
         return InlineKeyboardMarkup(rows)
 
     def _business_chat_card_text(
@@ -5158,6 +5210,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 return
+            if len(parts) == 3 and parts[1] == "p":
+                token = parts[2]
+                entry = self._business_chat_store().find_by_token(token)[1]
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                prompt_key = self._business_rule_prompt_key(
+                    user_id=caller_id,
+                    chat_id=str(query_chat_id or ""),
+                    thread_id=str(query_thread_id or ""),
+                )
+                pending_prompts = getattr(self, "_business_pending_prompt_tokens", None)
+                if not isinstance(pending_prompts, dict):
+                    self._business_pending_prompt_tokens = pending_prompts = {}
+                pending_prompts[prompt_key] = {
+                    "token": token,
+                    "actor_user_id": caller_id,
+                    "created_at": time.time(),
+                }
+                await query.answer(text="Send the dialog prompt as your next message.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(
+                            entry,
+                            title="Edit dialog prompt",
+                        ) + "\n\nReply here with the owner instructions Hermes should use for this dialog. Send <code>/cancel</code> to cancel.",
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry, watch_actions=True),
+                    )
+                except Exception:
+                    pass
+                return
+            if len(parts) == 3 and parts[1] == "pc":
+                token = parts[2]
+                _key, entry = self._business_chat_store().find_by_token(token)
+                if not entry:
+                    await query.answer(text="Business chat not found.")
+                    return
+                self._business_profile_store_obj().upsert_for_chat_entry(
+                    entry,
+                    updates={"dialog_prompt": ""},
+                    actor_user_id=caller_id,
+                )
+                self._record_business_history_event(
+                    entry,
+                    {
+                        "type": "settings_changed",
+                        "actor_user_id": caller_id,
+                        "created_at": time.time(),
+                        "fields": ["dialog_prompt"],
+                    },
+                )
+                await query.answer(text="Prompt cleared.")
+                try:
+                    await query.edit_message_text(
+                        text=self._business_chat_card_text(entry, title="Dialog prompt cleared"),
+                        parse_mode="HTML",
+                        reply_markup=self._business_mode_keyboard(entry),
+                    )
+                except Exception:
+                    pass
+                return
             if len(parts) == 3 and parts[1] == "r":
                 token = parts[2]
                 entry = self._business_chat_store().find_by_token(token)[1]
@@ -7649,6 +7763,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(msg)
+        if await self._maybe_handle_business_prompt_text(msg):
+            return
         if await self._maybe_handle_business_rule_text(msg):
             return
 
@@ -7665,6 +7781,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+        if await self._maybe_handle_business_prompt_text(msg):
+            return
         command = str(msg.text or "").strip().split()[0].split("@", 1)[0].lower()
         if command == "/business":
             caller_id = self._telegram_message_user_id(msg) or ""
