@@ -1,0 +1,13 @@
+# Task 4 command safety progress
+
+- 2026-06-10: Started implementer work in `/tmp/pi-worktree-75ea7da4-1`; read AGENTS/CLAUDE, plan Task 4, relevant Telegram adapter/gateway/test files. Initial git status had only task-package progress dir untracked.
+- 2026-06-10: Confirmed container-only verification command pattern from `docker-compose.test.yml`: `docker compose -f docker-compose.test.yml run --rm test scripts/run_tests.sh ...`.
+- 2026-06-10: Added RED tests in `tests/gateway/test_telegram_business.py` for adapter text/caption slash suppression, gateway command-handler suppression, active-session `/stop`, normal DM `/new`, and owner `/business`.
+- 2026-06-10: RED evidence (container, rebuilt image): `docker compose -f docker-compose.test.yml run --rm --build test bash -lc 'source "$HERMES_TEST_VENV/bin/activate" && python -m pytest tests/gateway/test_telegram_business.py -q -k "business_customer_text_slash_command_is_ignored_before_agent or business_media_caption_slash_command_is_ignored_before_agent or gateway_blocks_business_customer_slash_commands_before_dispatch or gateway_business_stop_does_not_interrupt_active_session or gateway_normal_telegram_dm_new_still_dispatches or gateway_owner_business_control_command_still_dispatches"'` failed as expected: 9 failed, 3 passed, 81 deselected. Failures showed caption `/restart@HermesBot` enqueued media; Business commands dispatched handlers; active-session `/stop` entered active-session path.
+- 2026-06-10: Implemented adapter helper to treat Business text or captions with leading whitespace + `/...` (including `/new@BotName`) as slash-like and ignore before media preparation/agent enqueue.
+- 2026-06-10: Implemented gateway defense-in-depth early guard for Business-shaped `MessageEvent` slash text before pre-gateway/command hook dispatch, command handlers, and active-session interrupt logic.
+- 2026-06-10: GREEN focused evidence: `docker compose -f docker-compose.test.yml run --rm test bash -lc 'source "$HERMES_TEST_VENV/bin/activate" && python -m pytest -q <six Task 4 node ids>'` passed: `12 passed in 1.23s`.
+- 2026-06-10: Full file container runner evidence: `docker compose -f docker-compose.test.yml run --rm test scripts/run_tests.sh tests/gateway/test_telegram_business.py -- -q` passed: `93 tests passed, 0 failed`.
+- 2026-06-10: Quality checks passed: container `python -m ruff check gateway/platforms/telegram.py gateway/run.py tests/gateway/test_telegram_business.py`; `git diff --check`.
+- 2026-06-10: Implementation commit created: `b6d2898b4 fix(gateway): block business customer slash commands`.
+- 2026-06-10: Final report and subagent log written under task package reports; preparing evidence commit.

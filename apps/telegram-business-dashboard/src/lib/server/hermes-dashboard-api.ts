@@ -10,6 +10,7 @@ export type {
   BusinessHistoryEvent,
   BusinessHistoryResponse,
   BusinessModeResponse,
+  BusinessSettingsResponse,
 } from "@/lib/business/types";
 
 export type HermesDashboardResponse<T> = {
@@ -25,7 +26,7 @@ export class HermesDashboardConfigError extends Error {
 }
 
 export type HermesDashboardRequestOptions = {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH";
   actorUserId: number;
   searchParams?: URLSearchParams;
   body?: Record<string, unknown>;

@@ -5,6 +5,8 @@ import type {
   BusinessDraftResponse,
   BusinessHistoryResponse,
   BusinessModeResponse,
+  BusinessSettingsPatch,
+  BusinessSettingsResponse,
 } from "./types";
 
 export class BusinessApiError extends Error {
@@ -20,7 +22,7 @@ export class BusinessApiError extends Error {
 }
 
 type RequestOptions = {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH";
   initData: string;
   body?: Record<string, unknown>;
 };
@@ -67,6 +69,24 @@ export function fetchBusinessChatDetail(token: string, initData: string): Promis
 export function fetchBusinessHistory(token: string, initData: string): Promise<BusinessHistoryResponse> {
   return businessFetch<BusinessHistoryResponse>(`/api/business/chats/${encodeURIComponent(token)}/history`, {
     initData,
+  });
+}
+
+export function fetchBusinessChatSettings(token: string, initData: string): Promise<BusinessSettingsResponse> {
+  return businessFetch<BusinessSettingsResponse>(`/api/business/chats/${encodeURIComponent(token)}/settings`, {
+    initData,
+  });
+}
+
+export function updateBusinessChatSettings(
+  token: string,
+  initData: string,
+  settingsPatch: BusinessSettingsPatch,
+): Promise<BusinessSettingsResponse> {
+  return businessFetch<BusinessSettingsResponse>(`/api/business/chats/${encodeURIComponent(token)}/settings`, {
+    method: "PATCH",
+    initData,
+    body: settingsPatch,
   });
 }
 

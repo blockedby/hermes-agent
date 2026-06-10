@@ -2499,6 +2499,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and str(getattr(source, "thread_id", "") or "").startswith("business:")
         )
 
+    def _is_telegram_business_slash_event(self, event: MessageEvent) -> bool:
+        """Return True when a Business customer event is slash-command shaped."""
+        return self._is_telegram_business_source(event.source) and str(event.text or "").lstrip().startswith("/")
+
     def _is_message_dispatch_authorized(self, source: SessionSource) -> bool:
         """Return True when an inbound event may enter the agent pipeline.
 
@@ -6482,6 +6486,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+
+        if not is_internal and self._is_telegram_business_slash_event(event):
+            logger.info(
+                "Ignoring Telegram Business customer slash-like message before gateway command dispatch"
+            )
+            return None
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:

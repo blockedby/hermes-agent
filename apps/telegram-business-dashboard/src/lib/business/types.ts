@@ -1,5 +1,6 @@
 export type BusinessChatMode = "ignored" | "watch" | "draft" | "auto";
 export type BusinessCanReply = "yes" | "no" | "unknown";
+export type BusinessInvocationPolicy = "off" | "mention_draft" | "mention_direct";
 
 export type BusinessChatSummary = {
   token: string;
@@ -49,6 +50,27 @@ export type BusinessChatResponse = {
 export type BusinessModeResponse = {
   chat: BusinessChatDetail;
 };
+
+export interface BusinessDialogSettings {
+  assistantDisplayName: string;
+  assistantPrefix: string;
+  dialogPrompt: string;
+  dialogNotes: string;
+  invocationPolicy: BusinessInvocationPolicy;
+  updatedAt?: number;
+  updatedByUserId?: string;
+}
+
+export type BusinessSettingsPatch = Partial<
+  Pick<
+    BusinessDialogSettings,
+    "assistantDisplayName" | "assistantPrefix" | "dialogPrompt" | "dialogNotes" | "invocationPolicy"
+  >
+>;
+
+export interface BusinessSettingsResponse {
+  settings: BusinessDialogSettings;
+}
 
 export type BusinessDraftResponse = {
   draft: {

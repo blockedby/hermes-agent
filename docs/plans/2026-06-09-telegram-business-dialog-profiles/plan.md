@@ -906,3 +906,22 @@ Recommended waves:
 - [ ] Mention invocation policy works and does not open slash-command execution.
 - [ ] Mode/direct/draft behavior is clear and tested.
 - [ ] Container-only targeted verification is recorded under `verification/`.
+
+## Execution update — Task 8 preliminary dashboard settings contract (2026-06-10)
+
+Status: done for preliminary contract scope.
+
+Scope completed:
+- Added dashboard settings types/API client methods for `GET`/`PATCH /api/business/chats/:token/settings`.
+- Added BFF route forwarding for settings GET/PATCH using existing dashboard auth/session/safe-response patterns.
+- Added targeted client and route tests for request shapes, auth rejection, allowed PATCH keys, actor forwarding, and validation error mapping.
+
+Evidence:
+- Implementer report: `reports/aad-implementer-task8-dashboard-settings-contract.md`.
+- Commits: `c60cc687c feat(dashboard): add business settings route contract`, `98715afaa docs: report dashboard settings contract implementation`.
+- Fresh owner container verification: `docker run --rm -w /workspace/apps/telegram-business-dashboard -v "$PWD/apps/telegram-business-dashboard/src:/workspace/apps/telegram-business-dashboard/src:ro" hermes-agent:test-runner-assets npm run test:auth -- src/lib/business/business-api.test.ts src/app/api/business/route-handlers.test.ts` — passed, 2 files / 23 tests.
+
+Limitations / side findings:
+- No backend Python settings persistence implemented in this slice; BFF depends only on the forwarding contract from Task 2.
+- No dashboard UI component implementation in this preliminary slice.
+- Broader dashboard container test/build issues reported as baseline/non-blocking for this contract slice: `business-dashboard-ui.test.tsx` invalid hook call and cached-image Next/Turbopack build root inference.

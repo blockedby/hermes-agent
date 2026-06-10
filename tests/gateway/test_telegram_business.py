@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms import telegram as telegram_mod
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.telegram import ApplicationHandlerStop, TelegramAdapter
@@ -162,6 +162,67 @@ def _allow_business_reply(adapter: TelegramAdapter, connection_id: str = "bc-1")
 
 def _gateway_runner_for_metadata() -> GatewayRunner:
     return object.__new__(GatewayRunner)
+
+
+def _business_source(*, thread_id: str = "business:bc-1") -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="67890",
+        user_name="Customer User",
+        thread_id=thread_id,
+        chat_topic="Telegram Business",
+    )
+
+
+def _owner_dm_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        chat_type="dm",
+        user_id="999",
+        user_name="Owner",
+    )
+
+
+def _gateway_runner_for_command_dispatch(source: SessionSource):
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())}
+    runner.session_store = MagicMock()
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_key_for_source = MagicMock(return_value=build_session_key(source))
+    runner._update_prompt_pending = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._check_slash_access = MagicMock(return_value=None)
+    runner._is_telegram_topic_root_lobby = MagicMock(return_value=False)
+    runner._handle_status_command = AsyncMock(side_effect=AssertionError("/status must not dispatch"))
+    runner._handle_help_command = AsyncMock(side_effect=AssertionError("/help must not dispatch"))
+    runner._handle_approve_command = AsyncMock(side_effect=AssertionError("/approve must not dispatch"))
+    runner._handle_deny_command = AsyncMock(side_effect=AssertionError("/deny must not dispatch"))
+    runner._handle_restart_command = AsyncMock(side_effect=AssertionError("/restart must not dispatch"))
+    runner._handle_business_command = AsyncMock(return_value="business ok")
+    runner._handle_reset_command = AsyncMock(return_value="reset ok")
+    runner._maybe_confirm_destructive_slash = AsyncMock(
+        side_effect=AssertionError("destructive slash confirm must not dispatch")
+    )
+    runner._interrupt_and_clear_session = AsyncMock(
+        side_effect=AssertionError("/stop must not interrupt Business sessions")
+    )
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(side_effect=AssertionError("command hook must not dispatch")),
+        loaded_hooks=False,
+    )
+    return runner
+
+
+async def _execute_confirmed_slash(**kwargs):
+    return await kwargs["execute"]()
 
 
 def test_business_thread_metadata_does_not_treat_connection_marker_as_dm_topic():
@@ -510,6 +571,64 @@ async def test_business_watch_chat_notifies_owner_without_agent():
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert "Telegram Business watch" in kwargs["text"]
     assert "business_connection_id" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_business_customer_text_slash_command_is_ignored_before_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-command",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    update = SimpleNamespace(
+        update_id=889,
+        business_connection=None,
+        business_message=_business_message(text="  /new@HermesBot please", connection_id="bc-command"),
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_business_media_caption_slash_command_is_ignored_before_agent():
+    adapter = _make_adapter(owner_chat_id="999")
+    entry, _ = adapter._business_chat_registry.upsert_from_message(
+        business_connection_id="bc-caption-command",
+        customer_chat_id="12345",
+        text="previous",
+        display_name="Customer",
+    )
+    adapter._business_chat_registry.set_mode_by_token(entry["token"], "draft")
+    adapter._enqueue_text_event = MagicMock()
+    msg = _business_media_message(
+        caption="  /restart@HermesBot please",
+        connection_id="bc-caption-command",
+        photo=[_make_photo()],
+    )
+    update = SimpleNamespace(
+        update_id=890,
+        business_connection=None,
+        business_message=msg,
+        edited_business_message=None,
+        deleted_business_messages=None,
+    )
+
+    with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=AssertionError("media command should not be prepared")):
+        with pytest.raises(ApplicationHandlerStop):
+            await adapter._handle_business_update(update, None)
+
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2283,6 +2402,70 @@ async def test_business_slash_confirm_routes_to_owner_not_customer():
     assert "business_connection_id" not in call_kwargs
     assert "Reload MCP?" in call_kwargs["text"]
     assert adapter._slash_confirm_state == {"c1": "agent:main:telegram:dm:12345:business:bc-1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/restart", "/stop", "/status", "/help", "/approve", "/deny"])
+async def test_gateway_blocks_business_customer_slash_commands_before_dispatch(command):
+    source = _business_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    event = MessageEvent(text=command, source=source, message_id="m-command")
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner.hooks.emit_collect.assert_not_called()
+    runner._handle_reset_command.assert_not_called()
+    runner._handle_restart_command.assert_not_called()
+    runner._handle_status_command.assert_not_called()
+    runner._handle_help_command.assert_not_called()
+    runner._handle_approve_command.assert_not_called()
+    runner._handle_deny_command.assert_not_called()
+    runner._interrupt_and_clear_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_business_stop_does_not_interrupt_active_session():
+    source = _business_source(thread_id="business:bc-active")
+    runner = _gateway_runner_for_command_dispatch(source)
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+    runner._running_agents_ts[session_key] = time.time()
+    event = MessageEvent(text="/stop", source=source, message_id="m-stop")
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    running_agent.interrupt.assert_not_called()
+    runner._interrupt_and_clear_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_normal_telegram_dm_new_still_dispatches():
+    source = _owner_dm_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    runner._maybe_confirm_destructive_slash = AsyncMock(side_effect=_execute_confirmed_slash)
+    event = MessageEvent(text="/new", source=source, message_id="m-new")
+
+    result = await runner._handle_message(event)
+
+    assert result == "reset ok"
+    runner._handle_reset_command.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_gateway_owner_business_control_command_still_dispatches():
+    source = _owner_dm_source()
+    runner = _gateway_runner_for_command_dispatch(source)
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    event = MessageEvent(text="/business", source=source, message_id="m-business")
+
+    result = await runner._handle_message(event)
+
+    assert result == "business ok"
+    runner._handle_business_command.assert_awaited_once_with(event)
 
 
 def test_business_customer_source_bypasses_gateway_user_pairing_auth():

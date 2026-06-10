@@ -9,6 +9,7 @@ import { GET as getChat } from "./chats/[token]/route";
 import { POST as postMode } from "./chats/[token]/mode/route";
 import { POST as postDraft } from "./chats/[token]/draft/route";
 import { GET as getHistory } from "./chats/[token]/history/route";
+import { GET as getSettings, PATCH as patchSettings } from "./chats/[token]/settings/route";
 import {
   DASHBOARD_SESSION_COOKIE_NAME,
   issueDashboardSessionCookie,
@@ -285,6 +286,136 @@ describe("Telegram Business dashboard BFF route handlers", () => {
     expect(upstreamBody).not.toHaveProperty("initData");
   });
 
+  it("proxies GET chat settings with actor headers from initData and dashboard session cookies", async () => {
+    const settingsResponse = {
+      settings: {
+        assistantDisplayName: "Hermes",
+        assistantPrefix: "🤖 Hermes:",
+        dialogPrompt: "Be concise.",
+        dialogNotes: "VIP customer",
+        invocationPolicy: "mention_draft",
+      },
+    };
+    const fetchMock = mockFetch(200, settingsResponse);
+
+    const headerResponse = await getSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings", { headers: authHeaders() }),
+      tokenCtx(),
+    );
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(settingsResponse), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    const cookieResponse = await getSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings", {
+        headers: { cookie: dashboardSessionCookieHeader() },
+      }),
+      tokenCtx(),
+    );
+
+    expect(headerResponse.status).toBe(200);
+    expect(cookieResponse.status).toBe(200);
+    await expect(jsonOf(headerResponse)).resolves.toEqual(settingsResponse);
+    await expect(jsonOf(cookieResponse)).resolves.toEqual(settingsResponse);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://hermes.example.test/dashboard/api/business/chats/chat-token-1/settings",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          authorization: `Bearer ${API_TOKEN}`,
+          "x-telegram-user-id": String(TEST_ADMIN_USER_ID),
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "https://hermes.example.test/dashboard/api/business/chats/chat-token-1/settings",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          authorization: `Bearer ${API_TOKEN}`,
+          "x-telegram-user-id": String(TEST_ADMIN_USER_ID),
+        }),
+      }),
+    );
+  });
+
+  it("PATCHes chat settings with only allowed settings keys plus actor body", async () => {
+    const fetchMock = mockFetch(200, {
+      settings: {
+        assistantDisplayName: "Mercury",
+        assistantPrefix: "🤖 Mercury:",
+        dialogPrompt: "Updated prompt",
+        dialogNotes: "VIP customer",
+        invocationPolicy: "mention_direct",
+      },
+    });
+
+    const response = await patchSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          initData: signedInitDataFor(TEST_ADMIN_USER_ID),
+          assistantDisplayName: "Mercury",
+          assistantPrefix: "🤖 Mercury:",
+          dialogPrompt: "Updated prompt",
+          dialogNotes: "VIP customer",
+          invocationPolicy: "mention_direct",
+          unknownKey: "must not forward",
+        }),
+      }),
+      tokenCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://hermes.example.test/dashboard/api/business/chats/chat-token-1/settings",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({
+          authorization: `Bearer ${API_TOKEN}`,
+          "content-type": "application/json",
+          "x-telegram-user-id": String(TEST_ADMIN_USER_ID),
+        }),
+        body: JSON.stringify({
+          assistantDisplayName: "Mercury",
+          assistantPrefix: "🤖 Mercury:",
+          dialogPrompt: "Updated prompt",
+          dialogNotes: "VIP customer",
+          invocationPolicy: "mention_direct",
+          actorUserId: String(TEST_ADMIN_USER_ID),
+        }),
+      }),
+    );
+    const upstreamBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(upstreamBody).not.toHaveProperty("initData");
+    expect(upstreamBody).not.toHaveProperty("unknownKey");
+  });
+
+  it("rejects unauthenticated chat settings requests before calling Hermes", async () => {
+    const fetchMock = mockFetch(200, { ok: true });
+
+    const getResponse = await getSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings"),
+      tokenCtx(),
+    );
+    const patchResponse = await patchSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ dialogPrompt: "Updated prompt" }),
+      }),
+      tokenCtx(),
+    );
+
+    await expect(jsonOf(getResponse)).resolves.toEqual({ ok: false, error: "missing_init_data" });
+    await expect(jsonOf(patchResponse)).resolves.toEqual({ ok: false, error: "missing_init_data" });
+    expect(getResponse.status).toBe(400);
+    expect(patchResponse.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("POSTs draft requests with source latest and actor body", async () => {
     const fetchMock = mockFetch(202, {
       draft: { status: "queued", chatToken: CHAT_TOKEN, source: "latest", sentToCustomer: false },
@@ -330,6 +461,16 @@ describe("Telegram Business dashboard BFF route handlers", () => {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ source: "latest" }),
+          }),
+          tokenCtx(),
+        ),
+      () => getSettings(request("http://localhost/api/business/chats/chat-token-1/settings"), tokenCtx()),
+      () =>
+        patchSettings(
+          request("http://localhost/api/business/chats/chat-token-1/settings", {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ dialogPrompt: "Updated prompt" }),
           }),
           tokenCtx(),
         ),
@@ -392,6 +533,23 @@ describe("Telegram Business dashboard BFF route handlers", () => {
     );
     await expect(jsonOf(invalidMode)).resolves.toEqual({ ok: false, error: "invalid_mode" });
     expect(invalidMode.status).toBe(400);
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: { code: "invalid_invocation_policy", message: "Invalid invocation policy." } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const invalidInvocationPolicy = await patchSettings(
+      request("http://localhost/api/business/chats/chat-token-1/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ invocationPolicy: "always" }),
+      }),
+      tokenCtx(),
+    );
+    await expect(jsonOf(invalidInvocationPolicy)).resolves.toEqual({ ok: false, error: "invalid_invocation_policy" });
+    expect(invalidInvocationPolicy.status).toBe(400);
 
     fetchMock.mockResolvedValueOnce(
       new Response(

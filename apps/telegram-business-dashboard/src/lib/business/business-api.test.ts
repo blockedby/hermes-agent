@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   fetchBusinessChatDetail,
+  fetchBusinessChatSettings,
   fetchBusinessChats,
   generateBusinessDraft,
   updateBusinessChatMode,
+  updateBusinessChatSettings,
 } from "./api";
 
 const INIT_DATA = "query_id=test&hash=signed";
@@ -51,6 +53,59 @@ describe("Business dashboard client API", () => {
         headers: { "x-telegram-init-data": INIT_DATA, accept: "application/json" },
       }),
     );
+  });
+
+  it("fetches and patches chat settings through BFF routes without exposing service tokens", async () => {
+    const fetchMock = mockFetch(200, {
+      settings: {
+        assistantDisplayName: "Hermes",
+        assistantPrefix: "🤖 Hermes:",
+        dialogPrompt: "Be concise.",
+        dialogNotes: "VIP customer",
+        invocationPolicy: "mention_draft",
+      },
+    });
+
+    await fetchBusinessChatSettings("tok-1", INIT_DATA);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/business/chats/tok-1/settings",
+      expect.objectContaining({
+        method: "GET",
+        headers: { "x-telegram-init-data": INIT_DATA, accept: "application/json" },
+      }),
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          settings: {
+            assistantDisplayName: "Hermes",
+            assistantPrefix: "🤖 Hermes:",
+            dialogPrompt: "Updated prompt",
+            dialogNotes: "VIP customer",
+            invocationPolicy: "mention_direct",
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    await updateBusinessChatSettings("tok-1", INIT_DATA, {
+      dialogPrompt: "Updated prompt",
+      invocationPolicy: "mention_direct",
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/business/chats/tok-1/settings",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: {
+          "x-telegram-init-data": INIT_DATA,
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ dialogPrompt: "Updated prompt", invocationPolicy: "mention_direct" }),
+      }),
+    );
+    expect(String(fetchMock.mock.calls.at(-1)?.[1]?.body)).not.toContain("HERMES" + "_DASHBOARD" + "_API" + "_TOKEN");
   });
 
   it("posts mode and draft actions through BFF routes without exposing service tokens", async () => {

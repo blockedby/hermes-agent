@@ -113,6 +113,8 @@ function publicClientError(code: string): string {
   const allowed = new Set([
     "invalid_mode",
     "invalid_source",
+    "invalid_settings",
+    "invalid_invocation_policy",
     "missing_latest_message",
     "chat_not_found",
   ]);

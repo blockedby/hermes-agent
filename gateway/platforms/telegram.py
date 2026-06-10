@@ -962,6 +962,13 @@ class TelegramAdapter(BasePlatformAdapter):
             or str(getattr(message, "caption", None) or "").strip()
         )
 
+    @staticmethod
+    def _business_message_looks_like_slash_command(message: Message) -> bool:
+        """Return True for customer-authored Business text/captions that look like commands."""
+        text = str(getattr(message, "text", None) or "")
+        caption = str(getattr(message, "caption", None) or "")
+        return text.lstrip().startswith("/") or caption.lstrip().startswith("/")
+
     def _record_business_media_history_event(self, entry: Dict[str, Any], event: MessageEvent) -> None:
         """Persist safe structured metadata for inbound Business media."""
         media_urls = list(getattr(event, "media_urls", None) or [])
@@ -7505,7 +7512,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     has_media = self._telegram_message_has_media(message)
                     if not message_text and not message_caption and not has_media:
                         logger.info("[%s] Ignoring empty Telegram Business message for connection %s", self.name, connection_id)
-                    elif message_text.lstrip().startswith("/"):
+                    elif self._business_message_looks_like_slash_command(message):
                         logger.info("[%s] Ignoring Telegram Business command for connection %s", self.name, connection_id)
                     else:
                         self._business_can_reply.setdefault(connection_id, None)
