@@ -10,3 +10,5 @@
 - Broader container verification passed: `docker run --rm -v "$PWD":/workspace -w /workspace -e HERMES_TEST_VENV=/opt/hermes-test-venv -e HERMES_TEST_WORKERS=4 -e TZ=UTC -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e PYTHONHASHSEED=0 hermes-agent:test-runner scripts/run_tests.sh tests/gateway/test_telegram_business.py tests/gateway/test_telegram_business_dashboard_api.py tests/gateway/test_telegram_business_profiles.py -- -q` — 3 files / 136 tests passed.
 - Quality checks passed: container `py_compile` for touched Python files; container `ruff check gateway/platforms/telegram.py gateway/platforms/telegram_business_history.py tests/gateway/test_telegram_business.py`.
 - Preparing report/commit. Note: root `progress.md` contains pre-existing unrelated Task 8 dirty content; I appended Task 7 updates as requested but will not include root `progress.md` in the Task 7 commit to avoid committing unrelated Task 8 content.
+- Commit created: `e4acd6ab3 feat(telegram-business): add bot prompt controls`.
+- Final report updated with commit SHA; preparing final evidence commit for report/progress SHA update only.

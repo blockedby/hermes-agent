@@ -4,7 +4,7 @@ TASK_PACKAGE: docs/plans/2026-06-09-telegram-business-dialog-profiles
 REPORT_PATH: docs/plans/2026-06-09-telegram-business-dialog-profiles/reports/aad-implementer-task7-bot-prompt-buttons.md
 PROGRESS_PATH: docs/plans/2026-06-09-telegram-business-dialog-profiles/progress/aad-implementer-task7-bot-prompt-buttons.md
 COMMITS:
-- pending: commit to be created after final report write
+- e4acd6ab3: feat(telegram-business): add bot prompt controls
 FILES_CHANGED:
 - gateway/platforms/telegram.py: added Business prompt keyboard controls, authorized pending prompt edit flow, clear prompt callback, DB profile writes, settings_changed history, and prompt cancel handling before normal owner message dispatch.
 - gateway/platforms/telegram_business_history.py: allowed normalized settings_changed history events to retain `fields` list metadata.
